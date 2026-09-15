@@ -1,0 +1,48 @@
+# 보정 + 외삽 검증 설정
+#
+# 핵심 설계: 학습 구간을 **일부러 저부하로 제한**한다. 실제 현장에서도 신규 라인은
+# 저부하 데이터만 쌓여 있고, 알고 싶은 것은 풀가동 시의 배출 농도다.
+# 이 설정이 "물리모델이 외삽에서 왜 필요한가"를 그대로 재현한다.
+
+name: SCR-01 NOx 모델 보정
+
+model:
+  python: model.py
+  builder: build
+
+data:
+  csv: data/plant_5min.csv
+  tagmap: tagmap.yaml
+
+split:
+  # pandas query 문법. 컬럼은 태그맵의 target 이름을 쓴다.
+  train: "`SRC_DRY.util` <= 0.55"
+  test:  "`SRC_DRY.util` >= 0.62"
+
+calibrate:
+  # 무엇을 보정 대상으로 고를 것인가가 이 도구에서 가장 중요한 판단이다.
+  #
+  # 처음에는 SCR.eta_max 도 함께 넣었는데, 식별성 진단이 상대표준오차 155% 로
+  # 경고했다. 당연하다. 굴뚝 농도는 (발생량) x (1 - eta) 로만 들어오므로
+  # 발생량과 최대효율은 곱으로만 결정된다. 그래서 eta_max 는 설계값(0.55)에
+  # 고정하고, L/G 의존성을 담는 ntu_a 만 자유롭게 둔다.
+  #
+  # 압력 계통 파라미터(DCT_MAIN.K, SCR.K)는 차압 계측이 따로 있어 잘 결정된다.
+  params:
+    - SRC_DRY.ef_process      # 건식식각 대당 가동 시 NOx 발생량
+    - SRC_DRY.ef_idle         # 건식식각 대당 대기 시 NOx 발생량
+    - SRC_CVD.ef_process      # 증착 대당 가동 시 NOx 발생량
+    - SCR.ntu_a               # 스크러버 물질전달 계수
+    - DCT_MAIN.K              # 메인 덕트 저항 (오염/퇴적으로 설계값과 달라진다)
+    - SCR.K                   # 충전층 저항 (막힘 정도)
+  max_rows: 120               # 층화 추출. 행 수보다 운전구간의 폭이 중요하다.
+  prior_weight: 0.05          # 설계값에서 과도하게 벗어나지 않게 하는 약한 정칙화
+
+baseline:
+  # 공정 비교용 데이터 기반 모델. 같은 학습 데이터만 본다.
+  features: [SRC_DRY.util, SRC_CVD.util, SRC_WET.util, STK.T_amb, FAN.n_ratio]
+  target: STK.C_dry
+  degree: 2
+
+params_out: params_fitted.yaml
+report: out/calibration.html

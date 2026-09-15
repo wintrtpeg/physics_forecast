@@ -1,0 +1,79 @@
+# what-if 시나리오
+#
+# 여기 있는 질문들은 전부 "과거 데이터에 없는 조건"이다. 그래서 ML 로는 답할 수
+# 없고, 물리모델만 답할 수 있다.
+
+name: SCR-01 배기 계통 용량 검토
+description: >
+  가동율 상승과 장비 증설이 굴뚝 NOx 농도와 배기 용량에 미치는 영향을 검토한다.
+  관리기준은 사내 자체기준 100 mg/Sm3 (법정 배출허용기준의 절반)로 둔다.
+
+model:
+  python: model.py
+
+params: params_fitted.yaml     # 보정된 값이 있으면 쓴다 (없으면 설계값)
+
+outputs:
+  - STK.C_dry
+  - STK.ppm_dry
+  - STK.Q_n
+  - SCR.eta
+  - SCR.LG_L_per_m3
+  - FAN.dp_mmAq
+  - FAN.power_shaft
+  - SRC_DRY.q_per_tool
+
+limits:
+  STK.C_dry: {max: 100.0}        # 사내 관리기준 [mg/Sm3]
+  SRC_DRY.q_per_tool: {min: 3.0} # 장비 대당 최소 배기 풍량 [CMM] - 이하면 후드 포집 불량
+
+cases:
+  - name: 현행 (가동율 80%)
+    set: {"SRC_*.util": 0.80}
+
+  - name: 풀가동 (100%)
+    set: {"SRC_*.util": 1.00}
+    note: 계획된 램프업 완료 시점
+
+  - name: 풀가동 + 여름 외기 35도
+    set: {"SRC_*.util": 1.00, "*.T_amb": {value: 35.0, unit: degC}}
+
+  - name: 증설 +30% (가동율 80%)
+    scale: {"SRC_*.n_tools": 1.30}
+    set: {"SRC_*.util": 0.80}
+    note: 2차 투자 계획
+
+  - name: 증설 +30% + 풀가동
+    scale: {"SRC_*.n_tools": 1.30}
+    set: {"SRC_*.util": 1.00}
+    note: 최악 조건. 여기서 기준을 넘는지가 증설 판단의 핵심.
+
+  - name: 증설 +30% + 풀가동 + 팬 증속 110%
+    scale: {"SRC_*.n_tools": 1.30}
+    set: {"SRC_*.util": 1.00, "FAN.n_ratio": 1.10}
+    note: 대책 1 - 송풍기 증속으로 희석 확보
+
+  - name: 증설 +30% + 풀가동 + 순환수 2배
+    scale: {"SRC_*.n_tools": 1.30, "SCR.L": 2.0}
+    set: {"SRC_*.util": 1.00}
+    note: 대책 2 - 스크러버 순환수 증량으로 제거효율 확보
+
+  - name: 에너지절감 - 팬 감속 85%
+    set: {"SRC_*.util": 0.80, "FAN.n_ratio": 0.85}
+    note: 동력은 줄지만 희석이 줄어 농도가 오른다. 상충관계 확인용.
+
+sweeps:
+  - name: 가동율 스윕 (현 설비)
+    over:
+      "SRC_*.util": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+
+  - name: 팬 회전수 스윕 (풀가동 기준)
+    set: {"SRC_*.util": 1.00}
+    over:
+      "FAN.n_ratio": [0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10]
+
+  - name: 스크러버 순환수 스윕 (풀가동 기준)
+    set: {"SRC_*.util": 1.00}
+    unit: "m3/min"
+    over:
+      "SCR.L": [0.2, 0.3, 0.4, 0.55, 0.7, 0.9, 1.2]

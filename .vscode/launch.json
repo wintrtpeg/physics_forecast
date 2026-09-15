@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "pf check (현재 모델)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pforecast.cli",
+      "args": ["check", "examples/nox_stack/model.py"],
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    },
+    {
+      "name": "pf solve",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pforecast.cli",
+      "args": ["solve", "examples/nox_stack/model.py"],
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    },
+    {
+      "name": "pf calibrate",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pforecast.cli",
+      "args": ["calibrate", "examples/nox_stack/calibration.yaml"],
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    },
+    {
+      "name": "현재 파일 디버그",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" }
+    }
+  ]
+}

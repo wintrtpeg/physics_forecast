@@ -1,0 +1,78 @@
+# 현장 Historian 태그 <-> 모델 변수 매핑
+#
+# 라인이 바뀌면 이 파일만 갈아끼운다. 물리 모델(model.py)은 태그 이름을 모른다.
+
+timestamp:
+  column: timestamp
+
+resample: 5min          # 5분 평균. 원본이 이미 5분이면 그대로 통과한다.
+
+inputs:
+  - tag: F2_FAB_DRY_UTIL
+    target: SRC_DRY.util
+    unit: "%"
+    desc: 건식식각 장비군 가동율
+  - tag: F2_FAB_CVD_UTIL
+    target: SRC_CVD.util
+    unit: "%"
+    desc: 증착 장비군 가동율
+  - tag: F2_FAB_WET_UTIL
+    target: SRC_WET.util
+    unit: "%"
+    desc: 습식세정 장비군 가동율
+  - tag: F2_FAB_IMP_UTIL
+    target: SRC_IMP.util
+    unit: "%"
+    desc: 이온주입 장비군 가동율
+
+  # 태그 하나가 여러 파라미터에 걸리는 경우는 target 을 리스트로 준다
+  - tag: F2_UT_AMB_TEMP
+    target:
+      - STK.T_amb
+      - DCT_MAIN.T_amb
+      - DCT_DRY.T_amb
+      - DCT_CVD.T_amb
+      - DCT_WET.T_amb
+      - DCT_IMP.T_amb
+    unit: degC
+    desc: 외기온도
+
+  - tag: F2_UT_SCR01_FAN_HZ
+    target: FAN.n_ratio
+    unit: "1"
+    scale: 0.0166666667      # 60Hz = 정격 1.0
+    desc: 유인송풍기 인버터 주파수
+
+observations:
+  - tag: F2_UT_STK01_NOX_DRY
+    target: STK.C_dry
+    unit: mg/Nm3
+    sigma: 3.0
+    desc: 굴뚝 NOx (건조 기준) - 규제 대상
+  - tag: F2_UT_STK01_FLOW
+    target: STK.Q_n
+    unit: Nm3/h
+    sigma: 200.0
+    desc: 굴뚝 배기 풍량
+  - tag: F2_UT_STK01_TEMP
+    target: STK.T_stack
+    unit: degC
+    sigma: 0.5
+    desc: 굴뚝 배기 온도
+  - tag: F2_UT_SCR01_FAN_SP
+    target: FAN.dp_mmAq
+    unit: mmAq
+    sigma: 5.0
+    desc: 송풍기 정압
+  - tag: F2_UT_SCR01_DP
+    target: SCR.dp_mmAq
+    unit: mmAq
+    sigma: 3.0
+    desc: 스크러버 차압
+
+meta:
+  line: F2
+  system: SCR-01 (배기 스크러버 계통)
+  note: |
+    NOx 는 NO2 환산 기준. 표준산소 보정은 적용하지 않는다(팹 배기는 사실상 공기라
+    O2 보정 분모가 0 에 붙어 발산한다). Stack.o2_corr=0 이 이에 대응한다.

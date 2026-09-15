@@ -1,0 +1,60 @@
+{
+  "version": "2.0.0",
+  "options": { "env": { "PYTHONPATH": "${workspaceFolder}/src" } },
+  "presentation": { "panel": "dedicated", "clear": true },
+  "tasks": [
+    {
+      "label": "pf: 모델 구조 검사",
+      "type": "shell",
+      "command": "python -m pforecast.cli check ${input:modelPath}",
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "pf: 설계점 풀이",
+      "type": "shell",
+      "command": "python -m pforecast.cli solve ${input:modelPath}",
+      "problemMatcher": []
+    },
+    {
+      "label": "pf: 시나리오 실행 (리포트 생성)",
+      "type": "shell",
+      "command": "python -m pforecast.cli run examples/nox_stack/scenarios.yaml -o examples/nox_stack/out/scenario.html",
+      "problemMatcher": []
+    },
+    {
+      "label": "pf: 보정 + 외삽 검증",
+      "type": "shell",
+      "command": "python -m pforecast.cli calibrate examples/nox_stack/calibration.yaml",
+      "problemMatcher": []
+    },
+    {
+      "label": "pf: 가상 데이터 생성",
+      "type": "shell",
+      "command": "python examples/nox_stack/make_synthetic_data.py --days 30",
+      "problemMatcher": []
+    },
+    {
+      "label": "pf: 전체 데모",
+      "type": "shell",
+      "command": "python -m pforecast.cli demo",
+      "problemMatcher": []
+    },
+    {
+      "label": "테스트",
+      "type": "shell",
+      "command": "python -m pytest tests -q",
+      "problemMatcher": [],
+      "group": { "kind": "test", "isDefault": true }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "modelPath",
+      "type": "pickString",
+      "description": "검사할 모델",
+      "options": ["examples/nox_stack/model.py", "examples/nox_stack/system.yaml"],
+      "default": "examples/nox_stack/model.py"
+    }
+  ]
+}

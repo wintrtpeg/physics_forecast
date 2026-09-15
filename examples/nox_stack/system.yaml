@@ -1,0 +1,45 @@
+# 같은 계통을 YAML 로 선언한 버전.
+#
+# model.py 쪽이 표현력은 높지만(반복문, 계산), 이쪽은 사람이 훑어보기 쉽고
+# 에이전트가 생성하기도 쉽다. 두 경로는 동일한 엔진을 쓴다.
+#   pf check examples/nox_stack/system.yaml
+#
+# 파라미터 값은 각 컴포넌트가 선언한 단위로 해석된다 (q_tool 은 Nm3/h, K 는 1/m4 ...).
+
+name: nox_stack_yaml
+
+components:
+  SRC_DRY: {type: ToolGroupSource, n_tools: 24, util: 0.80, q_tool: 220, dp_design: 150,
+            ef_idle: 0.55, ef_process: 7.00, T_exh: 52.0, rh_exh: 0.40}
+  SRC_CVD: {type: ToolGroupSource, n_tools: 18, util: 0.80, q_tool: 260, dp_design: 150,
+            ef_idle: 0.85, ef_process: 5.00, T_exh: 61.0, rh_exh: 0.35}
+  SRC_WET: {type: ToolGroupSource, n_tools: 30, util: 0.80, q_tool: 160, dp_design: 150,
+            ef_idle: 0.10, ef_process: 0.80, T_exh: 38.0, rh_exh: 0.85}
+  SRC_IMP: {type: ToolGroupSource, n_tools: 8,  util: 0.80, q_tool: 180, dp_design: 150,
+            ef_idle: 0.30, ef_process: 3.40, T_exh: 47.0, rh_exh: 0.40}
+
+  DCT_DRY: {type: Duct, K: 120,  UA: 250, T_amb: 25.0}
+  DCT_CVD: {type: Duct, K: 150,  UA: 250, T_amb: 25.0}
+  DCT_WET: {type: Duct, K: 150,  UA: 250, T_amb: 25.0}
+  DCT_IMP: {type: Duct, K: 1600, UA: 250, T_amb: 25.0}
+
+  HDR:      {type: Mixer, n_inlets: 4}
+  DCT_MAIN: {type: Duct, K: 17.0, UA: 1800, T_amb: 25.0}
+  SCR:      {type: WetScrubber, eta_max: 0.55, ntu_a: 14.0, ntu_b: 0.55,
+             L: 0.55, K: 51.0, rh_out: 0.97, T_water: 22.0}
+  FAN:      {type: Fan, c0: 4900, c1: 0.0, c2: -68.0, n_ratio: 1.0, eta: 0.70}
+  STK:      {type: Stack, H: 25.0, K: 8.4, T_amb: 20.0, o2_corr: 0.0}
+
+connections:
+  - [SRC_DRY.outlet, DCT_DRY.a]
+  - [SRC_CVD.outlet, DCT_CVD.a]
+  - [SRC_WET.outlet, DCT_WET.a]
+  - [SRC_IMP.outlet, DCT_IMP.a]
+  - [DCT_DRY.b, HDR.in1]
+  - [DCT_CVD.b, HDR.in2]
+  - [DCT_WET.b, HDR.in3]
+  - [DCT_IMP.b, HDR.in4]
+  - [HDR.out,   DCT_MAIN.a]
+  - [DCT_MAIN.b, SCR.a]
+  - [SCR.b, FAN.a]
+  - [FAN.b, STK.a]
