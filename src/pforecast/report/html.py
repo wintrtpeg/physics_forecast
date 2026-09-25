@@ -131,8 +131,14 @@ class Report:
         self.parts.append(f'<div class="{cls}">{body}</div>')
         return self
 
-    def bullets(self, items: list[str]) -> "Report":
-        li = "".join(f"<li>{i}</li>" for i in items)
+    @staticmethod
+    def _emphasis(text: str) -> str:
+        """``**강조**`` 를 ``<b>`` 로. 판정 문장이 마크다운으로 오므로 전부 변환한다."""
+        import re
+        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+    def bullets(self, items: list[str], markdown: bool = False) -> "Report":
+        li = "".join(f"<li>{self._emphasis(i) if markdown else i}</li>" for i in items)
         self.parts.append(f"<ul>{li}</ul>")
         return self
 

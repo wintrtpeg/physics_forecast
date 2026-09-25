@@ -328,8 +328,7 @@ def selection_report(result, out_path: str | Path) -> Path:
             "같은 데이터를 절대값으로 그린 것. 눈으로는 구분되지 않는다 — 그게 결론이다.")
 
     rep.h2("3. 판정")
-    rep.bullets([v.replace("**", "<b>", 1).replace("**", "</b>", 1) if "**" in v else v
-                 for v in result.verdict()])
+    rep.bullets(result.verdict(), markdown=True)
     rep.note(
         "<b>1등만 보고 고르지 마세요.</b> 외삽 오차가 비슷하면 파라미터가 적은 쪽이 낫습니다. "
         "식별성이 무너진 후보는 예측이 맞더라도 파라미터를 물리적으로 해석할 수 없습니다. "
