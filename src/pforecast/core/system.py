@@ -132,6 +132,25 @@ class System:
         for c in comps:
             self.add(c)
 
+    def replace(self, name: str, comp: Component) -> Component:
+        """같은 이름의 컴포넌트를 교체한다. 포트 이름이 같아야 연결이 유지된다.
+
+        구성방정식 후보를 바꿔 끼울 때 쓴다.
+        """
+        old = self.components.get(name)
+        if old is None:
+            raise ModelError(f"교체할 컴포넌트 {name!r} 가 없습니다. "
+                             f"가능: {sorted(self.components)}")
+        if comp.name != name:
+            raise ModelError(f"교체 컴포넌트의 이름이 다릅니다: {comp.name!r} != {name!r}")
+        missing = set(old.port_specs()) - set(comp.port_specs())
+        if missing:
+            raise ModelError(
+                f"{name} 교체 실패: 새 컴포넌트에 포트 {sorted(missing)} 가 없습니다. "
+                "연결이 끊어집니다.")
+        self.components[name] = comp
+        return comp
+
     def connect(self, a: str, b: str) -> None:
         """``connect("SRC1.outlet", "DUCT1.inlet")`` 형태로 포트를 잇는다."""
         self.connections.append((a, b))
@@ -232,8 +251,13 @@ class System:
                 comp_eqs = comp.equations(sc)
             except Exception as exc:  # 모델 작성 실수를 컴포넌트 이름과 함께 보여준다
                 raise ModelError(f"{cname}({type(comp).__name__}) 방정식 생성 실패: {exc}") from exc
+            labels = comp.equation_labels()
+            if labels is not None and len(labels) != len(comp_eqs):
+                raise ModelError(
+                    f"{cname}: 방정식 {len(comp_eqs)}개인데 이름은 {len(labels)}개입니다")
             for k, e in enumerate(comp_eqs):
-                push(e, cname, f"{cname} eq[{k}]")
+                name = labels[k] if labels is not None else f"eq[{k}]"
+                push(e, cname, f"{cname}.{name}")
 
         # 연결 방정식
         used: dict[str, str] = {}

@@ -1,0 +1,56 @@
+# 습식 스크러버 — 선언형 정의.
+#
+# 파이썬으로 짠 WetScrubber 와 방정식이 1:1 로 같다. 여기 있는 이유는
+# **구성방정식(closure)만 갈아끼운 후보들을 만들기 위해서**다.
+# 각 후보는 이 파일을 extends 하고 closure_eta 한 줄만 바꾼다.
+#
+# 보존법칙(mass/species/energy/momentum)은 후보가 아니다. 그건 공리다.
+# 후보로 두는 것은 구성방정식뿐이다.
+
+description: 습식 스크러버 (NTU 거듭제곱 상관식)
+
+ports:
+  a: {kind: gas, role: in}
+  b: {kind: gas, role: out}
+
+params:
+  eta_max:  {value: 0.55, unit: "1",    desc: 도달 가능 최대 제거효율, lo: 0.0, hi: 1.0, tunable: true}
+  ntu_a:    {value: 14.0, unit: "1",    desc: NTU 계수, lo: 0.0001, hi: 1000.0, tunable: true}
+  ntu_b:    {value: 0.55, unit: "1",    desc: NTU 의 L/G 지수, lo: 0.05, hi: 2.0, tunable: true}
+  L:        {value: 0.55, unit: m3/min, desc: 순환수 유량, lo: 1.0e-6, hi: 100.0}
+  K:        {value: 51.0, unit: 1/m4,   desc: 충전층 저항계수, lo: 0.0, hi: 1.0e6, tunable: true}
+  rh_out:   {value: 0.97, unit: "1",    desc: 출구 상대습도, lo: 0.5, hi: 1.0, tunable: true}
+  T_water:  {value: 22.0, unit: degC,   desc: 순환수 온도}
+
+vars:
+  eta:    {unit: "1",     start: 0.20, lo: 0.0,   hi: 0.9999, desc: NOx 제거효율}
+  m_evap: {unit: kg/s,    start: 0.02, lo: -1.0,  hi: 10.0,   desc: 증발 수분량}
+  dp:     {unit: Pa,      start: 1000.0,                      desc: 충전층 압력손실}
+  rho:    {unit: kg/m3,   start: 1.13, lo: 0.05,  hi: 10.0}
+  LG:     {unit: "1",     start: 2.0e-3, lo: 1.0e-9, hi: 1.0, desc: 액가스비 (m3/m3)}
+
+equations:
+  # --- 보존법칙 (절대 바꾸지 않는다) ---
+  mass:        "a.mdot + b.mdot + m_evap = 0"
+  species_nox: "(-b.mdot) * b.w_NOx = a.mdot * a.w_NOx * (1 - eta)"
+  species_h2o: "(-b.mdot) * b.w_H2O = a.mdot * a.w_H2O + m_evap"
+  species_o2:  "(-b.mdot) * b.w_O2  = a.mdot * a.w_O2"
+  energy:      "a.mdot*enthalpy(a) + b.mdot*enthalpy(b) + m_evap * 4186[J/(kg*K)] * (T_water - 273.15[K]) = 0"
+  momentum:    "a.p - b.p = dp"
+
+  # --- 상태/정의식 ---
+  state:       "rho = density(a)"
+  liquid_gas:  "LG * (a.mdot / rho) = L"
+  saturation:  "b.w_H2O = humidity(rh_out, b.T, b.p)"
+  friction:    "dp = K * signed_pow(a.mdot, 2) / rho"
+
+  # --- 구성방정식 (후보가 갈리는 지점) ---
+  closure_eta: "eta = eta_max * (1 - exp(-ntu_a * LG^ntu_b))"
+
+outputs:
+  eta:          {expr: "eta",               unit: "%"}
+  LG_L_per_m3:  {expr: "LG * 1000",         unit: "1"}
+  Q_gas:        {expr: "a.mdot / rho",      unit: CMM}
+  dp_mmAq:      {expr: "dp",                unit: mmAq}
+  T_out:        {expr: "b.T",               unit: degC}
+  m_evap:       {expr: "m_evap",            unit: kg/s}

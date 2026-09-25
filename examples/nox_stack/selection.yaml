@@ -1,0 +1,58 @@
+# 구성방정식 후보 비교
+#
+# 스크러버의 제거효율식만 갈아끼우며 어느 형태가 맞는지 데이터로 고른다.
+# 보존법칙은 네 후보 모두 동일하다 - 후보로 두지 않는다.
+
+name: 스크러버 물질전달 상관식 후보 비교
+
+model:
+  python: model.py
+
+data:
+  csv: data/plant_5min.csv
+  tagmap: tagmap.yaml
+
+split:
+  train: "`SRC_DRY.util` <= 0.55"     # 저부하만 학습
+  test:  "`SRC_DRY.util` >= 0.62"     # 고부하는 전부 외삽 검증
+
+target: STK.C_dry
+slot: SCR                             # 교체할 컴포넌트
+
+# 후보들이 갈리는 지점의 변수. 후보가 구분되지 않을 때
+# "이 값을 의도적으로 흔든 데이터가 필요하다"고 알려주는 데 쓴다.
+discriminator: SCR.LG
+
+calibrate:
+  # 후보와 무관하게 늘 함께 보정하는 파라미터 (계통 저항, 배출계수)
+  common:
+    - SRC_DRY.ef_process
+    - SRC_DRY.ef_idle
+    - SRC_CVD.ef_process
+    - DCT_MAIN.K
+    - SCR.K
+  max_rows: 80
+  prior_weight: 0.05
+
+candidates:
+  - id: ntu_power
+    description: "NTU = a·(L/G)^b — 물질전달 이론 표준형"
+    component: closures/scrubber_base.yaml
+    calibrate: [SCR.ntu_a]
+
+  - id: constant
+    description: "η = 상수 — L/G 의존성 없음 (하한선 모델)"
+    component: closures/scrubber_constant.yaml
+    calibrate: [SCR.eta0]
+
+  - id: langmuir
+    description: "η = η_max·(L/G)/(k+L/G) — 포화형"
+    component: closures/scrubber_langmuir.yaml
+    calibrate: [SCR.k_LG]
+
+  - id: ntu_power_T
+    description: "NTU = a·(L/G)^b·(T/313K)^c — 온도항 추가 (과다 매개변수화 대조군)"
+    component: closures/scrubber_ntu_temp.yaml
+    calibrate: [SCR.ntu_a, SCR.ntu_c]
+
+report: out/selection.html

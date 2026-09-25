@@ -46,6 +46,9 @@ class CalibrationResult:
     cost: float
     n_rows: int
     n_eval: int
+    #: 최적화가 실제로 쓴 경계 (SI). 모델 경계와 초기값 대비 배율 경계의 교집합이다.
+    lo_used: np.ndarray | None = None
+    hi_used: np.ndarray | None = None
     metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     message: str = ""
 
@@ -59,6 +62,42 @@ class CalibrationResult:
             "stderr": [from_si(v, u) for v, u in zip(self.stderr, self.units)],
             "rel_stderr_%": 100.0 * self.stderr / np.maximum(np.abs(self.fitted), 1e-30),
         })
+
+    def at_bound(self, rtol: float = 0.02) -> list[str]:
+        """최적화 경계에 붙은 파라미터 이름.
+
+        모델이 선언한 넓은 물리 경계가 아니라 **최적화가 실제로 쓴 경계** 기준이다.
+        (물리 경계는 lo=0 처럼 넓어서, 작은 양수 파라미터가 늘 '경계에 붙은' 것으로
+        오진된다.)
+        """
+        if self.lo_used is None or self.hi_used is None:
+            return []
+        hits = []
+        for i, name in enumerate(self.names):
+            lo, hi, v = self.lo_used[i], self.hi_used[i], self.fitted[i]
+            span = hi - lo
+            if not np.isfinite(span) or span <= 0:
+                continue
+            if abs(v - lo) <= rtol * span or abs(hi - v) <= rtol * span:
+                hits.append(name)
+        return hits
+
+    def subset(self, names: list[str]) -> tuple[float, float]:
+        """일부 파라미터만 본 (최악 상관, 최대 상대표준오차[%])."""
+        idx = [i for i, n in enumerate(self.names) if n in set(names)]
+        if not idx:
+            return 0.0, 0.0
+        rel = 100.0 * self.stderr[idx] / np.maximum(np.abs(self.fitted[idx]), 1e-30)
+        rel = rel[np.isfinite(rel)]
+        worst = 0.0
+        for a in range(len(idx)):
+            for b in range(len(self.names)):
+                if idx[a] == b:
+                    continue
+                c = self.correlation[idx[a], b]
+                if np.isfinite(c) and abs(c) > abs(worst):
+                    worst = float(c)
+        return worst, (float(np.max(rel)) if len(rel) else 0.0)
 
     def identifiability_warnings(self, threshold: float = 0.95) -> list[str]:
         out = []
@@ -211,5 +250,5 @@ def calibrate(
         units=[model.parameters[i].unit for i in p_idx],
         initial=theta0, fitted=fitted, stderr=stderr, correlation=corr,
         cost=float(sol.cost), n_rows=n_rows, n_eval=n_eval[0], metrics=metrics,
-        message=str(sol.message),
+        message=str(sol.message), lo_used=lo * scale, hi_used=hi * scale,
     )

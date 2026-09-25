@@ -15,14 +15,16 @@ python -m pforecast.cli check examples/nox_stack/model.py
 
 ```
 L5 cli.py / workflow.py
-L4 scenario/ report/
+L4 scenario/ report/ selection.py
 L3 data/ calib/
 L2 lib/            <- 도메인(배기/열/유체) 지식은 여기까지만
 L1 core/system.py core/structural.py core/solvers.py
-L0 core/symbolic.py core/units.py core/component.py
+L0 core/symbolic.py core/units.py core/component.py core/parser.py
 ```
 
 * **`core/` 는 도메인을 몰라야 한다.** NOx, 스크러버, 공기 같은 단어가 들어가면 잘못된 것이다.
+  `core/parser.py` 도 순수 수학 함수만 안다. 물성 함수(`density`, `enthalpy` ...)는
+  `lib/generic.py` 의 `domain_functions()` 가 `FunctionTable` 에 얹는다.
 * 새 계통(냉동기, CDA, 외조기)은 `lib/` 에 컴포넌트를 추가하는 것으로 끝나야 한다.
   `core/` 를 고쳐야 한다면 추상화가 부족한 것이니 먼저 그 점을 논의할 것.
 
@@ -54,12 +56,30 @@ L0 core/symbolic.py core/units.py core/component.py
 * 사내 태그 이름은 `tagmap.yaml` 에만 존재한다. **모델 코드에 태그를 넣지 말 것.**
 * 보정된 파라미터는 코드가 아니라 `params_fitted.yaml` 로 관리한다.
 
+## 선언형 컴포넌트 / 후보 비교
+
+* `equations` 는 **dict** 다 (리스트 아님). 이름이 있어야 진단 메시지가 `SCR.closure_eta`
+  처럼 뜨고, `extends` 로 **한 줄만 교체**할 수 있다.
+* 차원이 있는 상수는 `273.15[K]`, `4186[J/(kg*K)]` 처럼 단위를 단다. 맨 숫자는 무차원이다.
+* **후보로 둘 수 있는 것은 구성방정식(closure)뿐이다.** 보존법칙과 상태방정식을 후보로
+  돌리면 외삽 보증이 사라진다 — 그러면 물리모델을 쓸 이유가 없다.
+* 후보 비교에는 **반드시 하한선 모델**(가장 단순한 형태)을 넣는다. 그것보다 나은지
+  확인하지 않으면 복잡도가 값을 하는지 알 수 없다.
+* 선택 기준은 **외삽 구간 오차**가 1차다. 학습 적합도와 AICc 는 보조 지표다.
+  무작위 k-fold 는 쓰지 말 것 — 학습/검증이 같은 분포가 되어 외삽 능력을 못 잰다.
+* 후보 비교의 식별성 진단은 **그 후보에만 있는 파라미터** 기준으로 본다. 공통
+  파라미터의 식별성은 설정의 성질이지 후보의 성질이 아니다.
+* 시계열 잔차는 강하게 자기상관되어 있다. 후보 간 차이의 유의성은 **1차 자기상관으로
+  유효 표본수를 깎아서** 판정한다 (`SelectionResult.paired_compare`).
+
 ## 캘리브레이션 원칙
 
 * 보정 대상은 **물리 파라미터**만 (`ParamSpec(tunable=True)`). 회귀계수를 만들지 말 것.
 * 결과에는 항상 식별성 진단을 같이 낸다. 공분산은 **정칙화 항을 뺀 데이터 항만으로** 계산한다.
   (정칙화를 포함하면 상관이 인위적으로 낮아져 "식별된 것처럼" 보인다.)
 * 식별 안 되는 파라미터는 설계값에 고정하고 나머지만 보정한다.
+* 경계에 붙었는지는 **최적화가 실제로 쓴 경계**(`CalibrationResult.at_bound()`) 로 본다.
+  모델이 선언한 넓은 물리 경계로 보면 작은 양수 파라미터가 늘 오진된다.
 
 ## 문서 작성 시
 

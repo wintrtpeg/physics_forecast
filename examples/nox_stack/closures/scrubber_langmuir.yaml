@@ -1,0 +1,16 @@
+# 후보 B — 포화형(Langmuir 꼴) 상관식.
+#
+#     eta = eta_max * (L/G) / (k_LG + L/G)
+#
+# NTU 지수형과 마찬가지로 L/G 가 늘면 효율이 오르고 포화한다. 물리적으로도
+# 말이 되는 형태이며, 저부하 구간에서는 지수형과 거의 구분되지 않는다.
+# 고부하로 외삽할 때 두 형태가 갈라진다 - 그래서 후보로 둘 가치가 있다.
+
+extends: scrubber_base.yaml
+description: 포화형(Langmuir) L/G 상관식
+
+params:
+  k_LG: {value: 3.5e-3, unit: "1", desc: 반포화 액가스비, lo: 1.0e-6, hi: 1.0, tunable: true}
+
+equations:
+  closure_eta: "eta = eta_max * LG / (k_LG + LG)"

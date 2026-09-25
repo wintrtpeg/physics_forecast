@@ -102,6 +102,61 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_select(args) -> int:
+    import pickle
+    from .report import selection_report
+    from .selection import SelectionConfig, run_selection
+    cfg = SelectionConfig.load(args.config)
+    if args.max_rows:
+        cfg.max_rows = args.max_rows
+    if args.load:
+        # 보정을 다시 하지 않고 리포트만 다시 그린다 (후보 비교는 수 분이 걸린다)
+        with open(args.load, "rb") as fh:
+            res = pickle.load(fh)
+        print(f"저장된 결과 사용: {args.load}")
+    else:
+        t0 = time.perf_counter()
+        res = run_selection(cfg)
+        print(f"완료 ({time.perf_counter()-t0:.0f}s)\n")
+        if args.save:
+            with open(args.save, "wb") as fh:
+                pickle.dump(res, fh)
+            print(f"결과 저장: {args.save}")
+    import pandas as pd
+    pd.set_option("display.width", 220, "display.max_columns", 30)
+    print(res.table().to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+    print("\n[판정]")
+    for v in res.verdict():
+        print("  - " + v.replace("**", ""))
+    out = args.out or cfg.report_out
+    if out:
+        print(f"\n리포트: {selection_report(res, out)}")
+    return 0
+
+
+def cmd_equations(args) -> int:
+    """모델의 방정식을 이름과 함께 나열한다. 선언형 컴포넌트 디버깅용."""
+    system = _load(args.model, args.builder)
+    model = system.compile(check_dims=not args.no_dim_check)
+    from .core import symbolic as S
+    from .core.units import dim_str
+    src = args.component
+    shown = 0
+    for info in model.equations:
+        if src and not info.source.startswith(src):
+            continue
+        shown += 1
+        line = f"{info.label:34s} {S.expr_to_str(info.expr)}"
+        if args.dims:
+            try:
+                line += f"   [{dim_str(S.dim_of_expr(info.expr))}]"
+            except Exception as exc:
+                line += f"   [차원오류: {exc}]"
+        print(line if len(line) < 200 or args.full else line[:197] + "...")
+    print(f"\n{shown}개 방정식 / 미지수 {model.n_vars}개")
+    return 0
+
+
 def cmd_run(args) -> int:
     from .params import apply_params
     from .report import scenario_report
@@ -218,6 +273,23 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", help="케이스 결과 CSV 경로")
     c.add_argument("--params", help="보정 파라미터 YAML")
     c.set_defaults(func=cmd_run)
+
+    c = sub.add_parser("select", help="구성방정식 후보를 비교해 고른다")
+    c.add_argument("config")
+    c.add_argument("-o", "--out", help="HTML 리포트 경로")
+    c.add_argument("--max-rows", type=int, help="후보별 보정에 쓸 최대 행 수")
+    c.add_argument("--save", help="비교 결과를 저장할 경로 (리포트 재생성용)")
+    c.add_argument("--load", help="저장된 결과로 리포트만 다시 생성")
+    c.set_defaults(func=cmd_select)
+
+    c = sub.add_parser("equations", help="조립된 방정식을 이름과 함께 출력")
+    c.add_argument("model")
+    c.add_argument("--builder", default="build")
+    c.add_argument("--component", help="이 컴포넌트의 방정식만")
+    c.add_argument("--dims", action="store_true", help="각 식의 차원도 표시")
+    c.add_argument("--full", action="store_true", help="긴 식도 자르지 않음")
+    c.add_argument("--no-dim-check", action="store_true")
+    c.set_defaults(func=cmd_equations)
 
     c = sub.add_parser("demo", help="NOx 예제를 처음부터 끝까지 실행")
     c.set_defaults(func=cmd_demo)

@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .style import INK_MUTED, SERIES_LIGHT, STATUS, setup_style
+from .style import INK_MUTED, INK_SECONDARY, SERIES_LIGHT, STATUS, setup_style
 
 _CSS = """
 :root{color-scheme:light;--surface:#fcfcfb;--panel:#ffffff;--ink:#0b0b0b;
@@ -226,6 +226,48 @@ def parity_fig(pairs: dict[str, tuple[np.ndarray, np.ndarray]], label: str,
     if title:
         ax.set_title(title)
     ax.legend(loc="upper left")
+    return fig
+
+
+def grouped_bar_fig(categories, series: dict[str, np.ndarray], xlabel: str,
+                    title: str = "", value_fmt: str = "{:.2f}", figsize=(7.6, None),
+                    threshold: float | None = None, threshold_label: str = ""):
+    """가로 막대 비교. 계열은 같은 단위여야 한다 (이중 축은 쓰지 않는다).
+
+    값은 막대 끝에 직접 적는다 - 범례만 있고 숫자가 없으면 눈으로 재야 한다.
+    ``threshold`` 를 주면 판정선을 세로 점선으로 긋는다.
+    """
+    plt = setup_style()
+    n_cat, n_ser = len(categories), len(series)
+    h = figsize[1] or max(2.3, 0.42 * n_cat * n_ser + 1.4)
+    fig, ax = plt.subplots(figsize=(figsize[0], h))
+    y = np.arange(n_cat)
+    bar_h = 0.62 / n_ser                       # 얇게: 막대 사이에 지면이 보이도록
+    vmax = max(float(np.nanmax(v)) for v in series.values())
+    if threshold is not None:
+        vmax = max(vmax, threshold)
+    for i, ((name, vals), c) in enumerate(zip(series.items(), SERIES_LIGHT)):
+        off = (i - (n_ser - 1) / 2) * bar_h
+        ax.barh(y - off, vals, height=bar_h * 0.86, color=c, label=name, zorder=3)
+        for yy, v in zip(y - off, vals):
+            if np.isfinite(v):
+                ax.text(v + vmax * 0.015, yy, value_fmt.format(v), va="center", ha="left",
+                        fontsize=8.5, color=INK_SECONDARY, zorder=4)
+    if threshold is not None:
+        ax.axvline(threshold, color=STATUS["critical"], lw=1.6, ls=(0, (4, 3)), zorder=2)
+        ax.text(threshold, 1.005, f" {threshold_label}", ha="left", va="bottom",
+                fontsize=9, color=STATUS["critical"], transform=ax.get_xaxis_transform())
+    ax.set_yticks(y, [str(c) for c in categories])
+    ax.invert_yaxis()
+    ax.set_xlabel(xlabel)
+    ax.set_xlim(0, vmax * 1.25)
+    ax.grid(axis="y", visible=False)
+    if title:
+        ax.set_title(title, pad=24 if threshold is not None else 12)
+    if n_ser >= 2:
+        # 막대가 화면을 가득 채우므로 범례는 축 위로 뺀다
+        ax.legend(loc="lower left", bbox_to_anchor=(0, 1.0, 1, 0.12), mode="expand",
+                  ncols=min(n_ser, 3), borderaxespad=0)
     return fig
 
 

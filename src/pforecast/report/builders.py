@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 from ..core.units import from_si
-from .html import Report, parity_fig, sweep_fig, timeseries_fig
+from .html import (Report, grouped_bar_fig, parity_fig, sweep_fig,
+                   timeseries_fig)
 from .style import SERIES_LIGHT
 
 
@@ -262,3 +263,129 @@ def scenario_report(result, out_path: str | Path, title: str | None = None) -> P
             rep.figure(fig, f"{xcol} 변화에 따른 {ycols[0]}")
         rep.table(df)
     return rep.render(out_path)
+
+
+def selection_report(result, out_path: str | Path) -> Path:
+    """구성방정식 후보 비교 리포트."""
+    import numpy as np
+
+    cfg = result.config
+    df = result.table()
+    ok = [r for r in result.results if r.converged and np.isfinite(r.test_rmse)]
+    unit = ok[0].unit if ok else "1"
+    rep = Report(f"{cfg.name}", f"교체 슬롯 {cfg.slot} · 후보 {len(result.results)}개 · "
+                                f"대상 {cfg.target}")
+
+    if ok:
+        best = min(ok, key=lambda r: r.test_rmse)
+        worst = max(ok, key=lambda r: r.test_rmse)
+        rep.tiles([
+            {"label": "외삽 최소 오차 후보", "value": best.id,
+             "note": f"{best.test_rmse:.2f} {unit} · 파라미터 {best.n_params}개",
+             "status": "good"},
+            {"label": "최악 후보 대비", "value": f"{worst.test_rmse / best.test_rmse:.2f}",
+             "unit": "배", "note": f"{worst.id} = {worst.test_rmse:.2f} {unit}",
+             "status": "bad" if worst.test_rmse > best.test_rmse * 1.3 else "warn"},
+            {"label": "학습 구간 오차 차이", "value":
+                f"{max(r.train_rmse for r in ok) / min(r.train_rmse for r in ok):.2f}",
+             "unit": "배", "note": "학습만 보면 후보가 거의 구분되지 않는다"},
+        ])
+
+    rep.h2("1. 무엇을 후보로 두었는가")
+    rep.note(
+        "<b>보존법칙은 후보가 아니다.</b> 질량·화학종·에너지·운동량 보존과 상태방정식은 "
+        "네 후보 모두 글자 하나까지 같다. 갈아끼운 것은 <code>closure_eta</code> "
+        "한 줄 — 제거효율이 액가스비에 어떻게 의존하는가 하는 <b>구성방정식</b>뿐이다.<br><br>"
+        "보존법칙을 후보로 돌리면 외삽 보증이 사라진다. 그러면 물리모델을 쓸 이유가 없다.")
+    rep.table(pd.DataFrame([{"후보": r.id, "구성방정식": r.description,
+                             "보정 파라미터 수": r.n_params} for r in result.results]))
+
+    rep.h2("2. 비교 결과")
+    rep.table(df)
+    if ok:
+        # "차이가 없다"가 결론일 때는 절대값 막대 4개가 아무것도 말해 주지 않는다.
+        # 최선 후보 대비 **차이**를 그리고 판정선을 함께 긋는다.
+        ranked = sorted(ok, key=lambda r: r.test_rmse)
+        base = ranked[0].test_rmse
+        sigma = result.sigma
+        thr = result.practical_fraction * sigma if np.isfinite(sigma) else None
+        rep.figure(grouped_bar_fig(
+            [f"{r.id}" for r in ranked[1:]] or [ranked[0].id],
+            {"1위 대비 외삽 RMSE 증가":
+                np.array([r.test_rmse - base for r in ranked[1:]] or [0.0])},
+            f"1위({ranked[0].id}) 대비 RMSE 차이 [{unit}]",
+            "차이의 크기를 계측 불확도와 견준다",
+            value_fmt="{:.3f}", threshold=thr,
+            threshold_label=f"실무적 구분 한계 (계측 불확도의 "
+                            f"{result.practical_fraction*100:.0f}%)" if thr else ""),
+            f"막대가 판정선 왼쪽에 있으면 그 후보는 1위와 실무적으로 같습니다. "
+            f"계측 불확도 σ = {sigma:.3g} {unit}.")
+        rep.figure(grouped_bar_fig(
+            [r.id for r in ranked],
+            {"학습 구간 RMSE": np.array([r.train_rmse for r in ranked]),
+             "외삽 구간 RMSE": np.array([r.test_rmse for r in ranked])},
+            f"RMSE [{unit}]", "절대값으로 보면 네 후보가 겹친다"),
+            "같은 데이터를 절대값으로 그린 것. 눈으로는 구분되지 않는다 — 그게 결론이다.")
+
+    rep.h2("3. 판정")
+    rep.bullets([v.replace("**", "<b>", 1).replace("**", "</b>", 1) if "**" in v else v
+                 for v in result.verdict()])
+    rep.note(
+        "<b>1등만 보고 고르지 마세요.</b> 외삽 오차가 비슷하면 파라미터가 적은 쪽이 낫습니다. "
+        "식별성이 무너진 후보는 예측이 맞더라도 파라미터를 물리적으로 해석할 수 없습니다. "
+        "파라미터가 허용 경계에 붙었다면 대개 모델 형태 자체가 데이터와 맞지 않는다는 "
+        "신호입니다.", kind="warn")
+
+    rep.h2("4. 운전구간별 예측 비교")
+    rep.html(_selection_curve(result, ok, unit))
+
+    rep.h2("5. 한계")
+    rep.bullets([
+        "AICc 는 <b>학습 구간 적합도</b> 기반이라 외삽 능력을 직접 재지 못합니다. "
+        "파라미터 수가 값을 하는지 보는 보조 지표로만 쓰세요.",
+        "외삽 검증은 <b>운전영역으로 자른 분할</b>입니다. 무작위 k-fold 로 하면 학습과 검증이 "
+        "같은 분포가 되어 외삽 능력을 전혀 못 잽니다.",
+        "후보 집합 밖에 정답이 있으면 이 비교는 <b>가장 덜 틀린 것</b>을 고를 뿐입니다. "
+        "모든 후보의 외삽 오차가 크면 형태를 더 찾아야 한다는 뜻입니다.",
+    ])
+    return rep.render(out_path)
+
+
+def _selection_curve(result, ok, unit: str) -> str:
+    """가동율 구간별 평균: 실측 vs 최선/최악 후보."""
+    import numpy as np
+    from .html import fig_to_img
+
+    cfg = result.config
+    if len(ok) < 1:
+        return ""
+    drive = next((c for c in result.train.columns if c.endswith(".util")), None)
+    if drive is None:
+        return ""
+    full = pd.concat([result.train, result.test]).sort_index()
+    x = full[drive].to_numpy()
+    meas = _conv(full[cfg.target], unit)
+    best = min(ok, key=lambda r: r.test_rmse)
+    worst = max(ok, key=lambda r: r.test_rmse)
+    picks = [("실측 (구간평균)", meas)]
+    for r in ([best] if best is worst else [best, worst]):
+        pred = pd.concat([r.train_pred, r.test_pred]).sort_index()
+        picks.append((f"{r.id}", _conv(pred, unit)))
+
+    bins = np.linspace(np.nanmin(x), np.nanmax(x), 13)
+    centers, cols = [], [[] for _ in picks]
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        sel = (x >= lo) & (x < hi)
+        if sel.sum() < 5:
+            continue
+        centers.append(0.5 * (lo + hi))
+        for j, (_, arr) in enumerate(picks):
+            cols[j].append(float(np.nanmean(arr[sel])))
+    series = {name: np.array(vals) for (name, _), vals in zip(picks, cols)}
+    tr = result.train[drive]
+    fig = sweep_fig(np.array(centers), series, f"{drive} [-]", f"{cfg.target} [{unit}]",
+                    train_range=(float(tr.min()), float(tr.max())),
+                    title="후보별 예측 — 보정 구간 밖에서 갈라진다")
+    return (f'<figure>{fig_to_img(fig, "후보 비교 곡선")}<figcaption>'
+            f'음영 구간이 보정에 쓴 영역이다. 그 안에서는 후보가 겹치고, 밖으로 나가면 '
+            f'벌어진다.</figcaption></figure>')

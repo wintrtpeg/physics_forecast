@@ -1,0 +1,19 @@
+# 후보 C — NTU 지수형 + 온도 의존항 (의도적으로 과다 매개변수화).
+#
+#     NTU = a * (L/G)^b * (T_in / 313.15K)^c
+#
+# 흡수 속도가 온도에 의존한다는 것 자체는 물리적으로 맞는 이야기다. 문제는
+# 이 계통에서 스크러버 입구 온도가 거의 변하지 않는다는 점이다. 그러면 c 는
+# 데이터로 결정되지 않고, a 와 상쇄되어 아무 값이나 가능해진다.
+#
+# 이 후보를 넣는 이유: 툴이 **과다 매개변수화를 잡아내는지** 확인하기 위해서다.
+# 학습 잔차는 같거나 줄지만 식별성이 무너지고 AICc 가 벌점을 먹어야 정상이다.
+
+extends: scrubber_base.yaml
+description: NTU 지수형 + 온도 보정 (과다 매개변수화 대조군)
+
+params:
+  ntu_c: {value: 1.0, unit: "1", desc: NTU 온도 지수, lo: -6.0, hi: 6.0, tunable: true}
+
+equations:
+  closure_eta: "eta = eta_max * (1 - exp(-ntu_a * LG^ntu_b * (a.T / 313.15[K])^ntu_c))"

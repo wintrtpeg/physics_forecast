@@ -193,6 +193,14 @@ class Component:
         """리포트용 파생량. ``{이름: (식, 표시단위)}``."""
         return {}
 
+    def equation_labels(self) -> list[str] | None:
+        """방정식에 붙일 이름. ``None`` 이면 ``eq[0]``, ``eq[1]`` ... 로 번호를 쓴다.
+
+        YAML 선언형 컴포넌트는 방정식마다 이름이 있으므로, 수렴 실패나 구조 오류
+        메시지에 ``SCR.mass_balance`` 처럼 뜬다. 번호보다 훨씬 빨리 원인을 찾는다.
+        """
+        return None
+
     def initial_guess(self, inlets: dict[str, dict[str, float]]) -> dict[str, Any]:
         """초기값 전파 훅.
 

@@ -55,6 +55,8 @@ pf solve     examples/nox_stack/model.py          # 설계점 정상상태 풀�
 python examples/nox_stack/make_synthetic_data.py  # 가상 현장 데이터 30일치 생성
 pf calibrate examples/nox_stack/calibration.yaml  # 보정 + 외삽 검증 + HTML 리포트
 pf run       examples/nox_stack/scenarios.yaml -o out/scenario.html   # what-if
+pf select    examples/nox_stack/selection.yaml    # 구성방정식 후보 비교
+pf equations examples/nox_stack/system.yaml --dims # 조립된 방정식과 차원 확인
 ```
 
 VS Code 에서는 `Ctrl+Shift+B` 로 구조검사, `터미널 → 작업 실행`에 나머지가 등록되어
@@ -155,6 +157,61 @@ limits:
 
 ---
 
+## 지배방정식을 직접 선언한다
+
+컴포넌트를 파이썬으로 짤 필요가 없습니다. YAML 에 방정식을 그대로 적으면
+**손으로 짠 것과 완전히 같은 식 그래프**가 나옵니다 (해석적 미분·차원 검사·구조
+해석 모두 그대로 적용).
+
+```yaml
+ports:
+  a: {kind: gas, role: in}
+  b: {kind: gas, role: out}
+params:
+  K: {value: 30, unit: "1/m4", tunable: true}
+vars:
+  dp:  {unit: Pa, start: 100}
+  rho: {unit: kg/m3, start: 1.15, lo: 0.05, hi: 10}
+equations:
+  mass:     "a.mdot + b.mdot = 0"
+  state:    "rho = density(a)"
+  friction: "dp = K * signed_pow(a.mdot, 2) / rho"
+  momentum: "a.p - b.p = dp"
+```
+
+수치 리터럴에 단위를 달 수 있습니다 (`150[mmAq]`, `4186[J/(kg*K)]`). 달지 않은
+숫자는 무차원으로 취급되므로, 차원이 있는 상수는 반드시 달아야 검사가 삽니다.
+
+포트 종류는 `gas` / `liquid` / `thermal` 이 기본 제공되고 추가할 수 있습니다.
+`tests/test_generic.py` 에 **액체 배관 계통을 파이썬 0줄로** 만들어 해석해와
+대조하는 예가 있습니다.
+
+## 구성방정식 후보를 데이터로 고른다
+
+`extends` 로 기본 정의를 상속하고 **방정식 한 줄만** 갈아끼웁니다.
+
+```yaml
+extends: scrubber_base.yaml
+params:
+  k_LG: {value: 3.5e-3, unit: "1", lo: 1.0e-6, hi: 1.0, tunable: true}
+equations:
+  closure_eta: "eta = eta_max * LG / (k_LG + LG)"     # 이 줄만 다르다
+```
+
+```bash
+pf select examples/nox_stack/selection.yaml
+```
+
+**후보로 둘 수 있는 것과 없는 것이 명확히 갈립니다.**
+
+| | 후보? |
+|---|---|
+| 질량·운동량·에너지·화학종 보존, 상태방정식 | **아니오. 공리다.** |
+| 구성방정식 — 마찰/물질전달/열전달 상관식, 성능곡선 | **예.** |
+
+보존법칙을 후보로 돌리면 외삽 보증이 사라집니다. 그러면 물리모델을 쓸 이유가
+없습니다. 자세한 내용은 [`docs/generalization.md`](docs/generalization.md).
+
 ## 구조
 
 ```
@@ -162,6 +219,7 @@ src/pforecast/
 ├─ core/                 # 도메인 비의존 엔진
 │  ├─ units.py           # 단위 파서 + 7차원 벡터. 방정식 차원 동차성 검사
 │  ├─ symbolic.py        # 식 그래프 → 해석적 미분 → numpy 코드 생성 (자체 구현)
+│  ├─ parser.py          # 방정식 텍스트 → 식 그래프 (YAML 선언형의 토대)
 │  ├─ component.py       # Component / Port(across·through·stream) / Scope
 │  ├─ system.py          # 연결 → 방정식 조립 → 희소 야코비안 컴파일
 │  ├─ structural.py      # 매칭, Dulmage-Mendelsohn, BLT 블록 분할
@@ -169,11 +227,13 @@ src/pforecast/
 ├─ lib/                  # 물리 컴포넌트 라이브러리
 │  ├─ gas.py             # 이상기체 혼합물 물성, 습공기, 표준상태 환산
 │  ├─ flow.py            # Duct, Fan, Mixer
-│  └─ abatement.py       # ToolGroupSource, WetScrubber, Stack
+│  ├─ abatement.py       # ToolGroupSource, WetScrubber, Stack
+│  └─ generic.py         # EquationComponent — YAML 선언형 컴포넌트
 ├─ data/                 # 태그맵(YAML) + CSV/SQL 어댑터 + 5분 평균 정렬
 ├─ calib/                # 파라미터 추정, 식별성 진단, ML 기준모델
 ├─ scenario/             # 모델 로더(py/yaml), what-if 실행기
 ├─ report/               # 자체 완결형 HTML 리포트
+├─ selection.py          # 구성방정식 후보 비교·판정
 ├─ params.py             # 보정값 저장/적용 (라인별로 파일만 교체)
 ├─ workflow.py           # 데이터 → 보정 → 검증 → 리포트
 └─ cli.py                # pf 명령
@@ -235,3 +295,4 @@ src/pforecast/
 * [`docs/architecture.md`](docs/architecture.md) — 계층 구조와 설계 판단의 근거
 * [`docs/adding_components.md`](docs/adding_components.md) — 새 컴포넌트 만들기
 * [`docs/nox_model.md`](docs/nox_model.md) — NOx 모델의 물리와 검증
+* [`docs/generalization.md`](docs/generalization.md) — 방정식 직접 선언, 후보 비교, LLM 의 자리
