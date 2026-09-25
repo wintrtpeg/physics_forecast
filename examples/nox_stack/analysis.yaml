@@ -1,0 +1,46 @@
+# 데이터 주도 분석 — 타깃 컬럼만 지정하면 사다리를 자동으로 올라간다.
+#
+#   pf analyze examples/nox_stack/analysis.yaml
+#
+# units: 를 채우는 것이 이 설정에서 가장 중요하다. 단위를 알려주면 차원 해석과
+# 보존식 탐지(L2/L3)가 열린다. 단위 없이도 L0/L1 은 돌지만, 그건 그냥 ML 이다.
+
+name: 굴뚝 NOx 데이터 주도 분석
+
+data:
+  csv: data/plant_5min.csv
+  timestamp: timestamp
+
+target:
+  column: F2_UT_STK01_NOX_DRY
+  unit: mg/Nm3
+
+units:
+  F2_UT_STK01_NOX_DRY:      mg/Nm3
+  F2_UT_STK01_FLOW:         Nm3/h
+  F2_UT_STK01_TEMP:         degC
+  F2_UT_SCR01_FAN_SP:       mmAq
+  F2_UT_SCR01_DP:           mmAq
+  F2_UT_AMB_TEMP:           degC
+  F2_UT_SCR01_FAN_HZ:       Hz
+  F2_FAB_DRY_UTIL:          "%"
+  F2_FAB_CVD_UTIL:          "%"
+  F2_FAB_WET_UTIL:          "%"
+  F2_FAB_IMP_UTIL:          "%"
+  # 지류 유량계 — 이 다섯 개 사이에 질량 보존이 성립한다. 툴이 찾아내는지 본다.
+  F2_UT_SCR01_BR_DRY_FLOW:  kg/s
+  F2_UT_SCR01_BR_CVD_FLOW:  kg/s
+  F2_UT_SCR01_BR_WET_FLOW:  kg/s
+  F2_UT_SCR01_BR_IMP_FLOW:  kg/s
+  F2_UT_SCR01_HDR_FLOW:     kg/s
+
+# 운전자가 실제로 바꿀 수 있는 변수만 적는다. 개선 탐색은 여기만 움직인다.
+controllable:
+  - F2_UT_SCR01_FAN_HZ
+
+objective: minimize
+
+split:
+  train_fraction: 0.6        # 시간순 앞 60% 학습, 뒤 40% 검증 (무작위 분할 금지)
+
+report: out/analysis.html

@@ -19,7 +19,11 @@ dependencies = [
 # 사내 PC에서 설치 가능한 것만. GPU/torch 계열 의존성은 절대 넣지 않는다.
 plot = ["matplotlib>=3.7"]
 sql = ["SQLAlchemy>=2.0"]
+# pf analyze 의 대리모델. CPU 전용이라 사내 PC 에 설치된다.
+# 없으면 다항 릿지로 자동 대체되므로 필수는 아니다.
+ml = ["scikit-learn>=1.3"]
 dev = ["pytest>=7.4"]
+all = ["matplotlib>=3.7", "SQLAlchemy>=2.0", "scikit-learn>=1.3"]
 
 [project.scripts]
 pf = "pforecast.cli:main"

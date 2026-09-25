@@ -388,3 +388,214 @@ def _selection_curve(result, ok, unit: str) -> str:
     return (f'<figure>{fig_to_img(fig, "후보 비교 곡선")}<figcaption>'
             f'음영 구간이 보정에 쓴 영역이다. 그 안에서는 후보가 겹치고, 밖으로 나가면 '
             f'벌어진다.</figcaption></figure>')
+
+
+def analysis_report(result, out_path: str | Path) -> Path:
+    """데이터 주도 분석(XAI) 대시보드.
+
+    화면 구성의 원칙: **읽는 사람이 결과를 오독하지 못하게 한다.** 그래서
+    숫자보다 먼저 '이 숫자를 어떻게 읽어야 하는가'를 띄우고, 상관으로 얽힌
+    영향도는 묶음 기준을 먼저 보여준 뒤 개별 순위를 경고와 함께 붙인다.
+    """
+    import numpy as np
+
+    from ..analyze.surrogate import partial_dependence
+
+    cfg = result.config
+    s = result.surrogate
+    rep = Report(f"{cfg.name}", f"타깃 {cfg.target} · 데이터 {result.profile.n_rows:,}행")
+
+    # --- 요약 타일 ---
+    tiles = []
+    if s is not None:
+        skill = s.skill
+        tiles.append({"label": "설명력 (교차검증 R²)", "value": f"{s.r2_cv:.3f}",
+                      "note": f"{s.model_name} · 시간블록 5-fold",
+                      "status": "good" if s.r2_cv > 0.7 else "warn" if s.r2_cv > 0.3 else "bad"})
+        tiles.append({"label": "예측오차 RMSE", "value": f"{s.rmse_cv:.3g}",
+                      "unit": f" {s.unit}",
+                      "note": f"평균예측 대비 {skill*100:.0f}% 개선" if np.isfinite(skill) else ""})
+    sure = [b for b in result.balances if b.confidence == "확실"]
+    tiles.append({"label": "자동 발견 보존식", "value": f"{len(sure)}", "unit": "개",
+                  "note": "데이터가 스스로 만족하는 물리 제약",
+                  "status": "good" if sure else ""})
+    if np.isfinite(result.holdout_outside):
+        tiles.append({"label": "검증구간 외삽 비율",
+                      "value": f"{result.holdout_outside*100:.1f}", "unit": "%",
+                      "note": "학습 포락선 밖 = 대리모델 근거 없음",
+                      "status": "bad" if result.holdout_outside > 0.2 else
+                                "warn" if result.holdout_outside > 0.05 else "good"})
+    rep.tiles(tiles)
+
+    rep.h2("먼저 읽을 것")
+    rep.bullets(result.headline(), markdown=True)
+
+    # --- 사다리 ---
+    rep.h2("1. 분석 사다리 — 어디까지 갔고 어디서 막혔는가")
+    rep.note(
+        "데이터만으로 되는 것(L0~L3)과 사람이 구조를 줘야 하는 것(L4~L5)은 다릅니다. "
+        "<b>컬럼 이름과 숫자만으로는 '무엇이 무엇에 연결되는가'를 유도할 수 없습니다.</b> "
+        "그래서 이 도구는 자동으로 갈 수 있는 데까지 가고, 그다음에 무엇이 더 필요한지 "
+        "구체적으로 알려주는 방식으로 설계했습니다.")
+    rep.table(result.ladder_table())
+
+    # --- 발견된 물리 ---
+    rep.h2("2. 데이터에서 자동으로 찾은 물리")
+    if result.balances:
+        rep.h3("보존식 후보")
+        rep.table(pd.DataFrame([{
+            "신뢰도": b.confidence, "관계식": b.formula(), "차원": b.dimension,
+            "상대잔차[%]": b.residual_rel * 100, "R²": b.r2,
+            "보존식 형태": "예" if b.is_conservation else "아니오",
+        } for b in result.balances]))
+        rep.note(
+            "같은 차원을 가진 컬럼들 사이에서 <b>계수가 작은 정수인 선형 관계</b>만 "
+            "찾습니다. 그래야 나온 식이 차원적으로 옳고 사람이 읽을 수 있습니다. "
+            "차원을 무시하고 항 사전을 훑는 방식(SINDy 류)은 현장 노이즈에서 무너지고 "
+            "보존법칙을 위반하는 식을 내놓습니다.<br><br>"
+            "<b>신뢰도 '우연 의심'</b>은 잔차는 작지만 R²가 낮은 경우입니다 — 크기가 "
+            "비슷한 두 신호가 우연히 맞아떨어진 것일 수 있습니다.")
+    else:
+        rep.text("같은 차원의 컬럼 묶음에서 성립하는 선형 관계를 찾지 못했습니다.")
+    nontrivial = [g for g in result.pis if len(g.exponents) > 1]
+    if nontrivial:
+        rep.h3("무차원군 (Buckingham Π)")
+        rep.table(pd.DataFrame([{
+            "무차원군": g.formula(), "타깃 포함": "예" if g.contains_target else "",
+        } for g in nontrivial]))
+        rep.note(
+            "무차원군으로 회귀하면 모델이 <b>상사법칙을 정확히 만족</b>합니다. 순수 회귀와 "
+            "달리 스케일 방향으로는 외삽이 성립하므로, 물리모델과 ML 사이의 중간 사다리로 "
+            "쓸 수 있습니다.")
+
+    if s is None:
+        return rep.render(out_path)
+
+    # --- 예측 ---
+    rep.h2("3. 예측 성능")
+    if s.pred is not None:
+        step = max(1, len(s.pred) // 1500)
+        idx = s.pred.index[::step]
+        meas = result.df.loc[s.pred.index, cfg.target].to_numpy()[::step]
+        rep.figure(timeseries_fig(
+            idx, {"실측": meas, "예측 (교차검증)": s.pred.to_numpy()[::step]},
+            f"{cfg.target} [{s.unit}]", "시간블록 교차검증 예측"),
+            "각 구간은 그 구간을 빼고 학습한 모델로 예측한 값입니다. "
+            "무작위 k-fold 를 쓰면 앞뒤 시점이 서로 새어 들어가 성능이 과대평가됩니다.")
+        ok = np.isfinite(s.pred.to_numpy()) & np.isfinite(
+            result.df.loc[s.pred.index, cfg.target].to_numpy())
+        rep.figure(parity_fig(
+            {"교차검증": (result.df.loc[s.pred.index, cfg.target].to_numpy()[ok],
+                          s.pred.to_numpy()[ok])},
+            f"{cfg.target} [{s.unit}]", "예측-실측 대응도"),
+            "회색 띠는 ±10%.")
+    rep.table(pd.DataFrame([{
+        "지표": "교차검증 RMSE", "값": s.rmse_cv,
+    }, {"지표": "교차검증 MAE", "값": s.mae_cv},
+        {"지표": "교차검증 R²", "값": s.r2_cv},
+        {"지표": "학습 RMSE (참고)", "값": s.rmse_train},
+        {"지표": "평균예측 RMSE (기준선)", "값": s.baseline_rmse},
+        {"지표": "홀드아웃 RMSE", "값": result.holdout_rmse}]),
+        f"단위 {s.unit}. 학습 RMSE 가 교차검증보다 훨씬 작으면 과적합입니다.")
+
+    # --- 영향인자 ---
+    rep.h2("4. 영향인자 분석 (XAI)")
+    rep.h3("4-1. 인자 묶음 기준 — 이쪽을 먼저 보세요")
+    rep.note(
+        "순열 중요도는 <b>서로 상관된 변수들 사이에서 기여를 임의로 나눠 갖습니다.</b> "
+        "그래서 상관 0.9 이상인 변수를 묶어 <b>함께 섞은</b> 결과를 먼저 보여줍니다. "
+        "묶음 안의 순위는 데이터가 결정해 주지 못합니다.")
+    rep.table(s.cluster_table())
+    if s.clusters:
+        rep.figure(grouped_bar_fig(
+            [c.label for c in s.clusters[:8]],
+            {"묶음 중요도": np.array([c.importance_pct for c in s.clusters[:8]])},
+            "중요도 [%]", "인자 묶음별 기여", value_fmt="{:.1f}%"),
+            "묶음 단위로 잰 값. 구성 변수는 위 표를 보세요.")
+
+    rep.h3("4-2. 개별 순열 중요도 — 얽힘 표시를 반드시 같이 보세요")
+    rep.table(s.importance_table())
+    ent = [i for i in s.importances if i.entangled]
+    if ent:
+        rep.note(
+            f"<b>{len(ent)}개 변수가 다른 변수와 상관 0.8 을 넘습니다.</b> 이 변수들의 "
+            "개별 순위는 모델이 어느 쪽을 먼저 썼는지에 따라 달라질 뿐, 인과의 크기가 "
+            "아닙니다. 실제로 이 예제에서는 NOx 발생량이 가장 적은 장비군이 1위로 "
+            "올라왔습니다.", kind="warn")
+
+    # --- 부분의존도 ---
+    pdp_targets = []
+    for c in s.clusters[:4]:
+        member = max(c.members, key=lambda m: next(
+            (i.importance for i in s.importances if i.feature == m), 0.0))
+        pdp_targets.append((member, c.is_group))
+    if pdp_targets and s.model is not None:
+        rep.h3("4-3. 부분의존도 (변수를 바꾸면 예측이 어떻게 변하는가)")
+        X = result.df[s.features].dropna()
+        Xn = X.to_numpy(dtype=float)
+        for name, is_group in pdp_targets[:3]:
+            j = s.features.index(name)
+            lo, hi = float(np.nanpercentile(Xn[:, j], 2)), float(np.nanpercentile(Xn[:, j], 98))
+            if not np.isfinite(lo + hi) or hi <= lo:
+                continue
+            grid = np.linspace(lo, hi, 25)
+            pd_vals = partial_dependence(s.model, Xn, j, grid)
+            title = f"{name}" + (" (묶음 대표 — 개별 해석 불가)" if is_group else "")
+            rep.figure(sweep_fig(grid, {"예측 평균": pd_vals}, name,
+                                 f"{cfg.target} [{s.unit}]", title=title,
+                                 figsize=(6.6, 3.2)),
+                       ("이 변수는 다른 변수와 강하게 얽혀 있어, 곡선의 기울기를 "
+                        "'이 변수만 바꿨을 때의 효과'로 읽으면 안 됩니다."
+                        if is_group else
+                        "다른 변수는 실제 분포에서 표본추출해 평균낸 곡선입니다."))
+
+    # --- 외삽 ---
+    rep.h2("5. 외삽 경고")
+    if s.envelope is not None:
+        env_rows = []
+        for f in s.features:
+            env_rows.append({"피처": f, "학습 최소": s.envelope.lo.get(f, np.nan),
+                             "학습 최대": s.envelope.hi.get(f, np.nan)})
+        rep.table(pd.DataFrame(env_rows), "이 범위를 벗어난 입력에 대한 대리모델 예측은 "
+                                          "근거가 없습니다.")
+    rep.note(
+        f"검증 구간의 <b>{result.holdout_outside*100:.1f}%</b> 가 학습 포락선 밖입니다. "
+        "외삽이 필요한 질문(증설, 설비 교체, 가동율 상향)은 대리모델로 답할 수 없습니다 — "
+        "지배방정식 모델(L4)로 넘어가야 합니다.",
+        kind="bad" if result.holdout_outside > 0.2 else "warn")
+
+    # --- 개선안 ---
+    if result.improvement is not None:
+        imp = result.improvement
+        rep.h2("6. 개선안 (제어 가능한 변수만)")
+        rep.table(pd.DataFrame([{
+            "제어변수": k, "제안값": v,
+            "학습 범위": f"{s.envelope.lo.get(k, np.nan):.4g} ~ {s.envelope.hi.get(k, np.nan):.4g}",
+        } for k, v in imp.settings.items()]))
+        rep.table(pd.DataFrame([{
+            "기준 예측": imp.baseline_value, "개선 후 예측": imp.predicted_value,
+            "변화[%]": imp.change_pct, "포락선 이탈": imp.extrapolation,
+            "채택 가능": "예" if imp.feasible else "아니오 (범위 밖)",
+        }]))
+        ctrl_share = sum(c.importance_pct for c in s.clusters
+                         if set(c.members) & set(cfg.controllable))
+        rep.note(
+            f"제어변수가 설명하는 비중은 전체의 <b>{ctrl_share:.1f}%</b> 입니다. "
+            + ("이 정도로 약한 신호에서 나온 개선 방향은 부호가 뒤집히기도 합니다. "
+               "<b>물리 모델로 반드시 교차검증하세요.</b>" if ctrl_share < 5 else
+               "영향력이 충분하므로 제안을 검토할 만합니다."),
+            kind="bad" if ctrl_share < 5 else "")
+
+    # --- 한계 ---
+    rep.h2("7. 이 분석의 한계")
+    rep.bullets([
+        "<b>대리모델은 학습 포락선 안에서만 유효합니다.</b> 증설·설비교체·운전방식 변경처럼 "
+        "과거에 없던 조건은 원리적으로 답할 수 없습니다.",
+        "<b>영향인자는 상관이지 인과가 아닙니다.</b> 특히 한 덩어리로 묶인 변수들 사이에서는 "
+        "순위 자체가 의미 없습니다.",
+        "<b>보존식 탐지는 같은 차원의 컬럼이 2개 이상 있을 때만</b> 동작합니다. 지류별 "
+        "유량계처럼 합이 맞아야 하는 계측을 함께 넣을수록 많이 찾습니다.",
+        "<b>계통 토폴로지는 데이터에서 유도할 수 없습니다.</b> L4 로 가려면 컴포넌트 목록, "
+        "연결 관계, 설계 제원 세 가지를 사람이 줘야 합니다.",
+    ])
+    return rep.render(out_path)

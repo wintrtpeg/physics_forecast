@@ -56,6 +56,7 @@ python examples/nox_stack/make_synthetic_data.py  # 가상 현장 데이터 30�
 pf calibrate examples/nox_stack/calibration.yaml  # 보정 + 외삽 검증 + HTML 리포트
 pf run       examples/nox_stack/scenarios.yaml -o out/scenario.html   # what-if
 pf select    examples/nox_stack/selection.yaml    # 구성방정식 후보 비교
+pf analyze   examples/nox_stack/analysis.yaml     # 데이터 주도 분석 + XAI 대시보드
 pf equations examples/nox_stack/system.yaml --dims # 조립된 방정식과 차원 확인
 ```
 
@@ -157,6 +158,55 @@ limits:
 
 ---
 
+## 데이터만 있을 때 — `pf analyze`
+
+계통 구조를 모르는 상태에서도 타깃 컬럼 하나만 지정하면 **자동으로 갈 수 있는
+데까지** 올라가고, 어디서 왜 막혔는지 알려줍니다.
+
+| 단계 | 내용 | 필요한 것 | 자동? |
+|---|---|---|---|
+| L0 | 프로파일링, 운전 포락선, 준정상 구간 | 데이터만 | ✅ |
+| L1 | 대리모델 + XAI (중요도·부분의존도·지연) | 타깃 지정 | ✅ |
+| L2 | 무차원군 (Buckingham Π) | **컬럼 단위** | ✅ |
+| L3 | **보존식 자동 탐지** | **컬럼 단위** | ✅ |
+| L4 | 구조 지배방정식 모델 | **토폴로지 + 설비 제원** | ❌ |
+
+**L4 는 자동화할 수 없습니다.** 컬럼 이름과 숫자만으로 "이건 스크러버이고 뒤에
+팬이 달려 있다"를 유도할 수는 없습니다. 토폴로지는 물리적 사실이지 데이터의
+통계적 성질이 아닙니다. 대신 L0~L3 이 그 앞까지를 전부 자동으로 끌어줍니다.
+
+### L3 이 실제로 찾아낸 것
+
+```
+[확실]      BR_DRY + BR_CVD + BR_WET + BR_IMP − HDR = 0    잔차 0.31%, R² 0.986
+[우연 의심] BR_DRY − BR_WET = 0                             잔차 2.00%, R² 0.479
+```
+
+첫 번째는 **질량 보존**입니다. 회귀계수가 아니라 물리 제약이라 외삽에서도 성립합니다.
+두 번째는 크기가 비슷한 두 신호의 우연한 일치이고, 자동으로 걸러집니다.
+
+### XAI 가 틀린 답을 낸 사례 — 그리고 고친 방법
+
+정답을 아는 합성 데이터로 돌렸더니 개별 순열 중요도가 **완전히 뒤집힌 순위**를
+냈습니다:
+
+| | 진짜 기여 | 개별 순열 중요도 |
+|---|---|---|
+| DRY 장비군 | **60.4%** | 11.4% (4위) |
+| WET 장비군 | 7.3% | **35.5%** (1위) |
+
+원인은 네 가동율의 상호 상관 **0.9996**. 순열 중요도는 상관된 변수 사이에서 기여를
+임의로 나눠 갖습니다. 그래서 상관 0.9 이상을 묶어 **함께 섞는** 방식으로 바꿨고,
+결과가 정직해졌습니다:
+
+> 영향의 **93.2%** 가 서로 구분되지 않는 한 덩어리(11개 변수)에 있습니다.
+> 이 안에서 누가 원인인지는 **이 데이터로 알 수 없습니다.**
+
+그리고 이게 물리 모델이 필요한 이유입니다 — 지배방정식에서는 각 장비군의 배출계수가
+각자의 질량수지에 **구조적으로 다른 자리**로 들어가므로 분리 가능성이 생깁니다.
+
+자세한 내용은 [`docs/data_driven.md`](docs/data_driven.md).
+
 ## 지배방정식을 직접 선언한다
 
 컴포넌트를 파이썬으로 짤 필요가 없습니다. YAML 에 방정식을 그대로 적으면
@@ -233,6 +283,11 @@ src/pforecast/
 ├─ calib/                # 파라미터 추정, 식별성 진단, ML 기준모델
 ├─ scenario/             # 모델 로더(py/yaml), what-if 실행기
 ├─ report/               # 자체 완결형 HTML 리포트
+├─ analyze/              # 데이터 주도 분석 사다리
+│  ├─ profile.py         # 프로파일링, 운전 포락선, 준정상 구간
+│  ├─ dimensional.py     # 무차원군(Buckingham Π), 보존식 자동 탐지
+│  ├─ surrogate.py       # 대리모델 + XAI (묶음 순열 중요도, PDP, 외삽 거리)
+│  └─ pipeline.py        # 사다리 실행과 판정
 ├─ selection.py          # 구성방정식 후보 비교·판정
 ├─ params.py             # 보정값 저장/적용 (라인별로 파일만 교체)
 ├─ workflow.py           # 데이터 → 보정 → 검증 → 리포트
@@ -296,3 +351,4 @@ src/pforecast/
 * [`docs/adding_components.md`](docs/adding_components.md) — 새 컴포넌트 만들기
 * [`docs/nox_model.md`](docs/nox_model.md) — NOx 모델의 물리와 검증
 * [`docs/generalization.md`](docs/generalization.md) — 방정식 직접 선언, 후보 비교, LLM 의 자리
+* [`docs/data_driven.md`](docs/data_driven.md) — 타깃만 지정해서 어디까지 자동인가 (XAI)

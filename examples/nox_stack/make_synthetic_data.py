@@ -47,6 +47,17 @@ TAGS = {
     "SCR.dp_mmAq": "F2_UT_SCR01_DP",
 }
 
+#: 지류별 질량유량계. 현장에 늘 있지는 않지만 있으면 가치가 크다 -
+#: 이 컬럼들 사이에 성립하는 질량 보존을 툴이 **자동으로 찾아낸다**.
+FLOW_TAGS = {
+    "SRC_DRY.mdot": "F2_UT_SCR01_BR_DRY_FLOW",
+    "SRC_CVD.mdot": "F2_UT_SCR01_BR_CVD_FLOW",
+    "SRC_WET.mdot": "F2_UT_SCR01_BR_WET_FLOW",
+    "SRC_IMP.mdot": "F2_UT_SCR01_BR_IMP_FLOW",
+    "HDR.mdot_total": "F2_UT_SCR01_HDR_FLOW",
+}
+FLOW_SENSOR = dict(unit="kg/s", noise=0.012, bias=0.0)
+
 
 def utilization_profile(n: int, rng: np.random.Generator) -> np.ndarray:
     """현실적인 가동율 시계열: 완만한 추세 + 주간 주기 + 단기 변동 + 가끔 감산."""
@@ -98,7 +109,7 @@ def main() -> None:
     expansion = {"STK.T_amb": ["STK.T_amb", "DCT_MAIN.T_amb"]
                  + [f"DCT_{g[0]}.T_amb" for g in TOOL_GROUPS]}
     rows = build_param_rows(model, inputs, base_p=model.p0(), expansion=expansion)
-    targets = list(SENSOR)
+    targets = list(SENSOR) + list(FLOW_TAGS)
     print(f"{n} 스텝 시뮬레이션 중 ...")
     sim = simulate(model, rows, targets, index=idx)
     print(f"  수렴률 {sim.success_rate*100:.2f}%")
@@ -106,6 +117,9 @@ def main() -> None:
     from pforecast.core.units import from_si
     out = pd.DataFrame(index=idx)
     out.index.name = "timestamp"
+    for name, tag in FLOW_TAGS.items():
+        true_disp = np.array([from_si(v, FLOW_SENSOR["unit"]) for v in sim.values[name]])
+        out[tag] = np.round(true_disp + rng.normal(0, FLOW_SENSOR["noise"], n), 4)
     for name, spec in SENSOR.items():
         unit = spec["unit"]
         true_disp = np.array([from_si(v, unit) for v in sim.values[name]])

@@ -134,6 +134,38 @@ def cmd_select(args) -> int:
     return 0
 
 
+def cmd_analyze(args) -> int:
+    from .analyze import AnalysisConfig, run_analysis
+    from .report import analysis_report
+    cfg = AnalysisConfig.load(args.config)
+    if args.target:
+        cfg.target = args.target
+    if args.steady_only:
+        cfg.steady_only = True
+    t0 = time.perf_counter()
+    res = run_analysis(cfg)
+    print(f"완료 ({time.perf_counter()-t0:.1f}s)\n")
+    import pandas as pd
+    pd.set_option("display.width", 200, "display.max_columns", 20, "display.max_colwidth", 60)
+    print("[분석 사다리]")
+    print(res.ladder_table()[["단계", "내용", "상태", "결과"]].to_string(index=False))
+    print("\n[먼저 읽을 것]")
+    for h in res.headline():
+        print("  - " + h.replace("**", ""))
+    if res.balances:
+        print("\n[자동 발견 물리 관계]")
+        for b in res.balances:
+            print(f"  [{b.confidence}] {b.formula()}  (잔차 {b.residual_rel*100:.2f}%)")
+    if res.surrogate is not None:
+        print("\n[인자 묶음 중요도]")
+        print(res.surrogate.cluster_table().to_string(index=False,
+                                                      float_format=lambda v: f"{v:.4g}"))
+    out = args.out or cfg.report_out
+    if out:
+        print(f"\n대시보드: {analysis_report(res, out)}")
+    return 0
+
+
 def cmd_equations(args) -> int:
     """모델의 방정식을 이름과 함께 나열한다. 선언형 컴포넌트 디버깅용."""
     system = _load(args.model, args.builder)
@@ -273,6 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", help="케이스 결과 CSV 경로")
     c.add_argument("--params", help="보정 파라미터 YAML")
     c.set_defaults(func=cmd_run)
+
+    c = sub.add_parser("analyze", help="타깃 컬럼을 지정해 데이터 주도 분석 + XAI 대시보드")
+    c.add_argument("config")
+    c.add_argument("-o", "--out", help="HTML 대시보드 경로")
+    c.add_argument("--target", help="타깃 컬럼 (설정 파일을 덮어씀)")
+    c.add_argument("--steady-only", action="store_true", help="준정상 구간만 사용")
+    c.set_defaults(func=cmd_analyze)
 
     c = sub.add_parser("select", help="구성방정식 후보를 비교해 고른다")
     c.add_argument("config")

@@ -15,7 +15,7 @@ python -m pforecast.cli check examples/nox_stack/model.py
 
 ```
 L5 cli.py / workflow.py
-L4 scenario/ report/ selection.py
+L4 scenario/ report/ selection.py analyze/
 L3 data/ calib/
 L2 lib/            <- 도메인(배기/열/유체) 지식은 여기까지만
 L1 core/system.py core/structural.py core/solvers.py
@@ -71,6 +71,21 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
   파라미터의 식별성은 설정의 성질이지 후보의 성질이 아니다.
 * 시계열 잔차는 강하게 자기상관되어 있다. 후보 간 차이의 유의성은 **1차 자기상관으로
   유효 표본수를 깎아서** 판정한다 (`SelectionResult.paired_compare`).
+
+## 데이터 주도 분석 (analyze/)
+
+* **토폴로지는 데이터에서 유도할 수 없다.** L4 는 언제나 "막힘"으로 보고하고 무엇이
+  필요한지 알려준다. 자동으로 계통 구조를 추정하려 들지 말 것.
+* 영향인자는 **반드시 상관 묶음 기준**으로 먼저 말한다. 개별 순열 중요도는 상관된
+  변수 사이에서 기여를 임의로 나눠 갖는다 (실제로 기여 60% 인 인자가 4위로, 7% 인
+  인자가 1위로 나온 적이 있다).
+* 교차검증은 **시간 블록**으로 한다. 무작위 k-fold 는 5분 데이터에서 앞뒤가 새어
+  들어가 성능을 크게 과대평가한다.
+* 보존식 탐지는 **작은 정수 계수를 열거**한다. SVD 최소특이벡터는 공선적 데이터에서
+  노이즈를 따라간다 (±1 이어야 할 계수가 4,4,3,−3,−3 으로 나왔다).
+* 개선 제안은 **학습 포락선 밖으로 나가지 않는다.** 제어변수의 영향력이 5% 미만이면
+  방향이 뒤집힐 수 있다고 경고한다.
+* pandas 의 `.to_numpy()` 는 읽기전용 뷰를 줄 수 있다. 쓰기 전에 `np.array(...)` 로 복사할 것.
 
 ## 캘리브레이션 원칙
 
