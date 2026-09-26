@@ -21,6 +21,66 @@ def _conv(values, unit: str) -> np.ndarray:
     return np.array([from_si(float(v), unit) for v in np.asarray(values, dtype=float)])
 
 
+def _data_log_section(rep: Report, ingest_lines: list[str], quality_lines: list[str],
+                      title: str) -> None:
+    """파일을 읽으며 고친 것과 값에서 뺀 것. 조용히 고치지 않는다는 원칙의 화면."""
+    import html as _html
+    import re
+    if not ingest_lines and not quality_lines:
+        return
+
+    def esc(t: str) -> str:
+        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", _html.escape(t))
+
+    rep.h2(title)
+    if ingest_lines:
+        rep.h3("파일에서 고친 것")
+        rep.bullets([esc(t) for t in ingest_lines])
+    if quality_lines:
+        rep.h3("값에서 뺀 것 · 알아둘 것")
+        rep.bullets([esc(t) for t in quality_lines])
+    rep.note("값을 지어내 채우지 않습니다. 뺀 점은 결측이 되고, 보정·학습은 남은 점으로만 합니다.")
+
+
+def _changepoint_section(rep: Report, res) -> None:
+    cps = getattr(res, "changepoints", None) or []
+    rep.h2("6. 잔차 변화점 — 모델이 설명하지 못한 변화")
+    rep.note(
+        "원시 신호의 계단은 공정 변화(증설·설정 변경)와 계측 문제(센서 교체)를 구분하지 "
+        "못합니다. 물리모델은 입력이 만든 변화를 설명하므로, <b>잔차(측정 − 모델)에 남은 "
+        "계단은 모델 밖의 변화</b>입니다. 하루 중앙값 잔차에서 평균이 바뀐 날을 찾았습니다. "
+        "해석은 후보를 좁혀 주는 것이지 판결이 아닙니다 — 그날 정비 이력을 확인하세요.")
+    if not cps:
+        rep.note("눈에 띄는 계단 변화가 없습니다.", kind="good")
+    else:
+        import html as _html
+        rep.table(pd.DataFrame([{
+            "날짜": str(c.date.date()), "관측": c.observation,
+            "계단": f"{c.shift:+.3g}{c.unit}", "z": round(c.z, 1), "유형": c.kind}
+            for c in cps]))
+        seen, items = set(), []
+        for c in cps:
+            key = (str(c.date.date()), c.kind)
+            if c.kind == "공정 변화" and key in seen:
+                continue                      # 같은 날 함께 움직인 관측은 한 번만 설명
+            seen.add(key)
+            items.append(f"<b>{c.date.date()} · {_html.escape(c.observation)}</b> — "
+                         + _html.escape(c.interpretation()))
+        rep.bullets(items)
+    clipped = getattr(res, "clipped", None) or {}
+    cal = getattr(res, "calibration", None)
+    extra = []
+    if clipped:
+        extra.append("물리 범위 밖이라 경계로 자른 입력: " + ", ".join(
+            f"{k} {v:,}행" for k, v in clipped.items())
+            + " (예: 순환펌프 정지로 유량 0 → 물질전달식이 발산하지 않도록 하한으로).")
+    if cal is not None and getattr(cal, "n_excluded", 0):
+        extra.append(f"설계값에서도 수렴하지 않아 보정에서 뺀 행: {cal.n_excluded}개 "
+                     "(모델 적용 범위 밖의 운전).")
+    if extra:
+        rep.note("<br>".join(extra), kind="warn")
+
+
 def calibration_report(cfg, res, out_path: str | Path) -> Path:
     """보정 + 외삽 검증 리포트."""
     tgt = cfg.baseline_target or res.obs_cols[0]
@@ -53,9 +113,14 @@ def calibration_report(cfg, res, out_path: str | Path) -> Path:
                       "status": "bad" if ratio > 1.5 else "warn"})
     rep.tiles(tiles)
 
+    dr = getattr(res, "data_report", None)
+    if dr is not None:
+        _data_log_section(rep, dr.ingest.lines() if dr.ingest else [],
+                          dr.quality.lines() if dr.quality else [], "0. 데이터 정리 내역")
+
     rep.h2("1. 무엇을 검증했는가")
     rep.bullets([
-        f"동일한 <b>저부하 구간 데이터만</b> 써서 물리모델을 보정하고 ML 기준모델을 학습시켰다. "
+        f"동일한 <b>학습 구간 데이터만</b> 써서 물리모델을 보정하고 ML 기준모델을 학습시켰다. "
         f"(조건 <code>{cfg.train_query}</code>)",
         f"그 다음 <b>학습에 전혀 쓰지 않은 고부하 구간</b>에서 두 모델을 비교했다. "
         f"(조건 <code>{cfg.test_query}</code>)",
@@ -116,20 +181,53 @@ def calibration_report(cfg, res, out_path: str | Path) -> Path:
               "하나의 물리모델이 NOx·유량·온도·차압을 동시에 설명한다. "
               "회귀모형이라면 관측값마다 별도 모델이 필요하다.")
 
+    _changepoint_section(rep, res)
     _structural_questions_section(cfg, res, rep, tgt, unit)
     return rep.render(out_path)
 
 
-#: ML 기준모델이 구조적으로 답할 수 없는 질문들.
-#: (라벨, 파라미터 패턴 -> 값 지시, 그 조건이 학습 데이터에 존재했는지)
+#: 설비/운전 구성이 바뀌는 질문들. 'ML 이 답할 수 있는가' 는 **학습 데이터로 판정**한다
+#: (예전에는 예제 기준 문장을 고정해 두었다가 다른 데이터에서 틀린 설명이 나갔다).
 _STRUCTURAL_CASES = [
-    ("장비 30% 증설", {"scale": {"SRC_*.n_tools": 1.30}}, "대수는 학습 데이터에서 상수였다"),
-    ("장비 30% 증설 + 풀가동", {"scale": {"SRC_*.n_tools": 1.30},
-                                 "set": {"SRC_*.util": 1.0}}, "대수는 학습 데이터에서 상수였다"),
-    ("송풍기 85% 감속", {"set": {"FAN.n_ratio": 0.85}}, "학습 구간은 0.96~1.00"),
-    ("스크러버 순환수 반감", {"scale": {"SCR.L": 0.5}}, "순환수는 태그조차 없었다"),
-    ("충전재 교체 (효율 회복)", {"set": {"SCR.ntu_a": 14.0}}, "설비 상태는 특징이 아니다"),
+    ("장비 30% 증설", {"scale": {"SRC_*.n_tools": 1.30}}),
+    ("장비 30% 증설 + 풀가동", {"scale": {"SRC_*.n_tools": 1.30}, "set": {"SRC_*.util": 1.0}}),
+    ("송풍기 85% 감속", {"set": {"FAN.n_ratio": 0.85}}),
+    ("스크러버 순환수 반감", {"scale": {"SCR.L": 0.5}}),
+    ("충전재 교체 (효율 회복)", {"set": {"SCR.ntu_a": 14.0}}),
 ]
+
+
+def _case_coverage(res, model, directives: dict, base_p) -> tuple[bool, str]:
+    """이 조건이 학습 데이터 범위 안인가 — (ML 이 답할 근거가 있는가, 이유)."""
+    from fnmatch import fnmatch
+    exp = res.tagmap.expansion()
+    reasons, outside = [], False
+    for kind in ("set", "scale"):
+        for pat, v in (directives.get(kind) or {}).items():
+            names = [q.name for q in model.parameters if fnmatch(q.name, pat)]
+            cols = [c for c, targets in exp.items() if any(t in names for t in targets)]
+            if not cols:
+                outside = True
+                reasons.append(f"{pat} 는 데이터에 없는 값 (설비 상태·설계 파라미터)")
+                continue
+            for c in cols:
+                j = model.par_index(exp[c][0])
+                unit = model.parameters[j].unit
+                x = pd.to_numeric(res.train[c], errors="coerce").dropna()
+                if not len(x):
+                    continue
+                new = float(v) * base_p[j] if kind == "scale" else float(v)
+                lo, hi = float(x.min()), float(x.max())
+                f = lambda a: f"{from_si(a, unit):.3g}"  # noqa: E731
+                if hi - lo <= 1e-12 * max(1.0, abs(hi)):
+                    outside = True
+                    reasons.append(f"{c} 는 학습 구간 내내 {f(lo)} 로 고정")
+                elif new < lo - 1e-9 * abs(lo) or new > hi + 1e-9 * abs(hi):
+                    outside = True
+                    reasons.append(f"{c} {f(new)} 은 학습 범위 {f(lo)}~{f(hi)} 밖")
+                else:
+                    reasons.append(f"{c} {f(new)} 은 학습 범위 {f(lo)}~{f(hi)} 안")
+    return outside, "; ".join(dict.fromkeys(reasons))
 
 
 def _structural_questions_section(cfg, res, rep: Report, tgt: str, unit: str) -> None:
@@ -152,11 +250,12 @@ def _structural_questions_section(cfg, res, rep: Report, tgt: str, unit: str) ->
 
     rows = []
     warm = r0.x
-    for label, directives, why in _STRUCTURAL_CASES:
+    for label, directives in _STRUCTURAL_CASES:
         try:
             p = apply_settings(model, base_p, directives.get("set"), directives.get("scale"))
         except KeyError:
             continue
+        outside, why = _case_coverage(res, model, directives, base_p)
         r = solve_steady(model, p, x0=warm)
         if not r.success:
             continue
@@ -166,22 +265,24 @@ def _structural_questions_section(cfg, res, rep: Report, tgt: str, unit: str) ->
             "설비/운전 변경": label,
             f"물리모델 [{unit}]": val,
             "기준 대비 [%]": 100.0 * (val / max(base_val, 1e-9) - 1.0),
-            "ML 기준모델": "예측 불가",
-            "이유": why,
+            "ML 기준모델": "근거 없음 (외삽)" if outside else "범위 안 — 가능",
+            "_why": why,
         })
     if not rows:
         return
-    rep.h2("6. ML 기준모델이 구조적으로 답할 수 없는 질문")
+    rep.h2("7. 설비·운전 변경 질문 — 학습 데이터 밖인가")
     rep.text(
-        f"아래는 과거 운전 데이터에 존재하지 않는 조건이다. 기준점은 검증 구간의 "
-        f"평균 운전조건이며 이때 물리모델 예측은 {base_val:.1f} {unit} 이다.")
-    rep.table(pd.DataFrame(rows), float_fmt="{:,.1f}")
+        f"기준점은 검증 구간의 평균 운전조건이며 이때 물리모델 예측은 {base_val:.1f} {unit} "
+        "이다. 'ML 기준모델' 칸은 그 조건이 학습 데이터 범위 안인지를 실제 데이터로 판정한 것이다.")
+    import html as _html
+    rep.table(pd.DataFrame(rows).drop(columns="_why"), float_fmt="{:,.1f}")
+    rep.bullets([f"<b>{_html.escape(r['설비/운전 변경'])}</b> — {_html.escape(r['_why'])}"
+                 for r in rows if r["_why"]])
     rep.note(
-        "<b>여기가 핵심이다.</b> 앞 절의 외삽 오차 차이(RMSE 기준 수십 퍼센트)는 "
-        "정도의 문제지만, 이 표는 <b>종류의 문제</b>다. 증설·설비 교체·운전방식 변경은 "
-        "과거 데이터에 변동이 없었으므로 어떤 회귀모형도 계수를 가질 수 없다. "
-        "반면 물리모델은 대수·회전수·순환수가 지배방정식에 들어 있으므로 "
-        "학습 여부와 무관하게 답을 낸다.",
+        "<b>여기가 핵심이다.</b> 외삽 오차의 크기는 정도의 문제지만, 학습 구간에서 한 번도 "
+        "변하지 않은 변수(증설 전 장비 대수 등)는 <b>종류의 문제</b>다. 어떤 회귀모형도 그 "
+        "변수의 계수를 가질 수 없다. 물리모델은 대수·회전수·순환수가 지배방정식에 들어 "
+        "있으므로 학습 여부와 무관하게 답을 낸다.",
         kind="")
 
 
@@ -416,8 +517,8 @@ def analysis_report(result, out_path: str | Path) -> Path:
                       "unit": f" {s.unit}",
                       "note": f"평균예측 대비 {skill*100:.0f}% 개선" if np.isfinite(skill) else ""})
     sure = [b for b in result.balances if b.confidence == "확실"]
-    tiles.append({"label": "자동 발견 보존식", "value": f"{len(sure)}", "unit": "개",
-                  "note": "데이터가 스스로 만족하는 물리 제약",
+    tiles.append({"label": "자동 발견 물리 관계", "value": f"{len(sure)}", "unit": "개",
+                  "note": "보존식·이중화 계측 (확실)",
                   "status": "good" if sure else ""})
     if np.isfinite(result.holdout_outside):
         tiles.append({"label": "검증구간 외삽 비율",
@@ -429,6 +530,10 @@ def analysis_report(result, out_path: str | Path) -> Path:
 
     rep.h2("먼저 읽을 것")
     rep.bullets(result.headline(), markdown=True)
+
+    _data_log_section(rep, result.ingest.lines() if result.ingest is not None else [],
+                      result.quality.lines() if result.quality is not None else [],
+                      "0. 데이터 정리 내역")
 
     # --- 사다리 ---
     rep.h2("1. 분석 사다리 — 어디까지 갔고 어디서 막혔는가")

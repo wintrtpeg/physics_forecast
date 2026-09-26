@@ -1,0 +1,39 @@
+# 현장형 데이터로 보정 -> 증설 이후를 예측한다
+#
+# 실제로 알고 싶은 질문 그대로다: "1~5월 데이터만 있는데, 6월 증설 + 여름 + 가동율
+# 상승 이후의 굴뚝 NOx 는?" 검증 구간(6/10~8월)은 장비 대수·가동율·외기온도가 전부
+# 학습 범위 밖이다.
+
+name: 현장형 데이터 — SCR-01 NOx 보정
+
+model:
+  python: ../nox_stack/model.py
+  builder: build
+
+data:
+  csv: data/field_raw.csv
+  tagmap: tagmap.yaml
+
+split:
+  train: "index < '2025-06-01'"
+  test:  "index >= '2025-06-10'"
+
+calibrate:
+  params:
+    - SRC_DRY.ef_process
+    - SRC_DRY.ef_idle
+    - SRC_CVD.ef_process
+    - SCR.ntu_a
+    - DCT_MAIN.K
+    - SCR.K
+  max_rows: 150
+  prior_weight: 0.05
+
+baseline:
+  features: [SRC_DRY.util, SRC_CVD.util, SRC_WET.util, SRC_IMP.util, SRC_DRY.n_tools,
+             STK.T_amb, FAN.n_ratio, SCR.L]
+  target: STK.C_dry
+  degree: 2
+
+params_out: out/params_fitted.yaml
+report: out/calibration.html

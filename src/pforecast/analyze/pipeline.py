@@ -61,6 +61,8 @@ class AnalysisConfig:
     steady_only: bool = False
     balance_tol: float = 0.03
     report_out: str | None = None
+    #: 값 이상(교정 창·고착·스파이크)을 결측으로 돌리고 분석한다. 파일 형식 정리는 항상 한다.
+    clean: bool = True
 
     @classmethod
     def load(cls, path: str | Path) -> "AnalysisConfig":
@@ -97,6 +99,7 @@ class AnalysisConfig:
             steady_only=bool(d.get("steady_only", False)),
             balance_tol=float(d.get("balance_tol", 0.03)),
             report_out=rel(d.get("report")),
+            clean=bool(data.get("clean", True)),
         )
 
 
@@ -113,6 +116,11 @@ class AnalysisResult:
     holdout_rmse: float = np.nan
     improvement: Improvement | None = None
     features: list[str] = field(default_factory=list)
+    ingest: Any = None           # IngestReport — 파일을 읽으며 고친 것
+    quality: Any = None          # QualityReport — 값에서 뺀 것
+    #: 학습 구간에서 한 번도 변하지 않아 대리모델이 효과를 배울 수 없는 피처
+    #: [(이름, 학습 구간 값, 검증 구간 최소, 최대)]
+    untrainable: list[tuple[str, float, float, float]] = field(default_factory=list)
 
     def ladder_table(self) -> pd.DataFrame:
         return pd.DataFrame([{
@@ -161,12 +169,33 @@ class AnalysisResult:
             sep = ", ".join(f"{c.label}({c.importance_pct:.1f}%)" for c in singles[:3])
             out.append(f"반면 {sep} 는 독립적이라 개별 효과를 믿을 수 있습니다.")
 
-        conserved = [b for b in self.balances if b.is_conservation and b.confidence == "확실"]
+        sure = [b for b in self.balances if b.confidence == "확실"]
+        conserved = [b for b in sure if b.is_conservation and not b.is_redundant_pair]
+        pairs = [b for b in sure if b.is_redundant_pair]
         if conserved:
             out.append(
                 f"데이터에서 **보존식 {len(conserved)}개**를 찾았습니다: "
                 + "; ".join(b.formula() for b in conserved[:2])
                 + ". 이건 회귀가 아니라 물리 제약이라 외삽 구간에서도 성립합니다.")
+        if pairs:
+            out.append("같은 양을 재는 **이중화 계측** "
+                       + ", ".join(" = ".join(b.columns) for b in pairs[:3])
+                       + " 를 찾았습니다 — 한쪽이 고장 나도 다른 쪽으로 대신할 수 있습니다.")
+        notes = [b.gain_note() for b in sure if b.gain_note()]
+        if notes:
+            out.append("**계측기 점검 권고**: " + " ".join(notes)
+                       + " 보존식은 계측기끼리 서로를 검증하게 해 줍니다.")
+
+        for f, v, lo, hi in self.untrainable:
+            changed = np.isfinite(lo) and (abs(lo - v) > 1e-9 or abs(hi - v) > 1e-9)
+            if changed:
+                out.append(
+                    f"**{f} 는 학습 구간 내내 {v:g} 에서 변하지 않다가 검증 구간에서 "
+                    f"{lo:g}~{hi:g} 로 바뀝니다.** 대리모델은 이 변수의 효과를 배울 방법이 "
+                    "없어서 뺐습니다 — 이런 변화(증설·설비 교체)의 영향은 이 변수가 "
+                    "지배방정식에 들어가 있는 물리모델만 답할 수 있습니다.")
+            else:
+                out.append(f"{f} 는 값이 변하지 않아 영향을 식별할 수 없습니다 (뺐습니다).")
 
         if np.isfinite(self.holdout_outside) and self.holdout_outside > 0.05:
             out.append(
@@ -187,31 +216,61 @@ class AnalysisResult:
         return out
 
 
-def _load_frame(cfg: AnalysisConfig) -> pd.DataFrame:
-    df = pd.read_csv(cfg.csv)
-    if cfg.timestamp in df.columns:
-        df[cfg.timestamp] = pd.to_datetime(df[cfg.timestamp], errors="coerce")
-        df = df.dropna(subset=[cfg.timestamp]).set_index(cfg.timestamp).sort_index()
-    num = df.select_dtypes(include=[np.number])
-    if cfg.resample and isinstance(num.index, pd.DatetimeIndex):
-        num = num.resample(cfg.resample).mean()
-    return num
+def _load_frame(cfg: AnalysisConfig):
+    """현장 파일을 읽어 정리하고 (값 이상은 결측으로), 정리 내역과 함께 돌려준다."""
+    from ..data.ingest import read_table
+    from ..data.quality import apply, assess
+
+    tab = read_table(cfg.csv, time_column=cfg.timestamp)
+    df = tab.df
+    # 파일의 단위 행은 설정·태그맵보다 우선순위가 낮다 (사람이 적은 것이 먼저다)
+    for c, u in tab.units.items():
+        cfg.units.setdefault(c, u)
+    if not cfg.target_unit and cfg.target in cfg.units:
+        cfg.target_unit = cfg.units[cfg.target]
+    quality = None
+    if cfg.clean:
+        quality = assess(df)
+        df = apply(df, quality)
+    if cfg.resample and isinstance(df.index, pd.DatetimeIndex):
+        df = df.resample(cfg.resample).mean()
+    return df, tab.report, quality
 
 
 def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
-    df = _load_frame(cfg)
+    df, ingest, quality = _load_frame(cfg)
     if cfg.target not in df.columns:
-        raise KeyError(f"타깃 컬럼 {cfg.target!r} 이 없습니다. 가능: {list(df.columns)[:15]}")
+        extra = ""
+        if ingest is not None and cfg.target in ingest.text_columns:
+            extra = " (숫자가 아닌 값만 있어 뺐습니다)"
+        raise KeyError(f"타깃 컬럼 {cfg.target!r} 이 없습니다{extra}. "
+                       f"가능: {list(df.columns)[:15]}")
 
     prof = profile_dataset(df, cfg.units)
-    res = AnalysisResult(config=cfg, df=df, profile=prof)
+    res = AnalysisResult(config=cfg, df=df, profile=prof, ingest=ingest, quality=quality)
 
     # ---- L0 프로파일링 ----------------------------------------------------
+    fixes = []
+    if ingest is not None:
+        st = sum(ingest.status_total().values())
+        if st:
+            fixes.append(f"상태문자열 {st:,}셀")
+        if ingest.n_duplicate_rows:
+            fixes.append(f"중복 {ingest.n_duplicate_rows:,}행")
+        if ingest.n_repeated_header:
+            fixes.append(f"반복헤더 {ingest.n_repeated_header}행")
+    if quality is not None and quality.excluded():
+        kinds: dict[str, int] = {}
+        for i in quality.issues:
+            if i.n_points:
+                kinds[i.label] = kinds.get(i.label, 0) + i.n_points
+        fixes.append("값 이상 " + ", ".join(f"{k} {v:,}점" for k, v in kinds.items()))
     res.rungs.append(Rung(
         "L0", "데이터 프로파일링", "완료",
         finding=(f"{prof.n_rows:,}행, 샘플링 {prof.interval_s:.0f}초, "
                  f"사용 가능 컬럼 {len(prof.usable_columns())}/{len(prof.columns)}개, "
-                 f"준정상 구간 {prof.steady_fraction*100:.0f}%"),
+                 f"준정상 구간 {prof.steady_fraction*100:.0f}%"
+                 + (f". 정리: {'; '.join(fixes)}" if fixes else "")),
     ))
 
     features = cfg.features or [c for c in prof.usable_columns() if c != cfg.target]
@@ -234,6 +293,17 @@ def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
     n = len(work)
     cut = int(n * cfg.train_fraction)
     train, test = work.iloc[:cut], work.iloc[cut:]
+    # 학습 구간에서 한 번도 변하지 않은 피처는 뺀다. 대리모델은 그 효과를 배울 방법이
+    # 없다 — 증설처럼 '앞으로 바뀔 것'이 대개 여기에 걸린다. 빼는 것보다 알리는 게 중요하다.
+    for f in list(features):
+        xt = pd.to_numeric(train[f], errors="coerce").dropna()
+        if len(xt) and float(xt.max() - xt.min()) <= 1e-12 * max(1.0, abs(float(xt.mean()))):
+            xs = pd.to_numeric(test[f], errors="coerce").dropna()
+            res.untrainable.append((f, float(xt.iloc[0]),
+                                    float(xs.min()) if len(xs) else np.nan,
+                                    float(xs.max()) if len(xs) else np.nan))
+            features.remove(f)
+    res.features = features
     if verbose:
         print(f"L1 대리모델: 피처 {len(features)}개, 학습 {len(train)}행 / 검증 {len(test)}행")
     try:
@@ -262,7 +332,10 @@ def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
         res.rungs.append(Rung("L1", "대리모델 + XAI", "막힘", blocker=str(exc)))
 
     # ---- L2 차원 해석 -----------------------------------------------------
-    known = {c: u for c, u in cfg.units.items() if c in df.columns and u}
+    # 상수 컬럼만 뺀다. 결측이 많은 컬럼(도중에 고장 난 계측기)도 살아 있던 구간에서는
+    # 보존식의 증거가 된다.
+    alive = {c for c, cp in prof.columns.items() if not cp.is_constant} | {cfg.target}
+    known = {c: u for c, u in cfg.units.items() if c in df.columns and u and c in alive}
     missing = [c for c in [cfg.target] + features if c not in known]
     if len(known) < 2:
         res.rungs.append(Rung(
@@ -295,14 +368,22 @@ def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
     else:
         res.balances = find_balances(df, known, rel_tol=cfg.balance_tol)
         sure = [b for b in res.balances if b.confidence == "확실"]
+        gains = [b.gain_note() for b in sure if b.gain_note()]
+        if sure:
+            blocker, unblock = "", ""
+        elif res.balances:
+            blocker = "후보는 있지만 우연히 맞아떨어진 것과 구분되지 않습니다"
+            unblock = "합이 맞아야 하는 계측이 동시에 살아 있는 구간이 더 길어야 합니다"
+        else:
+            blocker = "같은 차원 컬럼 묶음에서 성립하는 관계를 찾지 못했습니다"
+            unblock = "지류별 유량계처럼 합이 맞아야 하는 계측을 함께 넣으세요"
         res.rungs.append(Rung(
             "L3", "보존식 탐지", "완료" if sure else "부분",
-            finding=(f"{len(res.balances)}개 발견 (확실 {len(sure)}개): "
-                     + "; ".join(b.formula() for b in sure[:2]) if res.balances
-                     else "같은 차원 컬럼 묶음에서 성립하는 선형 관계 없음"),
-            blocker="" if sure else "같은 차원의 컬럼이 2개 이상 있어야 찾을 수 있습니다",
-            how_to_unblock=("" if sure else
-                            "지류별 유량계처럼 합이 맞아야 하는 계측을 함께 넣으세요")))
+            finding=((f"{len(res.balances)}개 발견 (확실 {len(sure)}개): "
+                      + "; ".join(b.formula() for b in sure[:2])
+                      + (". " + " ".join(gains) if gains else ""))
+                     if res.balances else "같은 차원 컬럼 묶음에서 성립하는 선형 관계 없음"),
+            blocker=blocker, how_to_unblock=unblock))
 
     # ---- L4 구조 물리 모델 (자동 불가) ------------------------------------
     res.rungs.append(Rung(

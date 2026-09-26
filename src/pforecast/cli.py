@@ -93,6 +93,14 @@ def cmd_calibrate(args) -> int:
     if res.comparison is not None and len(res.comparison):
         print("\n[외삽 성능 비교]")
         print(res.comparison.to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+    if res.changepoints:
+        print("\n[잔차 변화점 — 모델이 설명하지 못한 변화]")
+        for c in res.changepoints:
+            print(f"  {c.date.date()} {c.observation:14s} {c.shift:+9.3g}{c.unit}  "
+                  f"(z={c.z:.0f}, {c.kind})")
+            print(f"      {c.interpretation()}")
+    if res.clipped:
+        print("\n[범위 밖 입력을 경계로 자름] " + ", ".join(f"{k} {v:,}행" for k, v in res.clipped.items()))
     out = args.out or cfg.report_out
     if out:
         p = calibration_report(cfg, res, out)

@@ -15,9 +15,10 @@ import pandas as pd
 import yaml
 
 from .calib import CalibrationSpec, PolyRidgeBaseline, build_param_rows, calibrate, simulate
+from .calib.diagnostics import residual_changepoints
 from .calib.estimator import _metrics
 from .core.units import from_si
-from .data import TagMap, read_csv
+from .data import TagMap, read_csv_report
 from .params import apply_params, save_params
 from .scenario import load_model
 
@@ -40,6 +41,10 @@ class WorkflowConfig:
     params_in: str | None = None
     params_out: str | None = None
     report_out: str | None = None
+    clean: bool = True                 # 값 이상(교정 창·고착·스파이크)을 결측으로
+    loss: str = "linear"               # 보정 손실: linear | soft_l1 | huber
+    f_scale: float = 3.0
+    diagnose: bool = True              # 잔차 변화점 진단
 
     @classmethod
     def load(cls, path: str | Path) -> "WorkflowConfig":
@@ -76,6 +81,10 @@ class WorkflowConfig:
             params_in=rel(d.get("params_in")),
             params_out=rel(d.get("params_out")),
             report_out=rel(d.get("report")),
+            clean=bool(data.get("clean", True)),
+            loss=str(cal.get("loss", "linear")),
+            f_scale=float(cal.get("f_scale", 3.0)),
+            diagnose=bool(d.get("diagnose", True)),
         )
 
 
@@ -94,19 +103,26 @@ class WorkflowResult:
     baseline_test: np.ndarray | None = None
     baseline_train: np.ndarray | None = None
     comparison: pd.DataFrame | None = None
+    data_report: object = None                 # DataReport (파일 정리 + 값 정제 내역)
+    changepoints: list = field(default_factory=list)   # 잔차 변화점
+    clipped: dict = field(default_factory=dict)        # 물리 범위 밖이라 자른 입력
 
 
-def load_dataset(cfg: WorkflowConfig):
+def load_dataset(cfg: WorkflowConfig, return_report: bool = False):
     tm = TagMap.load(cfg.tagmap)
-    inputs, obs = read_csv(cfg.csv, tm)
-    df = inputs.join(obs, how="inner").dropna()
+    inputs, obs, report = read_csv_report(cfg.csv, tm, clean=cfg.clean)
+    df = inputs.join(obs, how="inner")
+    # 입력은 전부 있어야 모델을 풀 수 있다. 관측은 하나라도 있으면 남긴다.
+    df = df[df[list(inputs.columns)].notna().all(axis=1) & df[list(obs.columns)].notna().any(axis=1)]
     train = df.query(cfg.train_query) if cfg.train_query else df
     test = df.query(cfg.test_query) if cfg.test_query else df
-    return tm, df, train, test, list(inputs.columns), list(obs.columns)
+    out = (tm, df, train, test, list(inputs.columns), list(obs.columns))
+    return out + (report,) if return_report else out
 
 
-def _predict(model, df, inputs_cols, obs_cols, expansion):
-    rows = build_param_rows(model, df[inputs_cols], base_p=model.p0(), expansion=expansion)
+def _predict(model, df, inputs_cols, obs_cols, expansion, clip_report=None):
+    rows = build_param_rows(model, df[inputs_cols], base_p=model.p0(), expansion=expansion,
+                            clip_report=clip_report)
     return simulate(model, rows, obs_cols, index=df.index)
 
 
@@ -118,20 +134,23 @@ def run_workflow(cfg: WorkflowConfig, verbose: bool = True) -> WorkflowResult:
     if cfg.params_in and Path(cfg.params_in).exists():
         apply_params(model, cfg.params_in)
 
-    tm, df, train, test, inputs_cols, obs_cols = load_dataset(cfg)
+    tm, df, train, test, inputs_cols, obs_cols, report = load_dataset(cfg, return_report=True)
     obs_cols = [c for c in (cfg.observations or obs_cols) if c in df.columns]
     expansion = tm.expansion()
 
     if verbose:
-        print(f"데이터 {len(df)}행 | 학습 {len(train)}행 | 검증 {len(test)}행")
+        print(f"데이터 {len(df)}행 | 학습 {len(train)}행 | 검증 {len(test)}행", flush=True)
+        for line in report.lines():
+            print("  · " + line.replace("**", ""))
 
     res = WorkflowResult(model=model, tagmap=tm, train=train, test=test,
-                         inputs_cols=inputs_cols, obs_cols=obs_cols)
+                         inputs_cols=inputs_cols, obs_cols=obs_cols, data_report=report)
 
     if cfg.params:
         spec = CalibrationSpec(params=cfg.params, observations=obs_cols,
                                sigmas=tm.sigmas(), max_rows=cfg.max_rows,
-                               prior_weight=cfg.prior_weight)
+                               prior_weight=cfg.prior_weight, loss=cfg.loss,
+                               f_scale=cfg.f_scale)
         if verbose:
             print(f"보정 중: {len(cfg.params)}개 파라미터, 최대 {cfg.max_rows}행 ...")
         res.calibration = calibrate(model, train[inputs_cols], train[obs_cols], spec,
@@ -141,8 +160,26 @@ def run_workflow(cfg: WorkflowConfig, verbose: bool = True) -> WorkflowResult:
                         meta={"config": cfg.name, "train_rows": len(train),
                               "train_query": cfg.train_query})
 
-    res.physics_train = _predict(model, train, inputs_cols, obs_cols, expansion).values
-    res.physics_test = _predict(model, test, inputs_cols, obs_cols, expansion).values
+    if verbose:
+        print(f"물리모델 예측 중: 학습 {len(train)}행 + 검증 {len(test)}행 ...", flush=True)
+    res.physics_train = _predict(model, train, inputs_cols, obs_cols, expansion,
+                                 res.clipped).values
+    res.physics_test = _predict(model, test, inputs_cols, obs_cols, expansion,
+                                res.clipped).values
+
+    # 잔차에 남은 계단 = 모델이 모르는 변화 (센서 교체, 레시피, 오염/세정 ...)
+    if cfg.diagnose:
+        both = pd.concat([res.physics_train, res.physics_test])
+        both = both[~both.index.duplicated()].sort_index()
+        meas = df.loc[both.index, obs_cols]
+        units = {e.primary: e.unit for e in tm.observations}
+        resid = pd.DataFrame({c: [from_si(m, units.get(c, "1")) - from_si(q, units.get(c, "1"))
+                                  for m, q in zip(meas[c].to_numpy(), both[c].to_numpy())]
+                              for c in obs_cols}, index=both.index)
+        ins = df.loc[both.index, inputs_cols]
+        # 계측 불확도의 절반보다 작은 계단은 실무적으로 의미가 없다
+        floor = {e.primary: 0.5 * e.sigma for e in tm.observations if e.sigma}
+        res.changepoints = residual_changepoints(resid, ins, units, min_shift=floor)
 
     # 같은 학습 데이터로 학습한 데이터 기반 기준모델
     if cfg.baseline_target and cfg.baseline_features:

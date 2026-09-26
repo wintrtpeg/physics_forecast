@@ -20,6 +20,9 @@ import numpy as np
 
 #: (토큰 정규식, 단위, 신뢰도, 설명). 위에서부터 먼저 맞는 것을 쓴다.
 _RULES: list[tuple[str, str, float, str]] = [
+    # 상태 태그가 먼저다. PUMP_A_RUN 의 '_A_' 가 전류(A)로 잡힌 적이 있다.
+    (r"(_RUN(_|$)|_STS(_|$)|STATUS|_ON_?OFF(_|$)|_STATE(_|$)|_TRIP(_|$)|_ALARM|_ALM(_|$))",
+     "1", 0.8, "운전 상태/경보 (0/1)"),
     (r"(NOX|SOX|NO2|SO2|HCL|NH3|VOC|THC|TOC|DUST|PM10|PM25)", "mg/Nm3", 0.75, "오염물질 농도"),
     (r"(^|_)(O2|CO2|CO)(_|$)", "%", 0.6, "가스 농도"),
     (r"(UTIL|UTILIZ|RATIO|RATE_?PCT|PERCENT|_PCT|_OP(_|$)|OPEN|VALVE|LOAD)", "%", 0.7, "비율/개도"),
@@ -83,6 +86,10 @@ def guess_unit(column: str, values: np.ndarray | None = None) -> UnitGuess:
     """컬럼 하나의 단위를 추론한다."""
     name = column.upper()
     vals = np.asarray(values, dtype=float) if values is not None else np.array([])
+    finite = vals[np.isfinite(vals)] if len(vals) else vals
+    # 값이 0 과 1 뿐이면 이름과 무관하게 상태 신호다 (단위를 붙이면 차원 해석이 틀어진다)
+    if len(finite) >= 10 and np.isin(finite, (0.0, 1.0)).all():
+        return UnitGuess(column, "1", 0.8, "값이 0/1 뿐 — 상태 신호", [])
 
     for pattern, unit, conf, why in _RULES:
         if not re.search(pattern, name):

@@ -69,3 +69,13 @@ def test_every_column_of_the_example_gets_a_unit():
                      parse_dates=["timestamp"]).set_index("timestamp")
     g = guess_units(df)
     assert all(v.unit for v in g.values()), "예제 태그는 전부 추론되어야 한다"
+
+
+def test_status_tags_are_dimensionless_not_amperes():
+    import numpy as np
+    from pforecast.analyze.units_guess import guess_unit
+    # 이름의 '_A_' 가 전류로 잡히면 안 된다
+    g = guess_unit("F2_UT_SCR01_PUMP_A_RUN", np.array([1.0, 0.0] * 20))
+    assert g.unit == "1"
+    assert guess_unit("F2_UT_SCR01_PUMP_A_RUN").unit == "1"
+    assert guess_unit("CHW_PUMP_A_CURRENT", np.array([12.3, 12.9, 13.1] * 5)).unit == "A"

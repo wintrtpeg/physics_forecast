@@ -174,6 +174,16 @@ class Balance:
     r2: float                    # 가장 큰 항을 나머지로 설명한 비율
     intercept: float = 0.0
     n_rows: int = 0
+    #: 주항 = gain × (나머지 합) 으로 맞췄을 때의 이득. 1 이 아니면 계측기 교정 오차다.
+    gain: float = 1.0
+    residual_rel_gain: float = float("nan")
+    r2_gain: float = float("nan")
+    lead: str = ""
+    #: 두 컬럼이 같은 양을 잴 때(A − B = 0) 평균 차이. degC 처럼 영점이 임의인 단위는
+    #: 이득(비율)이 의미가 없고 이 값이 진단이다.
+    offset: float = 0.0
+    offset_scale: bool = False
+    unit: str = ""
 
     def formula(self, unit: str = "") -> str:
         parts = []
@@ -202,9 +212,37 @@ class Balance:
         """
         if self.residual_rel < 0.01 and self.r2 > 0.9:
             return "확실"
-        if self.r2 > 0.5:
+        # 계측기 하나가 몇 % 높게 읽으면 보존식인데도 R2 가 망가진다. 이득을 보정한
+        # 뒤에 잔차가 계측 잡음 수준으로 떨어지면 보존식이고, 그 이득이 곧 진단이다.
+        if (abs(self.gain - 1.0) <= 0.1 and self.residual_rel_gain < 0.01
+                and self.r2_gain > 0.8):
+            return "확실"
+        if self.r2 > 0.5 or (np.isfinite(self.r2_gain) and self.r2_gain > 0.8):
             return "가능"
         return "우연 의심"
+
+    @property
+    def is_redundant_pair(self) -> bool:
+        """같은 양을 재는 두 계측 (A − B = 0)."""
+        return len(self.columns) == 2 and sorted(self.coefficients) == [-1.0, 1.0]
+
+    def gain_note(self) -> str:
+        """보존식이 계측기 이득(또는 영점) 오차를 드러내면 그 문장."""
+        if self.confidence != "확실":
+            return ""
+        if self.offset_scale or self.is_redundant_pair:
+            if self.is_redundant_pair and abs(self.offset) > 0:
+                a, b = self.columns
+                hi, lo = (a, b) if self.offset > 0 else (b, a)
+                return (f"{hi} 가 {lo} 보다 평균 {abs(self.offset):.3g}{self.unit} 높게 읽습니다 "
+                        "— 같은 양을 재는 이중화 계측으로 보이며, 차이는 영점 오차입니다.")
+            return ""
+        if not self.lead or abs(self.gain - 1.0) < 0.01:
+            return ""
+        why = ("계측기 교정 오차로 보입니다" if abs(self.gain - 1.0) <= 0.05 else
+               "교정 오차치고는 커서, 계측되지 않는 항이 빠졌을 수도 있습니다")
+        return (f"{self.lead} 가 나머지 항의 합보다 {(self.gain - 1.0) * 100:+.1f}% "
+                f"높게 읽습니다 — {why}.").replace("+-", "-").replace("높게 읽습니다", "높게 읽습니다" if self.gain > 1 else "낮게 읽습니다")
 
 
 def _rationalize(v: np.ndarray, max_den: int = 4) -> np.ndarray:
@@ -225,17 +263,31 @@ def _rationalize(v: np.ndarray, max_den: int = 4) -> np.ndarray:
 
 def _score(X: np.ndarray, coef: np.ndarray) -> tuple[float, float]:
     """(상대잔차, 주항 설명력 R2)."""
+    return _score_full(X, coef)[:2]
+
+
+def _score_full(X: np.ndarray, coef: np.ndarray):
+    """(상대잔차, R2, 이득, 이득 보정 상대잔차, 이득 보정 R2, 주항 위치)."""
     resid = X @ coef
     term_scale = float(np.sqrt(np.mean((np.abs(X) @ np.abs(coef)) ** 2)))
     if term_scale <= 0:
-        return np.inf, np.nan
+        return np.inf, np.nan, np.nan, np.inf, np.nan, -1
     rel = float(np.sqrt(np.mean(resid ** 2)) / term_scale)
     lead = int(np.argmax(np.abs(coef) * np.abs(X).mean(axis=0)))
     y = X[:, lead] * coef[lead]
     pred = -(X @ coef - y)
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 1.0 - float(np.sum((y - pred) ** 2)) / ss_tot if ss_tot > 0 else np.nan
-    return rel, float(r2)
+    pp = float(pred @ pred)
+    gain = float(pred @ y) / pp if pp > 0 else np.nan
+    rg = y - gain * pred if np.isfinite(gain) else y
+    rel_g = float(np.sqrt(np.mean(rg ** 2)) / term_scale)
+    r2_g = 1.0 - float(np.sum(rg ** 2)) / ss_tot if ss_tot > 0 else np.nan
+    return rel, float(r2), gain, rel_g, float(r2_g), lead
+
+
+#: 영점이 임의인 단위. 비율(이득)이 의미가 없다.
+_OFFSET_UNITS = {"degC", "C", "oC", "℃", "degF", "F"}
 
 
 def find_balances(df, units: dict[str, str], rel_tol: float = 0.03,
@@ -266,42 +318,68 @@ def find_balances(df, units: dict[str, str], rel_tol: float = 0.03,
     for dim, cols in by_dim.items():
         if len(cols) < max(2, min_columns):
             continue
-        sub = df[cols].dropna()
-        if len(sub) < 20:
-            continue
-        X = sub.to_numpy(dtype=float)
+        # 전 컬럼이 동시에 살아 있는 행만 쓰면, 고장 난 계측기 하나가 나머지 관계까지
+        # 못 찾게 만든다. 조합마다 **그 조합에 든 컬럼**이 살아 있는 행을 쓴다.
+        Xall = df[cols].to_numpy(dtype=float)
+        live = np.isfinite(Xall)
         k = len(cols)
-        candidates: list[tuple[float, int, np.ndarray, float]] = []
+        candidates: list[tuple] = []
+
+        def consider(coef: np.ndarray):
+            support = coef != 0
+            rows = live[:, support].all(axis=1)
+            if rows.sum() < 20:
+                return
+            X = np.where(np.isfinite(Xall[rows]), Xall[rows], 0.0)
+            rel, r2, gain, rel_g, r2_g, lead = _score_full(X, coef)
+            ok = rel <= rel_tol and (np.isnan(r2) or r2 >= min_r2)
+            # 이득만 다른 보존식 (계측기 교정 오차): 보정 후 잔차가 잡음 수준이면 받는다
+            ok_gain = (np.isfinite(gain) and abs(gain - 1.0) <= 0.15
+                       and rel_g <= rel_tol / 3 and np.isfinite(r2_g) and r2_g >= 0.9)
+            if ok or ok_gain:
+                # 이득이 1 에서 멀수록 벌점. 빠진 항이 나머지에 비례하면(계측 안 되는 지류)
+                # 이득만 다른 '가짜 보존식'이 생긴다 — 이득이 1 에 가까운 쪽이 물리적으로 옳다.
+                key = min(rel, rel_g + 0.1 * abs(gain - 1.0)) if ok_gain else rel
+                candidates.append((key, int(support.sum()),
+                                   coef, r2, gain, rel_g, r2_g, lead, int(rows.sum()), rel))
 
         if k <= max_enumerate:
             for combo in product(coeff_set, repeat=k):
                 nz = [c for c in combo if c != 0]
                 if len(nz) < 2 or nz[0] < 0:        # 부호 대칭 제거
                     continue
-                coef = np.array(combo, dtype=float)
-                rel, r2 = _score(X, coef)
-                if rel <= rel_tol and (np.isnan(r2) or r2 >= min_r2):
-                    candidates.append((rel, len(nz), coef, r2))
+                consider(np.array(combo, dtype=float))
         else:
-            _, _, Vt = np.linalg.svd(X, full_matrices=False)
-            coef = _rationalize(Vt[-1])
-            rel, r2 = _score(X, coef)
-            if rel <= rel_tol and (np.isnan(r2) or r2 >= min_r2):
-                candidates.append((rel, int(np.count_nonzero(coef)), coef, r2))
+            sub = df[cols].dropna()
+            if len(sub) >= 20:
+                _, _, Vt = np.linalg.svd(sub.to_numpy(dtype=float), full_matrices=False)
+                consider(_rationalize(Vt[-1]))
 
         # 잔차가 작고 항이 적은 순. 이미 채택한 관계의 확장판은 버린다.
         candidates.sort(key=lambda t: (t[0], t[1]))
         accepted_supports: list[set[int]] = []
-        for rel, nnz, coef, r2 in candidates:
+        for _, nnz, coef, r2, gain, rel_g, r2_g, lead, n_rows, rel in candidates:
             support = {i for i in range(k) if coef[i] != 0}
-            if any(prev <= support for prev in accepted_supports):
+            # 채택한 관계의 확장판도, 부분집합도 버린다 (부분집합이 맞으려면 빠진 항이
+            # 나머지에 비례해야 하는데, 그건 새 물리가 아니라 우연한 공선성이다)
+            if any(prev <= support or support <= prev for prev in accepted_supports):
                 continue
             accepted_supports.append(support)
             keep = sorted(support)
+            offset = 0.0
+            if len(keep) == 2:
+                rows = live[:, keep].all(axis=1)
+                d = Xall[rows][:, keep] @ coef[keep]
+                offset = float(np.mean(d)) * (1.0 if coef[keep[0]] > 0 else -1.0)
+            u0 = units.get(cols[keep[0]], "")
             found.append(Balance(
                 columns=[cols[i] for i in keep],
                 coefficients=[float(coef[i]) for i in keep],
                 dimension=dim_str(dim), residual_rel=rel, r2=r2,
-                intercept=0.0, n_rows=len(sub)))
+                intercept=0.0, n_rows=n_rows, gain=float(gain) if np.isfinite(gain) else 1.0,
+                residual_rel_gain=rel_g, r2_gain=r2_g,
+                lead=cols[lead] if lead >= 0 else "",
+                offset=offset, offset_scale=u0 in _OFFSET_UNITS,
+                unit=" ℃" if u0 in ("degC", "C", "℃") else (f" {u0}" if u0 else "")))
     found.sort(key=lambda b: (b.residual_rel, len(b.columns)))
     return found

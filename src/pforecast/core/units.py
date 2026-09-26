@@ -99,7 +99,7 @@ _UNITS: dict[str, tuple[float, Dim]] = {
     "min": (60.0, T), "h": (3600.0, T), "hr": (3600.0, T),
     "day": (86400.0, T), "yr": (31_536_000.0, T),
     # 부피 (Nm3 = 표준상태 기준 부피. 차원은 m3 와 같고, 표준상태 환산은 모델이 담당한다)
-    "L": (1e-3, VOLUME), "m3": (1.0, VOLUME), "Nm3": (1.0, VOLUME), "Sm3": (1.0, VOLUME),
+    "L": (1e-3, VOLUME), "mL": (1e-6, VOLUME), "m3": (1.0, VOLUME), "Nm3": (1.0, VOLUME), "Sm3": (1.0, VOLUME),
     "CMM": (1.0 / 60.0, VOL_FLOW), "CMH": (1.0 / 3600.0, VOL_FLOW), "LPM": (1e-3 / 60.0, VOL_FLOW),
     # 힘/압력 (mmAq: 현장 표준 표기. 4degC 물기둥 기준)
     "N": (1.0, FORCE), "Pa": (1.0, PRESSURE), "kPa": (1e3, PRESSURE),
@@ -205,6 +205,77 @@ def dim_of(unit: str) -> Dim:
     if u in ("degC", "C", "oC", "℃", "degF", "F"):
         return TEMP
     return parse_unit(u)[1]
+
+
+#: 현장 파일에 적히는 단위 표기 -> 이 도구의 표기. 한글 엑셀·DCS 가 쓰는 전각 기호를 포함한다.
+_CHAR_MAP = {
+    "㎥": "m3", "㎡": "m2", "㎜": "mm", "㎝": "cm", "㎞": "km", "㎎": "mg", "㎏": "kg",
+    "㎍": "ug", "μ": "u", "µ": "u", "㎪": "kPa", "㎫": "MPa", "㎩": "Pa", "㎾": "kW",
+    "㎿": "MW", "㎐": "Hz", "ℓ": "L", "㎖": "mL", "㎃": "mA", "㎸": "kV", "³": "3", "²": "2", "₂": "2", "₃": "3",
+    "·": "*", "×": "*", "／": "/", "％": "%", "（": "(", "）": ")", "°": "deg", "º": "deg",
+}
+_WORD_MAP = {
+    "℃": "degC", "degc": "degC", "deg.c": "degC", "degC": "degC", "C": "degC", "℉": "degF",
+    "degF": "degF", "%RH": "%", "RH%": "%", "%rh": "%", "RH": "%", "대": "1", "EA": "1",
+    "ea": "1", "개": "1", "대수": "1", "count": "1", "cnt": "1", "pH": "1", "PH": "1",
+    "mmWC": "mmAq", "mmwc": "mmAq", "mmaq": "mmAq", "mmAQ": "mmAq", "mmH2O": "mmAq",
+    "kg/cm2": "kgfcm2", "kgf/cm2": "kgfcm2", "kg/cm2g": "kgfcm2", "kgf/cm2g": "kgfcm2",
+    "kg/cm2G": "kgfcm2", "ppmv": "ppm", "t/h": "ton/h", "T/H": "ton/h", "RPM": "rpm",
+    "HZ": "Hz", "KW": "kW", "Kw": "kW", "KPA": "kPa", "kpa": "kPa", "MPA": "MPa",
+    "USRT": "RT", "rt": "RT", "Nm3/hr": "Nm3/h", "Sm3/hr": "Sm3/h", "m3/hr": "m3/h",
+    "CMH": "CMH", "CMM": "CMM", "cmh": "CMH", "cmm": "CMM", "LPM": "LPM", "lpm": "LPM",
+    "-": "1", "N/A": "", "n/a": "", "": "",
+}
+
+
+def normalize_unit(raw: str | None) -> str | None:
+    """파일에 적힌 단위 표기를 이 도구가 아는 단위 문자열로 바꾼다.
+
+    ``'mg/Sm³'`` -> ``'mg/Sm3'``, ``'㎥/h'`` -> ``'m3/h'``, ``'℃'`` -> ``'degC'``,
+    ``'대'`` -> ``'1'``. 해석할 수 없으면 ``None`` (단위가 아닌 글자일 가능성이 크다).
+    빈 칸은 ``None`` 이다 — '무차원'과 '모름'은 다르다.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s.startswith(("[", "(")) and s.endswith(("]", ")")):
+        s = s[1:-1].strip()
+    if not s:
+        return None
+    if s in _WORD_MAP:
+        return _WORD_MAP[s] or None
+    for a, b in _CHAR_MAP.items():
+        s = s.replace(a, b)
+    s = s.replace(" ", "")
+    if s in ("degC", "degF"):
+        return s
+    if s in _WORD_MAP:
+        return _WORD_MAP[s] or None
+    if s.lower().endswith("/hr"):
+        s = s[:-3] + "/h"
+    try:
+        parse_unit(s)
+        return s
+    except ValueError:
+        pass
+    # 대소문자만 다른 표기 (KW, kpa ...)
+    lower = {k.lower(): k for k in _UNITS}
+    parts = re.split(r"([*/()])", s)
+    fixed = []
+    for p in parts:
+        if p in "*/()" or not p:
+            fixed.append(p)
+            continue
+        m = re.fullmatch(r"([A-Za-z_%]+)(\d*)", p)
+        if m and m.group(1) not in _UNITS and m.group(1).lower() in lower:
+            p = lower[m.group(1).lower()] + m.group(2)
+        fixed.append(p)
+    cand = "".join(fixed)
+    try:
+        parse_unit(cand)
+        return cand
+    except ValueError:
+        return None
 
 
 def register_unit(symbol: str, si_factor: float, dim: Dim) -> None:

@@ -88,6 +88,25 @@ class Workspace:
         self.models: dict[str, Any] = {}          # 경로 -> CompiledModel
         self._locks: dict[str, threading.Lock] = {}
         self._warm: dict[str, np.ndarray] = {}
+        self._tables: dict[str, tuple] = {}       # 경로 -> (mtime, size, Table, QualityReport)
+        self._tlock = threading.Lock()
+
+    def table(self, rel: str, time_column: str | None = None):
+        """CSV 를 읽어 정리한 결과를 캐시한다. 10MB 에 2~3초라 미리보기마다 다시 읽을 수 없다."""
+        from ..data.ingest import read_table
+        from ..data.quality import assess
+        path = self.resolve(rel)
+        st = path.stat()
+        key = f"{rel}|{time_column or ''}"
+        with self._tlock:
+            hit = self._tables.get(key)
+            if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+                return hit[2], hit[3]
+        tab = read_table(path, time_column=time_column)
+        q = assess(tab.df)
+        with self._tlock:
+            self._tables[key] = (st.st_mtime, st.st_size, tab, q)
+        return tab, q
 
     def _rel(self, p: Path) -> str:
         try:
@@ -98,7 +117,8 @@ class Workspace:
     def datasets(self) -> list[dict]:
         out = []
         for p in sorted(self.root.rglob("*.csv")):
-            if any(part in {".git", "__pycache__", "out"} for part in p.parts):
+            if any(part in {".git", "__pycache__", "out"} or part.startswith(("_", "."))
+                   for part in p.relative_to(self.root).parts):
                 continue
             try:
                 size = p.stat().st_size
@@ -328,58 +348,78 @@ class Api:
                 "models": self.ws.model_files()}
 
     def profile(self, body) -> dict:
-        import pandas as pd
         from ..analyze.profile import profile_dataset
         from ..analyze.units_guess import guess_units
+        from ..data.quality import apply
 
-        path = self.ws.resolve(body["csv"])
-        df = pd.read_csv(path)
-        tcol = body.get("timestamp") or _detect_time_column(df)
-        if tcol and tcol in df.columns:
-            df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
-            df = df.dropna(subset=[tcol]).set_index(tcol).sort_index()
-        num = df.select_dtypes(include=[np.number])
+        tab, q = self.ws.table(body["csv"], body.get("timestamp"))
+        num = apply(tab.df, q)
         prof = profile_dataset(num)
         guesses = guess_units(num)
+        rep = tab.report
+        by_col = q.by_column()
         cols = []
         for name, c in prof.columns.items():
             g = guesses[name]
+            unit, conf, reason, review = g.unit, g.confidence, g.reason, g.needs_review
+            if rep.units.get(name):
+                # 파일에 단위 행이 있으면 그게 1순위다 (사람이 적어 둔 것)
+                unit, conf, review = rep.units[name], 0.95, False
+                reason = f"파일의 단위 행: '{rep.units_raw.get(name, unit)}'"
             cols.append({
-                "name": name, "unit": g.unit, "confidence": round(g.confidence, 2),
-                "reason": g.reason, "alternatives": g.alternatives,
-                "needs_review": g.needs_review,
+                "name": name, "unit": unit, "confidence": round(conf, 2),
+                "reason": reason, "alternatives": g.alternatives,
+                "needs_review": review, "desc": rep.descriptions.get(name, ""),
                 "missing_pct": round(c.missing_pct, 2),
                 "min": _num(c.vmin), "max": _num(c.vmax), "mean": _num(c.mean),
                 "cv": _num(c.cv), "status": ("상수" if c.is_constant else
                                              f"중복({c.duplicate_of})" if c.duplicate_of
                                              else "사용"),
                 "usable": c.usable,
+                "status_strings": rep.status_counts.get(name, {}),
+                "issues": [{"label": i.label, "kind": i.kind, "n": i.n_points,
+                            "message": i.message} for i in by_col.get(name, [])],
+                "excluded": q.excluded(name),
             })
         return {
             "rows": prof.n_rows, "interval_s": _num(prof.interval_s),
             "t_start": str(prof.t_start) if prof.t_start is not None else None,
             "t_end": str(prof.t_end) if prof.t_end is not None else None,
             "steady_fraction": _num(prof.steady_fraction),
-            "gap_count": prof.gap_count, "time_column": tcol,
+            "gap_count": prof.gap_count, "time_column": rep.time_column,
             "warnings": prof.warnings, "columns": cols,
+            "ingest": {"lines": rep.lines(), "encoding": rep.encoding,
+                       "header_rows": rep.header_rows,
+                       "status_total": rep.status_total(), "gaps": rep.gaps[:5],
+                       "dropped_columns": rep.dropped_columns,
+                       "text_columns": list(rep.text_columns)},
+            "quality": {"lines": q.lines(), "excluded": q.excluded(),
+                        "n_issues": len(q.issues)},
         }
 
     def preview(self, body) -> dict:
-        """선택한 컬럼 몇 개의 시계열을 내려보낸다 (차트용, 다운샘플)."""
-        import pandas as pd
-        path = self.ws.resolve(body["csv"])
-        df = pd.read_csv(path)
-        tcol = body.get("timestamp") or _detect_time_column(df)
-        if tcol and tcol in df.columns:
-            df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
-            df = df.dropna(subset=[tcol]).set_index(tcol).sort_index()
+        """컬럼 몇 개의 시계열 (차트용, 다운샘플). 결측 처리한 점은 따로 표시한다."""
+        from ..data.quality import apply
+        tab, q = self.ws.table(body["csv"], body.get("timestamp"))
+        df = tab.df
         cols = [c for c in body.get("columns", []) if c in df.columns]
         limit = int(body.get("limit", 800))
         step = max(1, len(df) // limit)
-        sub = df[cols].iloc[::step]
+        # 선은 정제한 값, 뺀 점은 원래 값 그대로 점으로 찍는다 (무엇을 왜 뺐는지 보이게)
+        sub = apply(df[cols], q).iloc[::step]
+        marks = {}
+        for c in cols:
+            m = q.masks.get(c)
+            if m is None:
+                continue
+            idx = np.flatnonzero(m)[:3000]
+            vals = df[c].to_numpy()[idx]
+            marks[c] = [{"i": round(float(i) / step, 3), "v": _num(v)} for i, v in zip(idx, vals)]
         return {
             "t": [str(i) for i in sub.index],
             "series": {c: [_num(v) for v in sub[c]] for c in cols},
+            "excluded": marks,
+            "issues": {c: [i.to_dict() for i in q.by_column().get(c, [])] for c in cols},
         }
 
     def analyze(self, body) -> dict:
@@ -389,7 +429,7 @@ class Api:
         cfg = AnalysisConfig(
             name=body.get("name", "분석"),
             csv=str(self.ws.resolve(body["csv"])),
-            timestamp=body.get("timestamp", "timestamp"),
+            timestamp=body.get("timestamp") or "timestamp",
             target=body["target"], target_unit=body.get("target_unit", ""),
             units=body.get("units") or {}, exclude=body.get("exclude") or [],
             controllable=body.get("controllable") or [],
@@ -494,6 +534,10 @@ def _analysis_payload(res, report_rel: str) -> dict:
                          .to_numpy()[::max(1, len(s.pred) // 600)]],
             } if s.pred is not None else None,
         },
+        "data_log": {"ingest": res.ingest.lines() if res.ingest is not None else [],
+                     "quality": res.quality.lines() if res.quality is not None else []},
+        "untrainable": [{"feature": f, "train_value": _num(v), "test_min": _num(lo),
+                         "test_max": _num(hi)} for f, v, lo, hi in res.untrainable],
         "holdout_outside": _num(res.holdout_outside),
         "holdout_rmse": _num(res.holdout_rmse),
         "improvement": None if res.improvement is None else {

@@ -98,6 +98,12 @@ def profile_dataset(df: pd.DataFrame, units: dict[str, str] | None = None,
         if len(deltas):
             prof.interval_s = float(np.median(deltas))
             prof.gap_count = int(np.sum(deltas > 3 * prof.interval_s))
+        # 규칙 격자(빠진 시각을 빈 행으로 채운 것)에서는 '전부 빈 행'이 이어진 곳이 공백이다
+        empty = num.isna().all(axis=1).to_numpy().astype(np.int8)
+        if empty.any():
+            d = np.diff(np.r_[0, empty, 0])
+            lengths = np.flatnonzero(d == -1) - np.flatnonzero(d == 1)
+            prof.gap_count += int(np.sum(lengths >= 3))
 
     for name in num.columns:
         x = num[name]

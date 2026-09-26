@@ -266,7 +266,8 @@ def fit_surrogate(df: pd.DataFrame, target: str, features: list[str], unit: str 
     total = sum(raw) or 1.0
     corr = work[used].corr().abs()
     for j, f in enumerate(used):
-        others = corr[f].drop(index=f)
+        # 상수에 가까운 피처는 상관이 전부 NaN 이다 (pandas 3 의 idxmax 는 여기서 예외를 낸다)
+        others = corr[f].drop(index=f).dropna()
         partner = others.idxmax() if len(others) else ""
         res.importances.append(Importance(
             feature=f, importance=raw[j], importance_pct=100.0 * raw[j] / total,

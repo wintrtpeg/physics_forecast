@@ -33,6 +33,10 @@ class CalibrationSpec:
     prior_weight: float = 0.05              # 초기 설계값으로 끌어당기는 정칙화 강도
     max_rows: int = 250
     bounds_scale: tuple[float, float] = (0.2, 5.0)   # 초기값 대비 허용 배율
+    #: 잔차 손실. "linear"(최소제곱) | "soft_l1" | "huber". 정제를 거쳐도 남는 이상치에
+    #: 한두 점이 파라미터를 끌고 가는 것을 막는다. f_scale 은 sigma 단위.
+    loss: str = "linear"
+    f_scale: float = 3.0
 
 
 @dataclass
@@ -51,6 +55,10 @@ class CalibrationResult:
     hi_used: np.ndarray | None = None
     metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     message: str = ""
+    #: 설계값에서도 수렴하지 않아 보정에서 뺀 행 수 (입력이 모델 적용 범위 밖)
+    n_excluded: int = 0
+    #: 물리 범위 밖이라 경계로 자른 입력 {컬럼: 행 수}
+    clipped: dict[str, int] = field(default_factory=dict)
 
     def table(self) -> pd.DataFrame:
         return pd.DataFrame({
@@ -149,16 +157,20 @@ def calibrate(
     from scipy.optimize import least_squares
 
     model.build()
-    df = inputs.join(observations, how="inner").dropna()
+    df = inputs.join(observations, how="inner")
+    # 입력은 전부 있어야 하고(모델을 못 푼다), 관측은 하나라도 있으면 쓴다. 관측 하나가
+    # 비었다고 행을 통째로 버리면, 유량계 하나가 고착된 이틀 동안 NOx 까지 잃는다.
+    obs_cols = [c for c in spec.observations if c in df.columns]
+    if not obs_cols:
+        raise ValueError(f"관측 컬럼이 없습니다: {spec.observations}")
+    df = df[df[list(inputs.columns)].notna().all(axis=1) & df[obs_cols].notna().any(axis=1)]
     if len(df) == 0:
         raise ValueError("입력과 관측이 겹치는 시점이 없습니다. 태그맵/시각 정렬을 확인하세요.")
     if len(df) > spec.max_rows:
         step = max(1, len(df) // spec.max_rows)
         df = df.iloc[::step]
     inp = df[[c for c in inputs.columns if c in df.columns]]
-    obs = df[[c for c in spec.observations if c in df.columns]]
-    if obs.shape[1] == 0:
-        raise ValueError(f"관측 컬럼이 없습니다: {spec.observations}")
+    obs = df[obs_cols]
 
     p_idx = np.array([model.par_index(n) for n in spec.params])
     p_base = model.p0()
@@ -175,8 +187,27 @@ def calibrate(
 
     var_targets, out_targets = resolve_targets(model, list(obs.columns))
     sig = np.array([max(spec.sigmas.get(c, 1.0), 1e-30) for c in obs.columns])
+    clipped: dict[str, int] = {}
+    base_rows = build_param_rows(model, inp, base_p=p_base, expansion=expansion,
+                                 clip_report=clipped)
+
+    # 설계값에서도 풀리지 않는 행은 모델 적용 범위 밖이다. 벌점을 매겨 최적화에 넣으면
+    # 파라미터가 그 행을 '풀리게' 만드는 쪽으로 끌려간다 — 빼고, 몇 행인지 보고한다.
+    x = model.x0()
+    keep = np.ones(len(base_rows), dtype=bool)
+    for i, p in enumerate(base_rows):
+        r = solve_steady(model, p, x0=x)
+        if r.success:
+            x = r.x
+        else:
+            keep[i] = False
+    n_excluded = int((~keep).sum())
+    if keep.sum() == 0:
+        raise ValueError("설계값에서 수렴하는 행이 하나도 없습니다. 입력 단위/태그맵을 확인하세요.")
+    base_rows = base_rows[keep]
+    df, inp, obs = df[keep], inp[keep], obs[keep]
     meas = obs.to_numpy(dtype=float)
-    base_rows = build_param_rows(model, inp, base_p=p_base, expansion=expansion)
+    has = np.isfinite(meas)
     n_rows = len(base_rows)
     warm = {"x": model.x0()}
     n_eval = [0]
@@ -202,15 +233,21 @@ def calibrate(
                     pred[i, obs.columns.get_loc(name)] = ov[name]
         if good > n_rows * 0.5:
             warm["x"] = x
-        res = (pred - meas) / sig
-        # 수렴 실패 시점은 큰 페널티로 처리 (파라미터가 비물리 영역으로 가는 것을 막는다)
+        res = (pred - np.where(has, meas, 0.0)) / sig
+        # 수렴 실패 시점은 큰 페널티로 처리 (파라미터가 비물리 영역으로 가는 것을 막는다).
+        # 측정이 비어 있는 칸은 0 — 정보가 없을 뿐 벌점 대상이 아니다.
         res = np.where(np.isfinite(res), res, 1e3)
+        res = np.where(has, res, 0.0)
         flat = res.ravel() / np.sqrt(n_rows)
         prior = spec.prior_weight * (y - theta0 / scale)
         return np.concatenate([flat, prior])
 
+    kw = {}
+    if spec.loss and spec.loss != "linear":
+        # f_scale 은 잔차 척도(sigma 단위)다. 잔차를 sqrt(n_rows) 로 나눠 넣으므로 맞춰 준다.
+        kw = {"loss": spec.loss, "f_scale": spec.f_scale / np.sqrt(n_rows)}
     sol = least_squares(residual, y0, bounds=(lo, hi), xtol=1e-10, ftol=1e-10,
-                        diff_step=1e-4, verbose=2 if verbose else 0)
+                        diff_step=1e-4, verbose=2 if verbose else 0, **kw)
     fitted = sol.x * scale
 
     # 공분산 = (J^T J)^-1 * s^2  (스케일 좌표계에서 구해 SI 로 환산)
@@ -222,7 +259,8 @@ def calibrate(
     n_prior = len(spec.params) if spec.prior_weight > 0 else 0
     J = sol.jac[:sol.jac.shape[0] - n_prior] if n_prior else sol.jac
     resid_data = sol.fun[:len(sol.fun) - n_prior] if n_prior else sol.fun
-    dof = max(J.shape[0] - J.shape[1], 1)
+    # 비어 있던 측정 칸은 자유도에 넣지 않는다
+    dof = max(int(has.sum()) - J.shape[1], 1)
     s2 = float(resid_data @ resid_data) / dof
     try:
         cov = np.linalg.pinv(J.T @ J) * s2
@@ -251,4 +289,5 @@ def calibrate(
         initial=theta0, fitted=fitted, stderr=stderr, correlation=corr,
         cost=float(sol.cost), n_rows=n_rows, n_eval=n_eval[0], metrics=metrics,
         message=str(sol.message), lo_used=lo * scale, hi_used=hi * scale,
+        n_excluded=n_excluded, clipped=clipped,
     )

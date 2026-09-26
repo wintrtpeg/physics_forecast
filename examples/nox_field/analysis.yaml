@@ -1,0 +1,27 @@
+# 현장형 데이터 — 타깃 컬럼만 지정한 데이터 주도 분석
+#
+#   pf analyze examples/nox_field/analysis.yaml
+
+name: 현장형 데이터 — 굴뚝 NOx 분석
+
+data:
+  csv: data/field_raw.csv
+  timestamp: 일시
+
+target:
+  column: F2_UT_STK01_NOX_DRY
+  unit: mg/Nm3
+
+# 단위는 파일의 단위 행과 태그맵에서 가져온다
+units_from_tagmap: tagmap.yaml
+
+controllable:
+  - F2_UT_SCR01_FAN_HZ
+  - F2_UT_SCR01_CIRC_FLOW
+
+objective: minimize
+
+split:
+  train_fraction: 0.6
+
+report: out/analysis.html

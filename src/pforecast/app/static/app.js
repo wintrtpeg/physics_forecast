@@ -35,6 +35,12 @@ const svgEl = (tag, attrs = {}) => {
   return n;
 };
 
+// 파일에서 온 글자(컬럼 이름, 상태 문자열)가 섞이므로 먼저 이스케이프하고 **굵게**만 살린다
+function mdBold(t) {
+  const esc = String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+}
+
 function fmt(v, d) {
   if (v === null || v === undefined || !isFinite(v)) return '—';
   const a = Math.abs(v);
@@ -102,6 +108,13 @@ function lineChart(host, opt) {
     if (opt.limit !== undefined && opt.limit !== null && isFinite(opt.limit)) {
       lo = Math.min(lo, opt.limit); hi = Math.max(hi, opt.limit);
     }
+    if (opt.marks && opt.marks.length && isFinite(lo)) {
+      // 뺀 점까지 축에 넣되, 999.9 같은 단선값이 축을 망치지 않게 범위의 2배까지만 늘린다
+      const span = Math.max(hi - lo, 1e-9);
+      for (const mk of opt.marks) if (mk.v !== null && isFinite(mk.v)) {
+        lo = Math.min(lo, Math.max(mk.v, lo - span)); hi = Math.max(hi, Math.min(mk.v, hi + span));
+      }
+    }
     if (!isFinite(lo)) { lo = 0; hi = 1; }
     if (hi === lo) { hi = lo + Math.abs(lo || 1) * 0.1; }
     const pad = (hi - lo) * 0.09; lo -= pad; hi += pad;
@@ -150,6 +163,17 @@ function lineChart(host, opt) {
       });
       svg.append(svgEl('path', { class: 'mark', d, stroke: color, 'stroke-width': s.width || 2 }));
     });
+
+    // 결측 처리한 점: 원래 값 그대로 빨간 점으로 (무엇을 뺐는지 보이게)
+    if (opt.marks && opt.marks.length) {
+      const mg = svgEl('g', { class: 'excluded' });
+      for (const mk of opt.marks) {
+        if (mk.v === null || !isFinite(mk.v)) continue;
+        const y = Math.max(m.t, Math.min(m.t + ih, Y(mk.v)));
+        mg.append(svgEl('circle', { cx: X(mk.i).toFixed(1), cy: y.toFixed(1), r: 2.6 }));
+      }
+      svg.append(mg);
+    }
 
     const cross = svgEl('line', { class: 'crosshair', y1: m.t, y2: m.t + ih, opacity: 0 });
     svg.append(cross);
@@ -330,10 +354,21 @@ function renderProfile() {
     tile('단위 지정', `${known}/${p.columns.length}`, '',
          review ? `${review}개 확인 필요` : '전부 확정', review ? 'warn' : 'good'),
   ));
+  const ing = (p.ingest && p.ingest.lines) || [], qual = (p.quality && p.quality.lines) || [];
+  if (ing.length > 1 || (p.quality && p.quality.excluded)) {
+    const list = lines => h('ul', { class: 'log' }, lines.map(t => h('li', { html: mdBold(t) })));
+    pane.append(h('div', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h3', {}, '데이터 정리 내역'),
+        h('span', { class: 'sub' }, '조용히 고치지 않습니다. 무엇을 고치고 뺐는지 전부 적습니다.')),
+      h('div', { class: 'cols2' },
+        h('div', {}, h('div', { class: 'k' }, '파일에서 고친 것'), list(ing)),
+        h('div', {}, h('div', { class: 'k' }, '값에서 뺀 것 · 정보'), list(qual)))));
+  }
   if (p.warnings.length) {
     pane.append(h('div', { class: 'note warn' },
       h('b', {}, '데이터 경고'), h('br'), p.warnings.slice(0, 5).join(' · ')));
   }
+  pane.append(h('div', { class: 'card', id: 'colpreview', hidden: true }));
 
   const rows = p.columns.map(c => {
     const unitInput = h('input', {
@@ -354,8 +389,15 @@ function renderProfile() {
         renderTargetBar();
       },
     });
+    const badges = (c.issues || []).map(i => h('span', {
+      class: 'badge ' + (i.n ? 'bad' : 'warn'), title: i.message },
+      i.n ? `${i.label} ${i.n.toLocaleString('ko-KR')}` : i.label));
+    const st = Object.entries(c.status_strings || {});
+    if (st.length) badges.push(h('span', { class: 'badge', title: st.map(([k, v]) => `${k} ${v}`).join(', ') },
+      `문자 ${st.reduce((a, [, v]) => a + v, 0).toLocaleString('ko-KR')}`));
     return h('tr', { 'data-name': c.name, class: S.target === c.name ? 'picked' : '' },
-      h('td', { class: 'name' }, c.name),
+      h('td', { class: 'name clickable', title: '클릭하면 시계열을 봅니다', onclick: () => showColumn(c) },
+        c.name, c.desc ? h('div', { class: 'desc' }, c.desc) : null),
       h('td', {}, unitInput),
       h('td', { class: 'num' }, fmt(c.min)),
       h('td', { class: 'num' }, fmt(c.max)),
@@ -363,20 +405,44 @@ function renderProfile() {
       h('td', {}, c.status === '사용'
         ? h('span', { class: 'badge good' }, '사용')
         : h('span', { class: 'badge' }, c.status)),
+      h('td', { class: 'issues' }, badges.length ? badges : '—'),
       h('td', {}, targetRadio), h('td', {}, ctrl));
   });
 
   pane.append(h('div', { class: 'card' },
     h('div', { class: 'card-head' }, h('h3', {}, '컬럼'),
-      h('span', { class: 'sub' }, '단위를 확인하고 타깃을 고르세요. 노란 칸은 추론 신뢰도가 낮습니다.')),
+      h('span', { class: 'sub' }, '단위를 확인하고 타깃을 고르세요. 노란 칸은 추론 신뢰도가 낮습니다. 이름을 누르면 시계열이 보입니다.')),
     h('div', { class: 'tablewrap' },
       h('table', { id: 'coltable' },
         h('thead', {}, h('tr', {},
           h('th', {}, '컬럼'), h('th', {}, '단위'), h('th', {}, '최소'), h('th', {}, '최대'),
-          h('th', {}, '결측'), h('th', {}, '상태'), h('th', {}, '타깃'), h('th', {}, '제어'))),
+          h('th', {}, '결측'), h('th', {}, '상태'), h('th', {}, '이상'),
+          h('th', {}, '타깃'), h('th', {}, '제어'))),
         h('tbody', {}, rows))),
     h('div', { id: 'targetbar' })));
   renderTargetBar();
+}
+
+async function showColumn(c) {
+  const card = $('#colpreview');
+  card.hidden = false; card.innerHTML = '';
+  card.append(h('div', { class: 'card-head' }, h('h3', {}, c.name),
+    h('span', { class: 'sub' }, [c.desc, S.units[c.name]].filter(Boolean).join(' · '))));
+  const host = h('div', { class: 'chart' });
+  card.append(host);
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  try {
+    const r = await api('/api/preview', { csv: S.csv, columns: [c.name], limit: 900 });
+    const marks = (r.excluded && r.excluded[c.name]) || [];
+    lineChart(host, {
+      series: [{ name: c.name, values: r.series[c.name] }], x: r.t, unit: S.units[c.name] || '',
+      xfmt: t => String(t).slice(0, 16), height: 220, marks,
+      caption: marks.length ? `빨간 점 ${marks.length.toLocaleString('ko-KR')}개는 결측 처리한 원래 값입니다 (선에서 빠짐).`
+                            : '결측 처리한 점이 없습니다.',
+    });
+    (r.issues[c.name] || []).forEach(i => card.append(h('div', {
+      class: 'note ' + (i.n_points ? 'bad' : 'warn') }, h('b', {}, i.label + ' '), i.message.replace(/\*\*/g, ''))));
+  } catch (e) { host.append(h('div', { class: 'note bad' }, e.message)); }
 }
 
 function renderTargetBar() {
@@ -438,8 +504,8 @@ function renderAnalysis() {
          s && s.r2_cv > 0.7 ? 'good' : s && s.r2_cv > 0.3 ? 'warn' : 'bad'),
     tile('예측오차 RMSE', s ? fmt(s.rmse_cv) : '—', s ? ' ' + (s.unit || '') : '',
          s ? `평균예측 대비 ${fmt(s.skill * 100, 0)}% 개선` : ''),
-    tile('자동 발견 보존식', String(a.balances.filter(b => b.confidence === '확실').length), '개',
-         '데이터가 만족하는 물리 제약',
+    tile('자동 발견 물리 관계', String(a.balances.filter(b => b.confidence === '확실').length), '개',
+         '보존식·이중화 계측 (확실)',
          a.balances.some(b => b.confidence === '확실') ? 'good' : ''),
     tile('검증구간 외삽', fmt(a.holdout_outside * 100, 1), '%', '학습 범위 밖 = 근거 없음',
          a.holdout_outside > 0.2 ? 'bad' : a.holdout_outside > 0.05 ? 'warn' : 'good'),
@@ -447,7 +513,7 @@ function renderAnalysis() {
 
   body.append(h('h2', {}, '먼저 읽을 것'));
   a.headline.forEach(t => body.append(h('div', {
-    class: 'note', html: t.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>'),
+    class: 'note', html: mdBold(t),
   })));
 
   body.append(h('h2', {}, '분석 사다리'));
