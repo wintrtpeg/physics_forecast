@@ -63,7 +63,7 @@ pf check     examples/nox_stack/model.py          # 구조 해석: 방정식/미
 pf solve     examples/nox_stack/model.py          # 설계점 정상상태 풀이
 python examples/nox_stack/make_synthetic_data.py  # 가상 현장 데이터 30일치 생성
 pf calibrate examples/nox_stack/calibration.yaml  # 보정 + 외삽 검증 + HTML 리포트
-pf improve   examples/nox_field/calibration.yaml  # 개선 피드백: 다음에 무엇을 고칠지 (학습 구간만)
+pf improve   examples/nox_stack/calibration.yaml  # 개선 피드백: 다음에 무엇을 고칠지 (학습 구간만, 약 10분)
 pf run       examples/nox_stack/scenarios.yaml -o out/scenario.html   # what-if
 pf select    examples/nox_stack/selection.yaml    # 구성방정식 후보 비교
 pf analyze   examples/nox_stack/analysis.yaml     # 데이터 주도 분석 + XAI 대시보드

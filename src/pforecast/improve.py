@@ -68,7 +68,9 @@ class ImproveResult:
     seconds: float = 0.0
 
     def mean_scores(self) -> pd.Series:
-        return self.scores.groupby("후보")["점수"].mean() if self.scores is not None else pd.Series()
+        if self.scores is None or not len(self.scores):
+            return pd.Series(dtype=float)
+        return self.scores.groupby("후보")["점수"].mean()
 
     def recommendations(self) -> list[str]:
         out = []
@@ -102,6 +104,21 @@ class ImproveResult:
                        f"{min(vals):.4g}~{max(vals):.4g} {self.unit} (폭 {max(vals) - min(vals):.2g}) 입니다. "
                        "파라미터 공분산보다 이쪽이 실제 예측 오차에 가깝습니다 — 설비 상태는 앞으로도 "
                        "변하기 때문입니다.")
+        low = [f for f in self.folds if f["extrapolation"] < 0.5]
+        if low:
+            out.append("**내부 폴드가 외삽이 아닙니다** (검증 구간 중 학습 운전영역 밖: "
+                       + ", ".join(f"{f['extrapolation'] * 100:.0f}%" for f in low)
+                       + "). 학습 기간이 짧거나 그동안 운전 조건이 거의 안 변했습니다. 위 설계 비교는 "
+                       "외삽 능력이 아니라 학습 범위 안의 성능을 잰 것이라, 설정을 바꾸는 근거로 약합니다.")
+        tested = {c.name[2:] for c in self.candidates if c.name.startswith("+ ")}
+        ms = self.mean_scores()
+        for p in self.proposals:
+            if p.name in tested and p.gain_pct >= 5.0 and self.best != f"+ {p.name}":
+                sc = ms.get(f"+ {p.name}", float("nan"))
+                out.append(f"잔차는 `{p.name}` 를 가리키지만(기대 감소 {p.gain_pct:.0f}%, 독립성 "
+                           f"{p.independence:.2f}) 풀어 봐도 {self.target} 예측은 나아지지 않았습니다 "
+                           f"({sc:.3g} vs 현재 {ms.get(self.current, float('nan')):.3g}). 목표가 아닌 관측"
+                           "(온도·유량·차압)만 맞추는 파라미터로 보입니다 — 그 관측의 계측이나 모델을 따로 보세요.")
         weak = [p for p in self.proposals if not p.usable and p.gain_pct >= 5.0]
         for p in weak[:2]:
             out.append(f"잔차는 `{p.name}` 도 가리키지만(기대 감소 {p.gain_pct:.0f}%) 이미 보정한 "
@@ -137,7 +154,8 @@ class ImproveResult:
             piv = self.scores.pivot(index="후보", columns="폴드", values="점수")
             piv["평균"] = piv.mean(axis=1)
             piv = piv.sort_values("평균")
-            out.append(f"\n{self.target} 내부 검증 RMSE [{self.unit}] (외삽 행 기준):")
+            out.append(f"\n{self.target} 내부 검증 RMSE [{self.unit}] "
+                       "(외삽 행이 30개 이상인 폴드는 외삽 행만, 아니면 전체 행):")
             out.append(piv.to_string(float_format=lambda v: f"{v:.3f}"))
             out.append(f"→ 선택: {self.best}" + (" (현재 설정)" if self.best == self.current else ""))
         if self.identifiability:
@@ -183,6 +201,10 @@ def choose(mean_scores: pd.Series, current: str, min_gain: float = MIN_GAIN) -> 
 def _inner_folds(index: pd.DatetimeIndex, n_folds: int, fold_days: float,
                  embargo: str = "1D") -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
     end = index.max()
+    # 학습 기간이 짧으면(예제는 20일) 폴드를 줄인다. 첫 폴드도 절반 가까이는 학습에 남아야
+    # 한다 — 30일 폴드 두 개를 20일에 넣으면 폴드가 하나도 안 생긴다.
+    span = (end - index.min()) / pd.Timedelta(days=1)
+    fold_days = min(fold_days, span / (n_folds + 2))
     out = []
     for k in range(n_folds, 0, -1):
         va_end = end - pd.Timedelta(days=fold_days * (k - 1))

@@ -188,7 +188,8 @@ def score_test(model, rows: pd.DataFrame, inputs: list[str], obs: list[str],
         if base <= 0:
             continue                        # 관측에 전혀 영향이 없다
         free = float(np.sqrt(nrm / base))
-        gain = float((r0 @ gp) ** 2 / nrm) if nrm > 1e-300 else 0.0
+        # 거의 완전 공선(독립성 < 0.05)이면 남는 방향이 수치 잡음뿐이라 '기대 감소'가 뜻이 없다
+        gain = float((r0 @ gp) ** 2 / nrm) if nrm > 1e-300 and free >= 0.05 else 0.0
         info = model.parameters[model.par_index(c)]
         out.append(ParamProposal(c, 100.0 * gain / max(ssr, 1e-300), free,
                                  from_si(float(p0[model.par_index(c)]), info.unit), info.unit))

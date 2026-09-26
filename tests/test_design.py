@@ -136,3 +136,14 @@ def test_improve_changes_the_design_only_for_a_clear_gain():
     ms["행 선택 stride"] = 4.80
     assert choose(ms, "현재 설정") == "행 선택 stride"
     assert choose(pd.Series(dtype=float), "현재 설정") == "현재 설정"
+
+
+def test_improve_folds_shrink_for_a_short_training_period():
+    """예제처럼 학습이 20일뿐이어도 폴드가 생겨야 한다 (30일 폴드 두 개는 안 들어간다)."""
+    from pforecast.improve import ImproveResult, _inner_folds
+    idx = pd.date_range("2025-03-01", "2025-03-19 23:55", freq="5min")
+    folds = _inner_folds(idx, 2, 30.0)
+    assert len(folds) == 2
+    first_train = (idx < folds[0][0]).sum() / len(idx)
+    assert first_train > 0.4
+    assert ImproveResult(target="y", unit="1").mean_scores().empty    # 폴드가 없어도 죽지 않는다
