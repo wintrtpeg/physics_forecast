@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import threading
 import traceback
 import uuid
@@ -24,11 +25,14 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+#: 업로드 상한. 5분 데이터 1년치 × 수십 태그가 수십 MB 수준이다.
+MAX_UPLOAD = 300 * 1024 * 1024
 
 
 # --- 작업 큐 ----------------------------------------------------------------
@@ -146,7 +150,8 @@ class Workspace:
 
     def resolve(self, rel: str) -> Path:
         p = (self.root / rel).resolve()
-        if not str(p).startswith(str(self.root)):
+        # 문자열 접두사로 보면 '작업폴더_other' 같은 이웃 폴더가 통과한다
+        if p != self.root and self.root not in p.parents:
             raise ValueError(f"작업 폴더 밖 경로입니다: {rel}")
         return p
 
@@ -484,6 +489,80 @@ class Api:
         self.ws.forget(body["model"])
         return self.model_meta(body)
 
+    # -- 간편 예측 (업로드 → 변수 → 기간 → 모델 → 결과) --
+    def upload(self, name: str, data: bytes) -> dict:
+        """CSV 를 작업 폴더의 ``uploads/`` 에 저장한다. 이 PC 밖으로는 아무것도 나가지 않는다."""
+        base = Path(str(name).replace("\\", "/")).name
+        stem, suffix = Path(base).stem, Path(base).suffix.lower()
+        if suffix not in (".csv", ".txt"):
+            raise ValueError("CSV 파일만 올릴 수 있습니다 (.csv). 엑셀은 'CSV 로 저장' 후 올리세요.")
+        if not data:
+            raise ValueError("빈 파일입니다.")
+        safe = re.sub(r"[^0-9A-Za-z가-힣._()\- ]+", "_", stem).strip(" ._") or "upload"
+        folder = self.ws.root / "uploads"
+        folder.mkdir(exist_ok=True)
+        path, i = folder / f"{safe}.csv", 1
+        while path.exists() and path.read_bytes() != data:
+            path, i = folder / f"{safe}_{i}.csv", i + 1
+        path.write_bytes(data)
+        return {"path": self.ws._rel(path), "name": path.name,
+                "size_kb": round(len(data) / 1024, 1)}
+
+    def easy_presets(self, body) -> dict:
+        from ..easy import find_presets
+        tab, _ = self.ws.table(body["csv"], body.get("timestamp"))
+        pre = find_presets(self.ws.root, list(tab.df.columns))
+        for p in pre:
+            p["config"] = self.ws._rel(Path(p["config"]))
+            if p.get("model"):
+                p["model"] = self.ws._rel(Path(p["model"]))
+        return {"presets": pre}
+
+    def easy_catalog(self, body) -> dict:
+        from ..easy import model_catalog, param_sensitivity
+        rel = body["model"]
+        model = self.ws.model(rel)
+        with self.ws.lock(rel):
+            cat = model_catalog(model)
+            sens = {}
+            if body.get("target"):
+                try:
+                    sens = param_sensitivity(model, body["target"])
+                except Exception:  # noqa: BLE001 — 민감도는 추천용일 뿐이다
+                    sens = {}
+        for p in cat["params"]:
+            p["sensitivity_pct"] = _num(sens.get(p["value"]))
+        suggested = cat["declared_params"] or [
+            k for k, v in sorted(sens.items(), key=lambda kv: -kv[1]) if v > 1.0][:4]
+        return {**cat, "suggested": suggested}
+
+    def easy_check(self, body) -> dict:
+        from ..easy import check, config_from_body, mapping_issues
+        cfg = config_from_body(body, self.ws.resolve)
+        tab, _ = self.ws.table(body["csv"], body.get("time_column"))
+        out = check(tab.df, cfg)
+        if body.get("model") and (cfg.target_map is not None or cfg.feature_map):
+            out["mapping_issues"] = mapping_issues(self.ws.model(body["model"]), cfg)
+        return out
+
+    def easy_run(self, body) -> dict:
+        from ..easy import config_from_body, mapping_issues, period_errors, run_easy
+        cfg = config_from_body(body, self.ws.resolve)
+        errs = period_errors(cfg.train, cfg.test, cfg.embargo_days)
+        if errs:
+            raise ValueError(" / ".join(e.replace("**", "") for e in errs))
+        if cfg.model:
+            issues = mapping_issues(self.ws.model(body["model"]), cfg)
+            if issues:
+                raise ValueError("컬럼 연결을 고치세요: " + " / ".join(
+                    f"{i['column']} → {i['target']}: {i['message']}" for i in issues))
+        root = self.ws.root
+
+        def work(job: Job):
+            return run_easy(cfg, root, progress=lambda m: setattr(job, "message", m))
+
+        return {"job": self.jobs.start("easy", work).payload()}
+
 
 def _num(v) -> float | None:
     try:
@@ -565,6 +644,10 @@ _ROUTES: dict[str, str] = {
     "/api/model/solve": "model_solve",
     "/api/model/sweep": "model_sweep",
     "/api/model/reload": "reload_model",
+    "/api/easy/presets": "easy_presets",
+    "/api/easy/catalog": "easy_catalog",
+    "/api/easy/check": "easy_check",
+    "/api/easy/run": "easy_run",
 }
 
 
@@ -601,11 +684,25 @@ def make_handler(api: Api):
             if path.startswith("/static/"):
                 return self._static(path[len("/static/"):])
             if path.startswith("/out/"):
-                return self._workspace_file(path.lstrip("/"))
+                return self._workspace_file(unquote(path).lstrip("/"))   # 한글 파일 이름
             self._json(404, {"error": f"없는 경로: {path}"})
 
         def do_POST(self):                        # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/upload":
+                if length > MAX_UPLOAD:
+                    # 본문을 읽지 않으면 연결이 꼬이므로 버리면서 읽는다
+                    left = length
+                    while left > 0:
+                        left -= len(self.rfile.read(min(left, 1 << 20)) or b"x" * left)
+                    return self._json(413, {"error": f"파일이 {MAX_UPLOAD // 2**20} MB 를 넘습니다."})
+                data = self.rfile.read(length) if length else b""
+                query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                try:
+                    return self._json(200, api.upload(query.get("name", "upload.csv"), data))
+                except ValueError as exc:
+                    return self._json(400, {"error": str(exc)})
             raw = self.rfile.read(length) if length else b"{}"
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
@@ -621,6 +718,8 @@ def make_handler(api: Api):
                 self._json(200, api.__getattribute__(name)(body))
             except KeyError as exc:
                 self._json(400, {"error": f"입력이 부족합니다: {exc}"})
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
             except FileNotFoundError as exc:
                 self._json(404, {"error": str(exc)})
             except Exception as exc:

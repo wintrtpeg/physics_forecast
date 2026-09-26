@@ -72,6 +72,9 @@ def load_yaml_model(path: str | Path) -> System:
     # 앱이 쓰는 선언 (없으면 자동 추출로 떨어진다)
     system.drivers = data.get("drivers") or []          # type: ignore[attr-defined]
     system.limits = data.get("limits") or {}            # type: ignore[attr-defined]
+    # 간편 예측 화면이 쓰는 선언: 현장에서 재는 값, 보정 대상 파라미터
+    system.observables = data.get("observables") or {}  # type: ignore[attr-defined]
+    system.calibrate = data.get("calibrate") or []      # type: ignore[attr-defined]
     for conn in data.get("connections") or []:
         if isinstance(conn, (list, tuple)) and len(conn) == 2:
             system.connect(conn[0], conn[1])

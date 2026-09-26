@@ -48,12 +48,24 @@ ML 회귀모형은 학습 분포 안에서는 훌륭합니다. 문제는 우리�
 git clone <repo> && cd physics_forecast
 pip install -e ".[plot,ml,dev]"       # numpy, scipy, pandas, pyyaml, matplotlib, scikit-learn
 
-pf serve                               # ★ 로컬 웹 앱 (데이터 → 분석 → 물리모델 → 시나리오)
+pf serve                               # ★ 로컬 웹 앱 (CSV 올리기 → y·x → 기간 → 물리+ML → 결과)
 pf demo                                # CLI 전 과정 (구조검사 → 풀이 → 시나리오 → 보정)
 ```
 
 `pf serve` 는 **표준 라이브러리만으로** 뜹니다. FastAPI 도 Streamlit 도 CDN 도
 쓰지 않아 잠긴 사내 PC 에서 외부 요청 0건으로 동작합니다.
+
+첫 화면은 **간편 예측** 5단계입니다.
+
+1. **데이터** — CSV 를 끌어다 놓기 (이 PC 의 `uploads/` 에만 저장)
+2. **변수** — 예측할 값 y 하나, 입력 x 여러 개 (미리 아는 값만 — 결과값은 누수)
+3. **기간** — 차트 위를 끌어서 학습·예측 기간. 예측은 학습 끝 + 간격(≥1일) 뒤로만
+   고를 수 있고, 외삽 비율과 입력별 범위를 바로 보여줍니다
+4. **모델·실행** — 물리모델 + ML(다항·부스팅) 또는 ML 만. 컬럼 ↔ 모델 변수 연결, 단위 검사
+5. **결과** — 외삽 행 기준 RMSE, 시계열·산점도·막대, 비교 표, 보정 파라미터, 예측 CSV
+
+현장형 더미 데이터(8개월)를 올려 ‘앞 60% 학습’ 그대로 돌리면 예측 기간 외삽 행 RMSE 가
+물리모델 3.25 / ML 다항 11.79 / ML 부스팅 19.39 mg/Nm3 였습니다 (약 3분).
 자세한 화면 설명은 [`docs/app.md`](docs/app.md).
 
 개별 명령:
@@ -401,8 +413,9 @@ src/pforecast/
 │  ├─ units_guess.py     # 태그 이름 + 값 범위로 단위 추론
 │  └─ pipeline.py        # 사다리 실행과 판정
 ├─ app/                  # 로컬 웹 앱 (표준 라이브러리만)
-│  ├─ server.py          # JSON API + 작업 큐 + 모델 캐시
-│  └─ static/            # 바닐라 JS SPA, SVG 차트 직접 구현
+│  ├─ server.py          # JSON API + 업로드 + 작업 큐 + 모델 캐시
+│  └─ static/            # 바닐라 JS SPA, SVG 차트 직접 구현 (easy.js = 간편 예측 5단계)
+├─ easy.py               # 간편 예측: 기간 규칙(누수 거절) · 컬럼↔모델 연결 · 물리+ML 실행
 ├─ selection.py          # 구성방정식 후보 비교·판정
 ├─ params.py             # 보정값 저장/적용 (라인별로 파일만 교체)
 ├─ workflow.py           # 데이터 → 보정 → 검증 → 리포트

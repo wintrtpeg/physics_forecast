@@ -139,6 +139,13 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
   기준이 엉뚱하게 따라붙는다.
 * `h()` 헬퍼에 `{html:...}` 를 자식 자리로 넘기지 말 것 (속성 자리다). 지금은
   TypeError 를 던지지만 원래는 `[object Object]` 가 화면에 찍혔다.
+* 간편 예측(`easy.py`, `static/easy.js`)의 기간 규칙은 **화면과 서버 둘 다** 건다. 화면은
+  예측 시작을 학습 끝 + 1일 + 간격 뒤로 밀고, 서버(`period_errors`)는 어긋나면 400 으로
+  거절한다. 날짜는 양끝 포함(끝 날짜는 그날 24시까지).
+* 올린 CSV 는 `uploads/`, 결과는 `out/easy/` (둘 다 커밋 차단). 경로는 `unquote` 후
+  `Workspace.resolve` 로 — 문자열 접두사 비교는 이웃 폴더(`작업폴더_x`)를 통과시킨다.
+* SVG 요소를 속성(`opacity`)으로 켜고 끌 때 같은 속성을 CSS 로 주지 말 것. CSS 가 이겨서
+  크로스헤어가 x=0 에 늘 보였다.
 * YAML 1.1 은 `3.5e6` 을 **문자열**로 읽는다 (`3.5e+6` 이라야 실수). 선언형 컴포넌트는
   `_maybe_float` 로 방어한다.
 

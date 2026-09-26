@@ -39,7 +39,7 @@ def get(base, path):
 
 
 def test_static_files_are_served(server):
-    for path in ("/", "/static/app.js", "/static/style.css"):
+    for path in ("/", "/static/app.js", "/static/easy.js", "/static/style.css"):
         with urllib.request.urlopen(server + path) as r:
             assert r.status == 200
             assert len(r.read()) > 500

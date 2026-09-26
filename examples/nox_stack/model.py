@@ -99,6 +99,13 @@ LIMITS = {
     "SRC_DRY.q_per_tool": {"min": 3.0, "label": "후드 포집 한계"},
 }
 
+#: 기본 보정 대상. 배출계수·물질전달 계수·저항계수 — 식별성 진단을 거쳐 고른 6개
+#: (calibration.yaml 의 설명 참고). 앱의 간편 예측 화면이 기본으로 체크한다.
+CALIBRATE = [
+    "SRC_DRY.ef_process", "SRC_DRY.ef_idle", "SRC_CVD.ef_process",
+    "SCR.ntu_a", "DCT_MAIN.K", "SCR.K",
+]
+
 #: 현장에서 계측되는 값 (캘리브레이션/검증 대상)
 OBSERVABLES = {
     "STK.C_dry": "굴뚝 NOx 농도 [mg/Sm3, 건조]",

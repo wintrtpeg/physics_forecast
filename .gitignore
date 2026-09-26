@@ -15,6 +15,7 @@ venv/
 # 현장 데이터는 절대 커밋하지 않는다 (보안).
 # 예외는 결정론적으로 재생성 가능한 예제용 합성 데이터 하나뿐.
 /data/
+uploads/
 examples/**/data/*
 !examples/nox_stack/data/plant_5min.csv
 *.parquet
