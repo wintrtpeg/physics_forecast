@@ -42,10 +42,15 @@ ML 회귀모형은 학습 분포 안에서는 훌륭합니다. 문제는 우리�
 
 ```bash
 git clone <repo> && cd physics_forecast
-pip install -e ".[plot,dev]"          # numpy, scipy, pandas, pyyaml, matplotlib
+pip install -e ".[plot,ml,dev]"       # numpy, scipy, pandas, pyyaml, matplotlib, scikit-learn
 
-pf demo                                # 예제 전 과정 (구조검사 → 풀이 → 시나리오 → 보정)
+pf serve                               # ★ 로컬 웹 앱 (데이터 → 분석 → 물리모델 → 시나리오)
+pf demo                                # CLI 전 과정 (구조검사 → 풀이 → 시나리오 → 보정)
 ```
+
+`pf serve` 는 **표준 라이브러리만으로** 뜹니다. FastAPI 도 Streamlit 도 CDN 도
+쓰지 않아 잠긴 사내 PC 에서 외부 요청 0건으로 동작합니다.
+자세한 화면 설명은 [`docs/app.md`](docs/app.md).
 
 개별 명령:
 
@@ -157,6 +162,35 @@ limits:
 110.4. **둘 다 단독으로는 기준을 못 맞춥니다.**
 
 ---
+
+## 범용성 — 다른 계통도 같은 엔진으로
+
+`examples/chiller_plant/system.yaml` 은 **파이썬 한 줄 없이** YAML 선언만으로 만든
+냉수 플랜트입니다. 배기 계통과 도메인도 포트 종류도 다른데 `core/` 는 한 줄도
+고치지 않았습니다.
+
+```
+부하 → [증발기] 칠러 [응축기] → 냉각탑 → 대기        (thermal 포트: 온도/열류)
+        └ 전력 ┐              └ 전력 ┐
+                배전반 ←────────────┘                (power 포트: 전력)
+```
+
+COP 를 카르노 한계 × 효율로 두어 **외삽이 성립**합니다. 실행 결과:
+
+| 조건 | COP | 냉각수 | 칠러 kW | 총 kW | kW/RT |
+|---|---|---|---|---|---|
+| 설계점 (3500 kW, 습구 27℃) | 5.38 | 32.0℃ | 650 | 774 | 0.778 |
+| 겨울 (습구 10℃) | 12.66 | 14.7℃ | 276 | 396 | 0.397 |
+| 여름 피크 (습구 31℃) | 4.74 | 36.0℃ | 738 | 864 | **0.868** |
+| 부하 130% + 습구 31℃ | 4.64 | 36.7℃ | 980 | 1,125 | **0.870** |
+| ㄴ 냉수온도 9℃로 완화 | 4.97 | 36.7℃ | 916 | 1,060 | 0.819 |
+
+부하 ↑ → 냉각탑 접근온도차 ↑ → 응축온도 ↑ → COP ↓ → 전력 ↑↑ 의 곱셈 효과입니다.
+마지막 줄이 이 도구의 쓸모입니다 — **냉수 공급온도를 2℃ 올리면 총전력 65 kW(−5.8%)
+가 줄어 관리기준 안으로 들어옵니다.** 과거에 해본 적 없는 운전이라 데이터로는
+답할 수 없습니다.
+
+포트 종류는 `gas` / `liquid` / `thermal` / `power` 가 기본 제공되고 추가할 수 있습니다.
 
 ## 데이터만 있을 때 — `pf analyze`
 
@@ -287,7 +321,11 @@ src/pforecast/
 │  ├─ profile.py         # 프로파일링, 운전 포락선, 준정상 구간
 │  ├─ dimensional.py     # 무차원군(Buckingham Π), 보존식 자동 탐지
 │  ├─ surrogate.py       # 대리모델 + XAI (묶음 순열 중요도, PDP, 외삽 거리)
+│  ├─ units_guess.py     # 태그 이름 + 값 범위로 단위 추론
 │  └─ pipeline.py        # 사다리 실행과 판정
+├─ app/                  # 로컬 웹 앱 (표준 라이브러리만)
+│  ├─ server.py          # JSON API + 작업 큐 + 모델 캐시
+│  └─ static/            # 바닐라 JS SPA, SVG 차트 직접 구현
 ├─ selection.py          # 구성방정식 후보 비교·판정
 ├─ params.py             # 보정값 저장/적용 (라인별로 파일만 교체)
 ├─ workflow.py           # 데이터 → 보정 → 검증 → 리포트
@@ -352,3 +390,4 @@ src/pforecast/
 * [`docs/nox_model.md`](docs/nox_model.md) — NOx 모델의 물리와 검증
 * [`docs/generalization.md`](docs/generalization.md) — 방정식 직접 선언, 후보 비교, LLM 의 자리
 * [`docs/data_driven.md`](docs/data_driven.md) — 타깃만 지정해서 어디까지 자동인가 (XAI)
+* [`docs/app.md`](docs/app.md) — 로컬 웹 앱 사용법과 API

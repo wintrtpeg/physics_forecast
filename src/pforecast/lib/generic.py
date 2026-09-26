@@ -64,10 +64,24 @@ def _liquid_port(role: str, medium: GasMedium, **kw) -> PortSpec:
     )
 
 
+def _power_port(role: str, medium: GasMedium, **kw) -> PortSpec:
+    """전력 포트: 전력만 흐른다 (through 만 있고 across 가 없다).
+
+    전력 집계는 팹 유틸리티 어디에나 필요한데, 컴포넌트가 다른 컴포넌트의 변수를
+    직접 참조하게 두면 무인과 모델링이 깨진다. 포트로 모으면 배전반을 갈아끼워도
+    소비처 모델은 그대로다.
+    """
+    return PortSpec(
+        through=(("P", "W"),), role=role, kind="power",
+        starts={"P": kw.get("P_start", 1.0e5)},
+    )
+
+
 PORT_KINDS: dict[str, Callable[..., PortSpec]] = {
     "gas": _gas_port,
     "thermal": _thermal_port,
     "liquid": _liquid_port,
+    "power": _power_port,
 }
 
 MEDIA: dict[str, GasMedium] = {"flue_gas": FLUE_GAS}
@@ -95,6 +109,17 @@ def domain_functions(medium: GasMedium) -> dict[str, Callable[..., Any]]:
 
 
 # --- 사양 로딩 / 상속 -------------------------------------------------------
+
+def _maybe_float(v):
+    """YAML 1.1 은 ``3.5e6`` 을 **문자열**로 읽는다 (``3.5e+6`` 이라야 실수다).
+    현장에서 매번 걸리는 함정이라 숫자로 읽히는 문자열은 조용히 변환한다."""
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return v
+    return v
+
 
 def _deep_merge(base: dict, over: dict) -> dict:
     out = dict(base)
@@ -151,14 +176,17 @@ class EquationComponent(GasComponent):
             if kind not in PORT_KINDS:
                 raise ValueError(
                     f"{name}: 알 수 없는 포트 종류 {kind!r}. 가능: {sorted(PORT_KINDS)}")
+            pcfg = {k: _maybe_float(v) for k, v in pcfg.items()}
             self._port_specs[pname] = PORT_KINDS[kind](role, med, **pcfg)
 
         self._var_specs: dict[str, VarSpec] = {}
         for vname, vcfg in (data.get("vars") or {}).items():
             vcfg = dict(vcfg or {})
             self._var_specs[vname] = VarSpec(
-                unit=str(vcfg.get("unit", "1")), start=float(vcfg.get("start", 1.0)),
-                lo=float(vcfg.get("lo", -float("inf"))), hi=float(vcfg.get("hi", float("inf"))),
+                unit=str(vcfg.get("unit", "1")),
+                start=float(_maybe_float(vcfg.get("start", 1.0))),
+                lo=float(_maybe_float(vcfg.get("lo", -float("inf")))),
+                hi=float(_maybe_float(vcfg.get("hi", float("inf")))),
                 desc=str(vcfg.get("desc", "")))
 
         self._param_specs: dict[str, ParamSpec] = {}
@@ -166,9 +194,11 @@ class EquationComponent(GasComponent):
             if not isinstance(pcfg, dict):
                 pcfg = {"value": pcfg}
             self._param_specs[pname] = ParamSpec(
-                default=float(pcfg.get("value", 0.0)), unit=str(pcfg.get("unit", "1")),
-                desc=str(pcfg.get("desc", "")), lo=float(pcfg.get("lo", -float("inf"))),
-                hi=float(pcfg.get("hi", float("inf"))), tunable=bool(pcfg.get("tunable", False)))
+                default=float(_maybe_float(pcfg.get("value", 0.0))),
+                unit=str(pcfg.get("unit", "1")), desc=str(pcfg.get("desc", "")),
+                lo=float(_maybe_float(pcfg.get("lo", -float("inf")))),
+                hi=float(_maybe_float(pcfg.get("hi", float("inf")))),
+                tunable=bool(pcfg.get("tunable", False)))
 
         eqs = data.get("equations") or {}
         if isinstance(eqs, list):     # 이름 없이 리스트로 줘도 받아준다

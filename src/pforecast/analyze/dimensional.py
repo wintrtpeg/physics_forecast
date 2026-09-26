@@ -109,6 +109,16 @@ class PiGroup:
             s += " / (" + " · ".join(den) + ")"
         return s
 
+    def is_trivial_ratio(self, units: dict[str, str]) -> bool:
+        """같은 차원 변수들끼리의 비율인가.
+
+        무차원이긴 하지만 물리적으로 알려주는 게 없다 (유량A/유량B 같은 것).
+        진짜 쓸모 있는 Π 는 **서로 다른 차원을 섞어** 무차원이 된 조합이다.
+        """
+        dims = {dim_of(units.get(n, "1")) for n in self.exponents}
+        dims.discard(DIMLESS)
+        return len(dims) <= 1
+
     def evaluate(self, df, eps: float = 1e-30) -> np.ndarray:
         out = np.ones(len(df))
         for name, e in self.exponents.items():

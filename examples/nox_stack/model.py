@@ -82,6 +82,23 @@ ALIASES = {
     "scrubber_water": ["SCR.L"],
 }
 
+#: 앱 시나리오 화면에 슬라이더로 뜨는 운전 손잡이.
+#: 선언하지 않으면 파라미터 이름 끝조각으로 자동 추출하지만, 그러면 대기압·기준밀도
+#: 같은 상수까지 손잡이로 나온다. 무엇이 '운전 중 실제로 변하는 값'인지는 사람이 안다.
+DRIVERS = [
+    {"key": "util",     "label": "가동율",         "unit": "%",      "lo": 20,  "hi": 130},
+    {"key": "n_tools",  "label": "장비 대수",       "mode": "scale",  "lo": 0.5, "hi": 2.0},
+    {"key": "T_amb",    "label": "외기온도",        "unit": "degC",   "lo": -10, "hi": 40},
+    {"key": "n_ratio",  "label": "송풍기 회전수비",  "unit": "1",      "lo": 0.7, "hi": 1.15},
+    {"key": "L",        "label": "스크러버 순환수",  "unit": "m3/min", "lo": 0.1, "hi": 1.5},
+]
+
+#: 관리기준. 시나리오 화면에서 초과 여부를 바로 표시한다.
+LIMITS = {
+    "STK.C_dry": {"max": 100.0, "label": "사내 관리기준"},
+    "SRC_DRY.q_per_tool": {"min": 3.0, "label": "후드 포집 한계"},
+}
+
 #: 현장에서 계측되는 값 (캘리브레이션/검증 대상)
 OBSERVABLES = {
     "STK.C_dry": "굴뚝 NOx 농도 [mg/Sm3, 건조]",

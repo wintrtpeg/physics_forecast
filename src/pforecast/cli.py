@@ -134,6 +134,12 @@ def cmd_select(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    from .app import serve
+    serve(args.root, args.host, args.port, not args.no_browser)
+    return 0
+
+
 def cmd_analyze(args) -> int:
     from .analyze import AnalysisConfig, run_analysis
     from .report import analysis_report
@@ -305,6 +311,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", help="케이스 결과 CSV 경로")
     c.add_argument("--params", help="보정 파라미터 YAML")
     c.set_defaults(func=cmd_run)
+
+    c = sub.add_parser("serve", help="로컬 웹 앱 실행 (데이터 → 분석 → 물리모델 → 시나리오)")
+    c.add_argument("--root", default=".", help="작업 폴더 (CSV/모델을 찾을 위치)")
+    c.add_argument("--host", default="127.0.0.1")
+    c.add_argument("--port", type=int, default=8765)
+    c.add_argument("--no-browser", action="store_true")
+    c.set_defaults(func=cmd_serve)
 
     c = sub.add_parser("analyze", help="타깃 컬럼을 지정해 데이터 주도 분석 + XAI 대시보드")
     c.add_argument("config")

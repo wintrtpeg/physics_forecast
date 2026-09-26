@@ -112,6 +112,10 @@ _UNITS: dict[str, tuple[float, Dim]] = {
     "W": (1.0, POWER), "kW": (1e3, POWER), "MW": (1e6, POWER), "RT": (3516.85, POWER),
     # 회전수
     "rpm": (1.0 / 60.0, _d(s=-1)), "Hz": (1.0, _d(s=-1)),
+    # 전기 / 기타 현장 표기
+    "V": (1.0, _d(m=2, kg=1, s=-3, A=-1)), "kV": (1e3, _d(m=2, kg=1, s=-3, A=-1)),
+    "mA": (1e-3, _d(A=1)), "kgf": (9.80665, FORCE),
+    "kgfcm2": (98066.5, PRESSURE), "MPag": (1e6, PRESSURE), "kPag": (1e3, PRESSURE),
 }
 
 _TOKEN = re.compile(r"\s*([A-Za-z_%][A-Za-z_0-9]*|1|-)\s*(?:\^?\s*(-?\d+))?\s*")

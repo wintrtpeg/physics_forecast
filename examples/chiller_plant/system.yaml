@@ -1,0 +1,158 @@
+# 냉수 플랜트 (칠러 + 냉각탑) — 파이썬 한 줄 없이 YAML 선언만으로 만든 계통.
+#
+# 배기 계통(nox_stack)과 완전히 다른 도메인이다. 포트 종류도 다르다 (thermal:
+# 온도가 across, 열류가 through). core/ 는 한 줄도 고치지 않았다.
+#
+#   pf check examples/chiller_plant/system.yaml
+#
+# 물리의 핵심은 **응축온도를 통한 결합**이다.
+#   부하 ↑  → 냉각탑 approach ↑ → 응축온도 ↑ → COP ↓ → 전력 ↑↑
+#   습구온도 ↑ (여름) → 응축온도 ↑ → COP ↓
+# 이 곱셈 효과 때문에 여름 피크에서 전력이 비선형으로 튄다. 과거 데이터에 없던
+# 부하·외기 조합을 물어보려면 회귀로는 안 되고 이 구조가 있어야 한다.
+#
+# 열 흐름:  부하 → [증발기] 칠러 [응축기] → 냉각탑 → 대기
+# thermal 포트의 through(Q) 부호는 '컴포넌트로 들어가는 방향'이 + 다.
+
+name: chiller_plant
+
+drivers:
+  - {key: Q_load,  label: 냉방부하,        unit: kW,   lo: 500,  hi: 6000}
+  - {key: T_wb,    label: 외기 습구온도,    unit: degC, lo: 5,    hi: 32}
+  - {key: T_chws,  label: 냉수 공급온도,    unit: degC, lo: 5,    hi: 12}
+  - {key: app_nom, label: 냉각탑 접근온도차, unit: K,    lo: 2.5,  hi: 9}
+
+limits:
+  PLANT.kW_per_RT: {max: 0.85, label: 에너지 원단위 관리기준}
+  CHILLER.COP:     {min: 4.5,  label: COP 하한}
+
+components:
+
+  # ── 냉방부하 (경계) ────────────────────────────────────────────────
+  LOAD:
+    type: equation
+    description: 팹 냉방부하. 냉수 공급온도에서 열을 계통에 밀어 넣는다.
+    ports:
+      out: {kind: thermal, role: out, T_start: 280.15, Q_start: 3.5e6}
+    params:
+      Q_load: {value: 3500.0, unit: kW,   desc: 냉방부하}
+      T_chws: {value: 7.0,    unit: degC, desc: 냉수 공급온도 설정}
+    equations:
+      heat:        "out.Q + Q_load = 0"
+      temperature: "out.T = T_chws"
+    outputs:
+      Q_load: {expr: "Q_load", unit: kW}
+      RT:     {expr: "Q_load / 3516.85[W]", unit: "1"}
+
+  # ── 칠러 ───────────────────────────────────────────────────────────
+  CHILLER:
+    type: equation
+    description: 원심식 칠러. COP 는 카르노 한계 x 효율로 둔다 (외삽이 성립한다).
+    ports:
+      evap: {kind: thermal, role: in,  T_start: 280.15, Q_start: 3.5e6}
+      cond: {kind: thermal, role: out, T_start: 305.15, Q_start: 4.2e6}
+      elec: {kind: power,   role: out, P_start: 6.5e5}
+    params:
+      eta_carnot: {value: 0.58, unit: "1", desc: 카르노 대비 효율, lo: 0.2, hi: 0.85, tunable: true}
+      dT_evap:    {value: 2.0,  unit: K,   desc: 증발기 접근온도차, lo: 0.2, hi: 8, tunable: true}
+      dT_cond:    {value: 3.0,  unit: K,   desc: 응축기 접근온도차, lo: 0.2, hi: 8, tunable: true}
+    vars:
+      W:   {unit: W, start: 6.5e5, lo: 1.0, hi: 5.0e7, desc: 압축기 축동력}
+      COP: {unit: "1", start: 5.4, lo: 0.3, hi: 25.0,  desc: 성적계수}
+    equations:
+      # 에너지 보존: 증발기로 들어온 열 + 압축일 = 응축기로 나가는 열
+      energy: "evap.Q + W + cond.Q = 0"
+      power:  "W * COP = evap.Q"
+      # 카르노 한계 x 효율. 냉매 온도는 물 온도에서 접근온도차만큼 떨어져 있다.
+      cop:    "COP * ((cond.T + dT_cond) - (evap.T - dT_evap)) = eta_carnot * (evap.T - dT_evap)"
+      elec:   "elec.P + W = 0"
+    outputs:
+      COP:        {expr: "COP", unit: "1"}
+      power:      {expr: "W", unit: kW}
+      Q_evap:     {expr: "evap.Q", unit: kW}
+      Q_cond:     {expr: "-cond.Q", unit: kW}
+      T_evap_ref: {expr: "evap.T - dT_evap", unit: degC}
+      T_cond_ref: {expr: "cond.T + dT_cond", unit: degC}
+      lift:       {expr: "(cond.T + dT_cond) - (evap.T - dT_evap)", unit: K}
+
+  # ── 냉각탑 ─────────────────────────────────────────────────────────
+  TOWER:
+    type: equation
+    description: 냉각탑. 접근온도차가 부하에 따라 커지는 것이 핵심 비선형이다.
+    ports:
+      hot:  {kind: thermal, role: in,  T_start: 305.15, Q_start: 4.2e6}
+      amb:  {kind: thermal, role: out, T_start: 300.15, Q_start: 4.2e6}
+      elec: {kind: power,   role: out, P_start: 2.0e5}
+    params:
+      app_nom:  {value: 5.0,    unit: K,  desc: 정격 접근온도차, lo: 1.0, hi: 15.0, tunable: true}
+      app_exp:  {value: 0.5,    unit: "1", desc: 부하 지수, lo: 0.1, hi: 1.5, tunable: true}
+      Q_nom:    {value: 4200.0, unit: kW, desc: 정격 방열량}
+      fan_nom:  {value: 40.0,   unit: kW, desc: 정격 냉각탑 팬 동력}
+      pump_cw:  {value: 45.0,   unit: kW, desc: 냉각수 펌프 동력}
+    vars:
+      approach: {unit: K, start: 5.0, lo: 0.2, hi: 30.0, desc: 접근온도차}
+      P_aux:    {unit: W, start: 2.0e5, lo: 1.0, hi: 1.0e7, desc: 팬+냉각수펌프 동력}
+    equations:
+      heat:     "hot.Q + amb.Q = 0"
+      # 냉각수 온도 = 습구온도 + 접근온도차
+      temp:     "hot.T = amb.T + approach"
+      # 방열량이 늘면 접근온도차가 커진다 (충전재 전열 한계)
+      closure:  "approach = app_nom * (hot.Q / Q_nom) ^ app_exp"
+      # 팬은 상사법칙(동력 ∝ 풍량^3)에 가깝게, 펌프는 정속으로 둔다
+      aux:      "P_aux = fan_nom * (hot.Q / Q_nom) ^ 1.5 + pump_cw"
+      elec:     "elec.P + P_aux = 0"
+    outputs:
+      approach:  {expr: "approach", unit: K}
+      T_cw:      {expr: "hot.T", unit: degC}
+      Q_reject:  {expr: "hot.Q", unit: kW}
+      fan_power: {expr: "P_aux - pump_cw", unit: kW}
+      aux_power: {expr: "P_aux", unit: kW}
+
+  # ── 대기 (경계) ────────────────────────────────────────────────────
+  AMBIENT:
+    type: equation
+    description: 외기. 습구온도가 계통의 최종 열싱크 온도다.
+    ports:
+      a: {kind: thermal, role: in, T_start: 300.15, Q_start: 4.2e6}
+    params:
+      T_wb: {value: 27.0, unit: degC, desc: 외기 습구온도}
+    equations:
+      temperature: "a.T = T_wb"
+
+  # ── 배전반 (전력 집계) ──────────────────────────────────────────────
+  PLANT:
+    type: equation
+    description: >
+      플랜트 배전반. 소비처의 전력 포트를 모아 총 전력과 에너지 원단위를 낸다.
+      컴포넌트가 서로의 변수를 직접 참조하지 않고 포트로만 만나는 것이 요점이다.
+    ports:
+      a:       {kind: thermal, role: in,  T_start: 300.15, Q_start: 4.2e6}
+      b:       {kind: thermal, role: out, T_start: 300.15, Q_start: 4.2e6}
+      chiller: {kind: power,   role: in,  P_start: 6.5e5}
+      tower:   {kind: power,   role: in,  P_start: 1.0e5}
+    params:
+      pump_chw: {value: 40.0, unit: kW, desc: 냉수 펌프 동력}
+    vars:
+      W_total: {unit: W, start: 8.0e5, lo: 1.0, hi: 1.0e8, desc: 플랜트 총 전력}
+    equations:
+      heat:  "a.Q + b.Q = 0"
+      temp:  "b.T = a.T"
+      total: "W_total = chiller.P + tower.P + pump_chw"
+    outputs:
+      W_total:   {expr: "W_total", unit: kW}
+      # 실제 냉동능력 = 방열량 − 칠러 전력. 배전반이 열과 전력을 둘 다 보므로
+      # 다른 컴포넌트를 참조하지 않고도 원단위가 정확히 나온다.
+      Q_cooling: {expr: "a.Q - chiller.P", unit: kW}
+      RT:        {expr: "(a.Q - chiller.P) / 3516.85[W]", unit: "1"}
+      kW_per_RT: {expr: "W_total / ((a.Q - chiller.P) / 3516.85[W])", unit: kW}
+      pump_chw:  {expr: "pump_chw", unit: kW}
+
+connections:
+  # 열 흐름
+  - [LOAD.out,     CHILLER.evap]
+  - [CHILLER.cond, TOWER.hot]
+  - [TOWER.amb,    PLANT.a]
+  - [PLANT.b,      AMBIENT.a]
+  # 전력 흐름
+  - [CHILLER.elec, PLANT.chiller]
+  - [TOWER.elec,   PLANT.tower]

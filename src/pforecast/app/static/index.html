@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>pforecast — 팹 유틸리티 물리기반 예측</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%232a78d6'/></svg>">
+</head>
+<body>
+
+<header>
+  <div class="brand"><span class="dot"></span>pforecast<small>팹 유틸리티 물리기반 예측</small></div>
+  <nav id="nav">
+    <button data-screen="data"     aria-current="true"><span class="step">1</span>데이터</button>
+    <button data-screen="analyze"  disabled><span class="step">2</span>분석</button>
+    <button data-screen="model"    ><span class="step">3</span>물리모델</button>
+    <button data-screen="scenario" disabled><span class="step">4</span>시나리오</button>
+  </nav>
+  <div class="spacer"></div>
+  <button class="icon-btn" id="theme" title="라이트/다크 전환">◐</button>
+</header>
+
+<main>
+  <!-- ─── 1. 데이터 ──────────────────────────────────────── -->
+  <section class="screen active" id="screen-data">
+    <h1>데이터 선택과 단위 지정</h1>
+    <p class="sub">단위를 지정해야 차원 해석과 보존식 탐지가 열립니다. 태그 이름에서 자동 추론한 값을 확인·수정하세요.</p>
+    <div class="split">
+      <div>
+        <div class="card">
+          <div class="card-head"><h3>데이터셋</h3></div>
+          <div class="list" id="datasets"><div class="empty">불러오는 중…</div></div>
+        </div>
+      </div>
+      <div id="profile-pane">
+        <div class="card"><div class="empty">왼쪽에서 CSV 를 선택하세요.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── 2. 분석 ────────────────────────────────────────── -->
+  <section class="screen" id="screen-analyze">
+    <h1>데이터 주도 분석</h1>
+    <p class="sub">자동으로 갈 수 있는 데까지 올라가고, 어디서 왜 막혔는지 보여줍니다.</p>
+    <div id="analyze-body"><div class="card"><div class="empty">1단계에서 분석을 실행하세요.</div></div></div>
+  </section>
+
+  <!-- ─── 3. 물리모델 ────────────────────────────────────── -->
+  <section class="screen" id="screen-model">
+    <h1>물리 모델</h1>
+    <p class="sub">지배방정식으로 조립된 계통. 풀기 전에 구조부터 검사합니다.</p>
+    <div class="split">
+      <div class="card">
+        <div class="card-head"><h3>모델</h3></div>
+        <div class="list" id="models"><div class="empty">불러오는 중…</div></div>
+      </div>
+      <div id="model-pane"><div class="card"><div class="empty">왼쪽에서 모델을 선택하세요.</div></div></div>
+    </div>
+  </section>
+
+  <!-- ─── 4. 시나리오 ────────────────────────────────────── -->
+  <section class="screen" id="screen-scenario">
+    <h1>시나리오 <span class="badge good">실시간</span></h1>
+    <p class="sub">손잡이를 움직이면 지배방정식을 그 자리에서 다시 풉니다. 과거 데이터에 없던 조건도 답이 나옵니다.</p>
+    <div class="split-wide">
+      <div class="card">
+        <div class="card-head"><h3>운전 조건</h3><span class="sub" id="solve-stat"></span></div>
+        <div id="drivers"><div class="empty">모델을 먼저 선택하세요.</div></div>
+        <div class="actions"><button class="btn ghost sm" id="reset-drivers">설계값으로</button></div>
+      </div>
+      <div id="scenario-pane"><div class="card"><div class="empty">3단계에서 모델을 선택하세요.</div></div></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -31,5 +31,9 @@ pf = "pforecast.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# 앱의 정적 파일은 패키지에 같이 들어가야 한다 (설치 후에도 pf serve 가 떠야 한다)
+[tool.setuptools.package-data]
+"pforecast.app" = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

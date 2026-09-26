@@ -69,6 +69,9 @@ def load_yaml_model(path: str | Path) -> System:
         if cls is None:
             raise ModelError(f"알 수 없는 컴포넌트 타입 {ctype!r}. 가능: {sorted(REGISTRY)}")
         system.add(cls(cname, **cfg))
+    # 앱이 쓰는 선언 (없으면 자동 추출로 떨어진다)
+    system.drivers = data.get("drivers") or []          # type: ignore[attr-defined]
+    system.limits = data.get("limits") or {}            # type: ignore[attr-defined]
     for conn in data.get("connections") or []:
         if isinstance(conn, (list, tuple)) and len(conn) == 2:
             system.connect(conn[0], conn[1])

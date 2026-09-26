@@ -345,7 +345,21 @@ class System:
 
 def _build_compiled(system: System, eqs: list[EquationInfo], scopes: dict[str, Scope],
                     estimates: dict[str, float] | None = None) -> "CompiledModel":
-    syms = S.collect_syms([e.expr for e in eqs])
+    outputs: dict[str, tuple[S.Expr, str]] = {}
+    for cname, comp in system.components.items():
+        for oname, (expr, unit) in comp.outputs(scopes[cname]).items():
+            outputs[f"{cname}.{oname}"] = (expr, unit)
+
+    # 출력식에만 등장하는 심볼도 잡아야 한다. 방정식에는 안 쓰이지만 리포트에는
+    # 쓰이는 기준값(정격용량 등)이 흔하다.
+    syms = S.collect_syms([e.expr for e in eqs] + [ex for ex, _ in outputs.values()])
+    eq_var_syms = {s.uid for s in S.collect_syms([e.expr for e in eqs]) if s.kind == "var"}
+    orphan = [s.name for s in syms
+              if s.kind == "var" and s.uid not in eq_var_syms]
+    if orphan:
+        raise ModelError(
+            "출력식이 어떤 방정식에도 없는 미지수를 참조합니다: " + ", ".join(sorted(orphan))
+            + "\n  출력은 방정식으로 결정된 값만 쓸 수 있습니다.")
     var_syms = [s for s in syms if s.kind == "var"]
     par_syms = [s for s in syms if s.kind == "par"]
     der_syms = [s for s in syms if s.kind == "der"]
@@ -405,11 +419,6 @@ def _build_compiled(system: System, eqs: list[EquationInfo], scopes: dict[str, S
         incidence.append(idx)
 
     report = analyze(incidence, len(var_syms))
-
-    outputs: dict[str, tuple[S.Expr, str]] = {}
-    for cname, comp in system.components.items():
-        for oname, (expr, unit) in comp.outputs(scopes[cname]).items():
-            outputs[f"{cname}.{oname}"] = (expr, unit)
 
     return CompiledModel(
         system=system, equations=eqs, variables=variables, parameters=parameters,

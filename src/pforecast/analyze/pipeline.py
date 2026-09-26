@@ -274,11 +274,13 @@ def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
             res.pis = pi_groups(known, target=cfg.target if cfg.target in known else None)
         except Exception:
             res.pis = []
-        nontrivial = [g for g in res.pis if len(g.exponents) > 1]
+        nontrivial = [g for g in res.pis
+                      if len(g.exponents) > 1 and not g.is_trivial_ratio(known)]
         status = "완료" if nontrivial else "부분"
         res.rungs.append(Rung(
             "L2", "차원 해석 (무차원군)", status,
-            finding=(f"무차원군 {len(res.pis)}개 (자명하지 않은 것 {len(nontrivial)}개)"
+            finding=(f"무차원군 {len(res.pis)}개 중 물리적으로 의미 있는 것 "
+                     f"{len(nontrivial)}개 (나머지는 같은 차원끼리의 단순 비율)"
                      if res.pis else "무차원군 없음"),
             blocker=("변수 수가 차원 수보다 충분히 많지 않습니다"
                      if not nontrivial else ""),

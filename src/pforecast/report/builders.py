@@ -457,7 +457,8 @@ def analysis_report(result, out_path: str | Path) -> Path:
             "비슷한 두 신호가 우연히 맞아떨어진 것일 수 있습니다.")
     else:
         rep.text("같은 차원의 컬럼 묶음에서 성립하는 선형 관계를 찾지 못했습니다.")
-    nontrivial = [g for g in result.pis if len(g.exponents) > 1]
+    nontrivial = [g for g in result.pis
+                  if len(g.exponents) > 1 and not g.is_trivial_ratio(cfg.units)]
     if nontrivial:
         rep.h3("무차원군 (Buckingham Π)")
         rep.table(pd.DataFrame([{
