@@ -40,6 +40,7 @@ class Issue:
     n_points: int = 0      # 결측 처리한 점 수 (0 이면 정보성)
     start: str | None = None
     end: str | None = None
+    part: str = ""         # 분할별로 따로 진단했으면 그 이름 (학습/검증)
 
     @property
     def excluded(self) -> bool:
@@ -80,11 +81,12 @@ class QualityReport:
         for kind in ("calibration", "frozen", "spike", "zero_hold", "long_missing"):
             for i in self.issues:
                 if i.kind == kind:
-                    out.append(f"[{i.label}] {i.column}: {i.message}")
+                    where = f"({i.part}) " if i.part else ""
+                    out.append(f"[{i.label}] {where}{i.column}: {i.message}")
         # 계단형 신호는 정보성이라 종류별로 한 줄에 모은다
         groups: dict[str, list[str]] = {}
         for i in self.issues:
-            if i.kind == "step_signal":
+            if i.kind == "step_signal" and i.column not in groups.get(i.label, []):
                 groups.setdefault(i.label, []).append(i.column)
         why = {"1시간 갱신": "한 시간에 한 번만 값이 바뀜 — 시간 내 변동은 이 컬럼으로 설명 불가",
                "설정값": "계단형 설정값/상태값 — 고착·스파이크 검사 생략",
@@ -319,6 +321,30 @@ def assess(df: pd.DataFrame, columns: list[str] | None = None, *,
 
         if mask.any():
             rep.masks[c] = mask
+    return rep
+
+
+def assess_parts(df: pd.DataFrame, parts: dict[str, np.ndarray],
+                 columns: list[str] | None = None, **kw) -> QualityReport:
+    """분할마다 **따로** 진단한다. 학습 데이터 정제에 검증 구간의 통계가 섞이지 않게.
+
+    잡음 척도, 고착 판정의 '평소 변화 빈도', 정기 교정의 요일·시각 빈도는 전부 데이터
+    전체에서 추정하는 값이다. 전 기간으로 추정하면 검증 구간 정보가 학습 데이터의
+    정제에 들어간다 — 작아도 누수다. 다른 분할의 행은 비워서(격자는 유지) 넘긴다.
+    """
+    rep = QualityReport(n_rows=len(df), interval_s=_interval(df))
+    for name, mask in parts.items():
+        mask = np.asarray(mask, dtype=bool)
+        if not mask.any():
+            continue
+        sub = df.where(pd.Series(mask, index=df.index), axis=0)
+        r = assess(sub, columns, **kw)
+        for i in r.issues:
+            i.part = name
+            rep.issues.append(i)
+        for c, m in r.masks.items():
+            m = m & mask
+            rep.masks[c] = (rep.masks[c] | m) if c in rep.masks else m
     return rep
 
 

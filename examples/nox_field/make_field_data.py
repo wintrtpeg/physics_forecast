@@ -98,6 +98,18 @@ SPAN_GAS = 160.0          # 분석계 스팬 가스 (레인지 200 의 80%)
 DRIFT_PER_DAY = 0.12      # mg/Sm3/일, 월 1회 수동 교정으로 0 복귀
 CAL_SKIP = 0.10           # 자동 점검을 건너뛰는 날의 비율
 
+#: 계측 결함의 크기와 시각. 기본값이 개발에 쓴 데이터다. ``--holdout`` 은 이 값들과
+#: 사건 날짜를 시드로 흔들어, 툴을 만들며 한 번도 보지 않은 데이터를 만든다
+#: (탐지 임계값을 개발 데이터에 맞춰 놓았을 수 있으므로 — 그것도 누수다).
+VAR = {
+    "cal_hour": 3.0,            # 자동 점검 시각
+    "analyzer_offset": -3.0,    # 분석계 교체 후 오프셋 [mg/Sm3]
+    "fan_sp_offset": 12.0,      # 정압 전송기 교체 오프셋 [mmAq]
+    "flow_gain": 1.02,          # 굴뚝 유량계 게인
+    "hdr_gain": 1.03,           # 헤더 유량계 게인
+    "temp2_offset": 0.45,       # 예비 온도계 영점 [degC]
+}
+
 
 # --------------------------------------------------------------------------
 # 1. 공정 (진짜 운전 조건과 숨은 파라미터)
@@ -341,24 +353,26 @@ def measure(drivers: pd.DataFrame, true: pd.DataFrame, rng) -> Sheet:
         if (t.day == 1 and t.hour == 10 and t.minute == 0) or t == swap:
             last_reset = t
         drift[i] = DRIFT_PER_DAY * (t - last_reset) / pd.Timedelta(days=1)
-    offset = np.where(idx >= swap, -3.0, 0.0)
+    offset = np.where(idx >= swap, VAR["analyzer_offset"], 0.0)
     V["F2_UT_STK01_NOX_DRY"] = resp + drift + offset + rng.normal(0, 1.8, n)
     sh.event("sensor", "drift", ["F2_UT_STK01_NOX_DRY"], idx[0], idx[-1],
              f"분석계 드리프트 +{DRIFT_PER_DAY} mg/Sm3/일, 매월 1일 10:00 수동 교정으로 복귀")
     sh.event("sensor", "level_shift", ["F2_UT_STK01_NOX_DRY"], swap, None,
-             "NOx 분석계 교체 — 새 분석계가 3 mg/Sm3 낮게 읽음", magnitude=-3.0)
+             f"NOx 분석계 교체 — 새 분석계 오프셋 {VAR['analyzer_offset']:+.2f} mg/Sm3",
+             magnitude=VAR["analyzer_offset"])
 
     tag = "F2_UT_STK01_NOX_DRY"
     maint_a, maint_b = EV["nox_maint"]
     maint = sh.mask(maint_a, maint_b)
     days = pd.date_range(idx[0].normalize(), idx[-1].normalize(), freq="D")
     n_cal = 0
+    cal_at = pd.Timedelta(hours=VAR["cal_hour"])
     for d in days:
-        if rng.random() < CAL_SKIP or maint[idx.searchsorted(d + pd.Timedelta(hours=3))]:
+        if rng.random() < CAL_SKIP or maint[min(idx.searchsorted(d + cal_at), n - 1)]:
             continue
         n_cal += 1
-        i0 = idx.searchsorted(d + pd.Timedelta(hours=3))
-        if i0 + 5 > n or idx[i0] != d + pd.Timedelta(hours=3):
+        i0 = idx.searchsorted(d + cal_at)
+        if i0 + 5 > n or idx[i0] != d + cal_at:
             continue
         V[tag][i0:i0 + 2] = rng.normal(0.4, 0.3, 2)
         sh.label[tag][i0:i0 + 2] = "cal_zero"
@@ -366,7 +380,9 @@ def measure(drivers: pd.DataFrame, true: pd.DataFrame, rng) -> Sheet:
         sh.label[tag][i0 + 2:i0 + 4] = "cal_span"
         V[tag][i0 + 4] = 0.5 * SPAN_GAS + 0.5 * V[tag][i0 + 4]
         sh.label[tag][i0 + 4] = "cal_recover"
-    sh.event("sensor", "calibration", [tag], "매일 03:00", "03:25",
+    c0 = pd.Timestamp(0) + cal_at
+    sh.event("sensor", "calibration", [tag], f"매일 {c0:%H:%M}",
+             f"{c0 + pd.Timedelta(minutes=25):%H:%M}",
              f"자동 점검: 영점가스 10분 -> 스팬가스({SPAN_GAS:g}) 10분 -> 회복 5분. "
              f"{n_cal}일 수행, 약 {CAL_SKIP*100:.0f}% 건너뜀", n_days=n_cal)
     sh.mark(tag, maint, "maint", "Maint")
@@ -386,7 +402,7 @@ def measure(drivers: pd.DataFrame, true: pd.DataFrame, rng) -> Sheet:
     # ---- 굴뚝 유량계 --------------------------------------------------------
     tag = "F2_UT_STK01_FLOW"
     q = true["STK.Q_n"].to_numpy()
-    V[tag] = q * 1.02 + rng.normal(0, 0.012, n) * q
+    V[tag] = q * VAR["flow_gain"] + rng.normal(0, 0.012, n) * q
     cand = np.where(sh.label[tag] == "")[0]
     for i in rng.choice(cand, 15, replace=False):
         V[tag][i] *= rng.choice([0.7, 1.3])
@@ -398,12 +414,13 @@ def measure(drivers: pd.DataFrame, true: pd.DataFrame, rng) -> Sheet:
     V[tag][fz] = V[tag][np.argmax(fz) - 1]
     sh.mark(tag, fz, "frozen")
     sh.event("sensor", "frozen", [tag], fa, fb, "유량계 통신 모듈 이상 — 마지막 값 유지")
-    sh.event("sensor", "gain", [tag], idx[0], idx[-1], "유량계 +2% 게인 오차", magnitude=0.02)
+    sh.event("sensor", "gain", [tag], idx[0], idx[-1],
+             f"유량계 게인 {(VAR['flow_gain'] - 1) * 100:+.1f}%", magnitude=VAR["flow_gain"] - 1)
 
     # ---- 굴뚝 온도 (2중화) ---------------------------------------------------
     ts = true["STK.T_stack"].to_numpy()
     V["F2_UT_STK01_TEMP"] = ts + rng.normal(0, 0.3, n)
-    V["F2_UT_STK01_TEMP_2"] = ts + 0.45 + rng.normal(0, 0.3, n)
+    V["F2_UT_STK01_TEMP_2"] = ts + VAR["temp2_offset"] + rng.normal(0, 0.3, n)
     tag = "F2_UT_STK01_TEMP"
     for s, k, v in [("2025-02-03 14:10", 2, 999.9), ("2025-06-02 03:40", 1, -40.0),
                     ("2025-08-11 22:15", 3, 999.9)]:
@@ -415,9 +432,10 @@ def measure(drivers: pd.DataFrame, true: pd.DataFrame, rng) -> Sheet:
     # ---- 송풍기 / 스크러버 ------------------------------------------------------
     tag = "F2_UT_SCR01_FAN_SP"
     V[tag] = true["FAN.dp_mmAq"].to_numpy() + rng.normal(0, 3.0, n)
-    V[tag] = V[tag] + np.where(idx >= _t(EV["fan_sp_offset"]), 12.0, 0.0)
+    V[tag] = V[tag] + np.where(idx >= _t(EV["fan_sp_offset"]), VAR["fan_sp_offset"], 0.0)
     sh.event("sensor", "level_shift", [tag], EV["fan_sp_offset"], None,
-             "정압 전송기 교체 — 영점 미조정으로 +12 mmAq", magnitude=12.0)
+             f"정압 전송기 교체 — 영점 미조정으로 {VAR['fan_sp_offset']:+.1f} mmAq",
+             magnitude=VAR["fan_sp_offset"])
     V["F2_UT_SCR01_FAN_HZ"] = drivers["fan_hz"].to_numpy().copy()
     V["F2_UT_SCR01_DP"] = true["SCR.dp_mmAq"].to_numpy() + 2.0 + rng.normal(0, 2.0, n)
     V["F2_UT_SCR01_CIRC_FLOW"] = np.where(
@@ -442,9 +460,11 @@ def measure(drivers: pd.DataFrame, true: pd.DataFrame, rng) -> Sheet:
     for g in GROUPS:
         V[f"F2_UT_SCR01_BR_{g}_FLOW"] = (true[f"SRC_{g}.mdot"].to_numpy()
                                          + rng.normal(0, 0.012, n))
-    V["F2_UT_SCR01_HDR_FLOW"] = true["HDR.mdot_total"].to_numpy() * 1.03 + rng.normal(0, 0.02, n)
+    V["F2_UT_SCR01_HDR_FLOW"] = (true["HDR.mdot_total"].to_numpy() * VAR["hdr_gain"]
+                                 + rng.normal(0, 0.02, n))
     sh.event("sensor", "gain", ["F2_UT_SCR01_HDR_FLOW"], idx[0], idx[-1],
-             "헤더 유량계 +3% 게인 오차 — 지류 합과 3% 어긋남", magnitude=0.03)
+             f"헤더 유량계 게인 {(VAR['hdr_gain'] - 1) * 100:+.1f}%",
+             magnitude=VAR["hdr_gain"] - 1)
     tag = "F2_UT_SCR01_BR_IMP_FLOW"
     dead = sh.mask(EV["imp_meter_dead"])
     sh.mark(tag, dead, "status", "Bad")
@@ -574,12 +594,47 @@ def write_file(sh: Sheet, path: Path, rng) -> dict:
 
 # --------------------------------------------------------------------------
 
+def randomize(seed: int) -> None:
+    """시험용 변형: 사건 날짜·교정 시각·결함 크기를 시드로 흔든다.
+
+    증설일(6/10)과 학습/검증 경계는 그대로 둔다 — 비교 설계는 같고 결함만 다르다.
+    """
+    r = np.random.default_rng(seed + 7919)
+    windows = {                       # 사건별 허용 구간 (날짜를 옮겨도 이야기가 성립하게)
+        "comm_fail": ("2025-01-10", "2025-03-20"), "server_down": ("2025-02-01", "2025-03-25"),
+        "nox_maint": ("2025-02-10", "2025-04-20"), "recipe_change": ("2025-03-10", "2025-05-10"),
+        "pump_maint": ("2025-03-20", "2025-04-30"), "mes_na": ("2025-04-15", "2025-05-25"),
+        "flow_frozen": ("2025-04-20", "2025-05-25"), "fan_sp_offset": ("2025-04-15", "2025-07-31"),
+        "packing_clean": ("2025-06-15", "2025-07-25"), "water_increase": ("2025-06-20", "2025-07-20"),
+        "analyzer_swap": ("2025-07-01", "2025-08-15"),
+    }
+    for key, (lo, hi) in windows.items():
+        v = EV[key]
+        first = v[0] if isinstance(v, tuple) else v
+        span = (_t(hi) - _t(lo)).days
+        new0 = _t(lo) + pd.Timedelta(days=int(r.integers(0, span))) + (
+            _t(first) - _t(first).normalize())
+        shift = new0 - _t(first)
+        EV[key] = (tuple(str(_t(x) + shift) for x in v) if isinstance(v, tuple)
+                   else str(_t(v) + shift))
+    VAR["cal_hour"] = float(r.choice([1.0, 1.5, 2.0, 4.0, 4.5, 5.0]))
+    VAR["analyzer_offset"] = float(r.choice([-1, 1]) * r.uniform(2.0, 4.5))
+    VAR["fan_sp_offset"] = float(r.choice([-1, 1]) * r.uniform(8.0, 16.0))
+    VAR["flow_gain"] = float(1.0 + r.uniform(-0.03, 0.03))
+    VAR["hdr_gain"] = float(1.0 + r.choice([-1, 1]) * r.uniform(0.02, 0.05))
+    VAR["temp2_offset"] = float(r.choice([-1, 1]) * r.uniform(0.3, 0.8))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="현장형 비이상 데이터 생성")
     ap.add_argument("--seed", type=int, default=20250101)
     ap.add_argument("--out", default=str(HERE / "data"))
     ap.add_argument("--reuse", action="store_true", help="저장된 물리 시뮬레이션을 재사용")
+    ap.add_argument("--holdout", action="store_true",
+                    help="사건 날짜·교정 시각·결함 크기까지 시드로 흔든 시험용 변형")
     args = ap.parse_args()
+    if args.holdout:
+        randomize(args.seed)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -612,8 +667,9 @@ def main() -> None:
              "4월·7월 앞에 중간 헤더, 3월/4월 72행 중복, 8월이 7월보다 앞, "
              "3/9 하루 누락, 끝 콤마와 빈 줄", **info)
     (ans / "anomalies.json").write_text(
-        json.dumps({"events": sh.events, "EV": EV, "fan_hz": FAN_HZ,
-                    "true_const": TRUE_CONST}, ensure_ascii=False, indent=1),
+        json.dumps({"events": sh.events, "EV": EV, "fan_hz": FAN_HZ, "var": VAR,
+                    "true_const": TRUE_CONST, "seed": args.seed, "holdout": args.holdout},
+                   ensure_ascii=False, indent=1),
         encoding="utf-8")
 
     c = true["STK.C_dry"]

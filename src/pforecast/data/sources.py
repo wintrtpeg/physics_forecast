@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from .ingest import IngestReport, read_table
-from .quality import QualityReport, apply, assess
+from .quality import QualityReport, apply, assess, assess_parts
 from .tagmap import TagEntry, TagMap
 
 
@@ -76,20 +76,34 @@ def read_csv(path: str | Path, tagmap: TagMap, **kw) -> tuple[pd.DataFrame, pd.D
     return inputs, obs
 
 
-def read_csv_report(path: str | Path, tagmap: TagMap, clean: bool = True,
+def read_csv_report(path: str | Path, tagmap: TagMap, clean: bool = True, split=None,
                     **kw) -> tuple[pd.DataFrame, pd.DataFrame, DataReport]:
     """현장 CSV 를 읽고(인코딩·헤더·날짜 표기·상태 문자열 ...) 값 이상을 걸러
     모델 좌표계로 옮긴다. 무엇을 고치고 뺐는지 ``DataReport`` 로 같이 돌려준다.
 
     ``clean=False`` 면 값 이상(교정 창, 고착, 스파이크)을 그대로 둔다. 파일 형식은
     어느 쪽이든 고친다 — 그건 선택의 문제가 아니다.
+
+    ``split`` 은 (정제 전 모델 좌표계 프레임) -> {이름: 행 마스크} 함수다. 주면 값 이상
+    진단을 **분할마다 따로** 한다. 학습 데이터 정제에 검증 구간 통계가 섞이면 누수다.
     """
     tab = read_table(path, time_column=tagmap.timestamp_column)
     df = tab.df
     quality = None
     if clean:
         cols = [t for t in tagmap.all_tags if t in df.columns]
-        quality = assess(df, cols)
+        if split is not None:
+            inp0, obs0 = load_frames(df, tagmap, strict=False, **kw)
+            frame = inp0.join(obs0, how="inner")
+            parts = {}
+            for name, m in split(frame).items():
+                ser = pd.Series(np.asarray(m, dtype=bool), index=frame.index)
+                ser = ser.reindex(df.index, method="ffill") if not ser.index.equals(df.index) \
+                    else ser
+                parts[name] = ser.fillna(False).to_numpy(dtype=bool)
+            quality = assess_parts(df, parts, cols)
+        else:
+            quality = assess(df, cols)
         df = apply(df, quality)
     inputs, obs = load_frames(df, tagmap, **kw)
     return inputs, obs, DataReport(ingest=tab.report, quality=quality)

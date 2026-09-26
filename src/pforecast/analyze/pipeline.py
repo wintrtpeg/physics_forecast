@@ -63,6 +63,10 @@ class AnalysisConfig:
     report_out: str | None = None
     #: 값 이상(교정 창·고착·스파이크)을 결측으로 돌리고 분석한다. 파일 형식 정리는 항상 한다.
     clean: bool = True
+    #: 학습 끝과 검증 시작 사이 간격. 경계 부근은 거의 같은 상태라 검증이 쉬워진다.
+    embargo: str = "1D"
+    #: 미래 시점에도 미리 알 수 있는 값 (생산계획·기상예보·설정값). 미래 예측은 이것만 쓴다.
+    drivers: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str | Path) -> "AnalysisConfig":
@@ -80,12 +84,16 @@ class AnalysisConfig:
             return str(p if p.is_absolute() or p.exists() else root / p)
 
         units = dict(d.get("units") or {})
+        drivers = list(d.get("drivers") or [])
         tm_path = rel(d.get("units_from_tagmap"))
         if tm_path and Path(tm_path).exists():
             from ..data import TagMap
             tm = TagMap.load(tm_path)
             for e in list(tm.inputs) + list(tm.observations):
                 units.setdefault(e.tag, e.unit)
+            # 태그맵의 입력 = 모델에 주는 운전 조건 = 미래에도 미리 아는 값
+            if not d.get("drivers"):
+                drivers = [e.tag for e in tm.inputs]
         split = d.get("split") or {}
         return cls(
             name=d.get("name", Path(path).stem), csv=rel(data.get("csv", "")),
@@ -100,6 +108,8 @@ class AnalysisConfig:
             balance_tol=float(d.get("balance_tol", 0.03)),
             report_out=rel(d.get("report")),
             clean=bool(data.get("clean", True)),
+            embargo=str(split.get("embargo", "1D")),
+            drivers=drivers,
         )
 
 
@@ -121,6 +131,9 @@ class AnalysisResult:
     #: 학습 구간에서 한 번도 변하지 않아 대리모델이 효과를 배울 수 없는 피처
     #: [(이름, 학습 구간 값, 검증 구간 최소, 최대)]
     untrainable: list[tuple[str, float, float, float]] = field(default_factory=list)
+    split: Any = None            # SplitCheck — 미래인가, 외삽인가
+    #: 운전 입력만으로 한 미래 예측 (학습 구간 → 검증 구간)
+    forecast: dict[str, Any] = field(default_factory=dict)
 
     def ladder_table(self) -> pd.DataFrame:
         return pd.DataFrame([{
@@ -143,7 +156,7 @@ class AnalysisResult:
         else:
             out.append(
                 f"대리모델이 {self.config.target} 변동의 **{s.r2_cv*100:.0f}%** 를 설명합니다 "
-                f"(시간블록 교차검증 R², RMSE {s.rmse_cv:.4g} {s.unit}).")
+                f"(전진 교차검증 R², RMSE {s.rmse_cv:.4g} {s.unit} — 같은 시각 측정값을 쓴 현재값 추정).")
 
         # 영향인자는 반드시 '묶음' 기준으로 말한다. 개별 순위는 상관에 따라 임의로 갈린다.
         groups = [c for c in s.clusters if c.is_group]
@@ -197,6 +210,21 @@ class AnalysisResult:
             else:
                 out.append(f"{f} 는 값이 변하지 않아 영향을 식별할 수 없습니다 (뺐습니다).")
 
+        if self.split is not None:
+            out.extend(self.split.warnings())
+        fc = self.forecast
+        if fc.get("rmse") is not None and np.isfinite(fc.get("rmse", np.nan)):
+            msg = (f"**미래 예측(운전 입력 {len(fc['drivers'])}개만)**: 검증 구간 RMSE "
+                   f"{fc['rmse']:.4g} {s.unit}, 편향 {fc['bias']:+.3g}")
+            if fc["n_outside"] and np.isfinite(fc["rmse_outside"]):
+                msg += (f". 학습 운전영역 밖 {fc['n_outside']:,}행에서는 {fc['rmse_outside']:.4g}"
+                        + (f", 안쪽 {fc['n_inside']:,}행에서는 {fc['rmse_inside']:.4g}"
+                           if fc["n_inside"] and np.isfinite(fc["rmse_inside"]) else ""))
+            out.append(msg + ". 위의 설명력은 같은 시각 측정값을 쓴 현재값 추정이라 이 숫자와 다릅니다.")
+        elif not self.config.drivers:
+            out.append("운전 입력(미래에도 미리 아는 값)을 지정하지 않아 **미래 예측 성능은 재지 "
+                       "않았습니다.** 위의 설명력은 같은 시각 측정값을 쓴 현재값 추정입니다.")
+
         if np.isfinite(self.holdout_outside) and self.holdout_outside > 0.05:
             out.append(
                 f"검증 구간의 **{self.holdout_outside*100:.0f}% 가 학습 포락선 밖**입니다. "
@@ -217,9 +245,8 @@ class AnalysisResult:
 
 
 def _load_frame(cfg: AnalysisConfig):
-    """현장 파일을 읽어 정리하고 (값 이상은 결측으로), 정리 내역과 함께 돌려준다."""
+    """현장 파일을 읽어 정리한다. 값 정제는 분할을 정한 **뒤에** 분할별로 한다."""
     from ..data.ingest import read_table
-    from ..data.quality import apply, assess
 
     tab = read_table(cfg.csv, time_column=cfg.timestamp)
     df = tab.df
@@ -228,17 +255,34 @@ def _load_frame(cfg: AnalysisConfig):
         cfg.units.setdefault(c, u)
     if not cfg.target_unit and cfg.target in cfg.units:
         cfg.target_unit = cfg.units[cfg.target]
-    quality = None
-    if cfg.clean:
-        quality = assess(df)
-        df = apply(df, quality)
     if cfg.resample and isinstance(df.index, pd.DatetimeIndex):
         df = df.resample(cfg.resample).mean()
-    return df, tab.report, quality
+    return df, tab.report
+
+
+def _split_masks(df: pd.DataFrame, cfg: AnalysisConfig):
+    """시간순 분할 (앞 train_fraction 학습, 엠바고 뒤 검증). 시각이 없으면 행 순서."""
+    from ..data.split import future_split
+    if isinstance(df.index, pd.DatetimeIndex):
+        return future_split(df.index, cfg.train_fraction, cfg.embargo)
+    n = len(df)
+    cut = int(n * cfg.train_fraction)
+    tr = np.arange(n) < cut
+    return tr, np.arange(n) >= cut
 
 
 def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
-    df, ingest, quality = _load_frame(cfg)
+    from ..data.quality import apply, assess_parts
+    from ..data.split import check_split
+
+    df, ingest = _load_frame(cfg)
+    train_mask, test_mask = _split_masks(df, cfg)
+    quality = None
+    if cfg.clean:
+        # 분할별로 따로 진단한다 — 학습 데이터 정제에 검증 구간 통계가 섞이면 누수다
+        gap = ~(train_mask | test_mask)
+        quality = assess_parts(df, {"학습": train_mask, "간격": gap, "검증": test_mask})
+        df = apply(df, quality)
     if cfg.target not in df.columns:
         extra = ""
         if ingest is not None and cfg.target in ingest.text_columns:
@@ -282,17 +326,15 @@ def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
                               how_to_unblock="상수/중복 컬럼을 빼고 다시 확인하세요"))
         return res
 
-    work = df
+    keep = np.ones(len(df), dtype=bool)
     if cfg.steady_only:
-        mask = steady_state_mask(df, [cfg.target] + features)
-        work = df[mask]
+        keep = steady_state_mask(df, [cfg.target] + features)
         if verbose:
-            print(f"준정상 구간만 사용: {len(work)}/{len(df)}행")
+            print(f"준정상 구간만 사용: {int(keep.sum())}/{len(df)}행")
 
     # ---- L1 대리모델 + XAI -----------------------------------------------
-    n = len(work)
-    cut = int(n * cfg.train_fraction)
-    train, test = work.iloc[:cut], work.iloc[cut:]
+    # 시간순 분할 + 엠바고. 학습은 과거만 본다.
+    train, test = df[train_mask & keep], df[test_mask & keep]
     # 학습 구간에서 한 번도 변하지 않은 피처는 뺀다. 대리모델은 그 효과를 배울 방법이
     # 없다 — 증설처럼 '앞으로 바뀔 것'이 대개 여기에 걸린다. 빼는 것보다 알리는 게 중요하다.
     for f in list(features):
@@ -312,24 +354,50 @@ def run_analysis(cfg: AnalysisConfig, verbose: bool = True) -> AnalysisResult:
         res.surrogate = sur
         if len(test) > 10:
             res.holdout_outside = sur.envelope.outside_fraction(test)
-            Xte = test[features].to_numpy(dtype=float)
+            pred = sur.predict(pd.concat([train.tail(cfg.max_lag), test]))[test.index]
             yte = test[cfg.target].to_numpy(dtype=float)
-            ok = np.all(np.isfinite(Xte), axis=1) & np.isfinite(yte)
+            ok = np.isfinite(pred.to_numpy()) & np.isfinite(yte)
             if ok.sum() > 5:
-                pred = sur.model.predict(Xte[ok])
-                res.holdout_rmse = float(np.sqrt(np.mean((pred - yte[ok]) ** 2)))
+                res.holdout_rmse = float(np.sqrt(np.mean((pred.to_numpy()[ok] - yte[ok]) ** 2)))
         res.rungs.append(Rung(
-            "L1", "대리모델 + XAI", "완료",
+            "L1", "대리모델 + XAI (현재값 추정)", "완료",
             # 1위 인자는 반드시 **묶음** 기준으로 적는다. 개별 순위는 상관에 따라 갈린다.
-            finding=(f"{sur.model_name}, 교차검증 R²={sur.r2_cv:.3f}, "
+            finding=(f"{sur.model_name}, 전진 교차검증 R²={sur.r2_cv:.3f}, "
                      f"RMSE={sur.rmse_cv:.4g} {sur.unit}, "
                      f"1위 인자묶음 {sur.clusters[0].label}"
-                     f"({sur.clusters[0].importance_pct:.0f}%)"
+                     f"({sur.clusters[0].importance_pct:.0f}%). 같은 시각 측정값을 쓰므로 "
+                     "미래 예측 성능이 아닙니다"
                      if sur.clusters else ""),
             blocker="학습 포락선 밖에서는 근거가 없습니다",
             how_to_unblock="외삽이 필요하면 L4 구조 모델로 가야 합니다"))
     except Exception as exc:
         res.rungs.append(Rung("L1", "대리모델 + XAI", "막힘", blocker=str(exc)))
+
+    # ---- 미래 예측: 운전 입력만으로, 학습 구간 → 검증 구간 ------------------
+    drivers = [d for d in cfg.drivers if d in df.columns and d != cfg.target]
+    res.split = check_split(train, test, drivers or features)
+    if drivers:
+        try:
+            fc_feats = [d for d in drivers if d not in {u[0] for u in res.untrainable}]
+            fsur = fit_surrogate(train, cfg.target, fc_feats, unit=cfg.target_unit,
+                                 max_lag=cfg.max_lag, apply_lags=False)
+            pred = fsur.predict(test).to_numpy()
+            yte = test[cfg.target].to_numpy(dtype=float)
+            ok = np.isfinite(pred) & np.isfinite(yte)
+            out = res.split.outside if res.split.outside is not None else np.zeros(len(test), bool)
+            rm = lambda m: (float(np.sqrt(np.mean((pred[m] - yte[m]) ** 2)))  # noqa: E731
+                            if m.sum() > 5 else float("nan"))
+            res.forecast = {
+                "model": fsur.model_name, "drivers": fc_feats,
+                "untrainable": [u[0] for u in res.untrainable if u[0] in drivers],
+                "n": int(ok.sum()), "rmse": rm(ok), "bias": float(np.mean(pred[ok] - yte[ok]))
+                if ok.any() else float("nan"),
+                "n_outside": int((ok & out).sum()), "rmse_outside": rm(ok & out),
+                "n_inside": int((ok & ~out).sum()), "rmse_inside": rm(ok & ~out),
+                "pred": pd.Series(pred, index=test.index),
+            }
+        except Exception as exc:
+            res.forecast = {"error": str(exc)}
 
     # ---- L2 차원 해석 -----------------------------------------------------
     # 상수 컬럼만 뺀다. 결측이 많은 컬럼(도중에 고장 난 계측기)도 살아 있던 구간에서는

@@ -98,20 +98,40 @@ def calibration_report(cfg, res, out_path: str | Path) -> Path:
         ok = np.isfinite(a) & np.isfinite(b)
         return float(np.sqrt(np.mean((a[ok] - b[ok]) ** 2))) if ok.any() else float("nan")
 
-    phys_test_rmse = rmse(p_test, m_test)
+    # 핵심 비교는 학습 운전영역 밖(외삽) 행만으로 한다. 안쪽 행은 ML 도 근거가 있다.
+    chk = getattr(res, "split", None)
+    out = chk.outside if chk is not None and chk.outside is not None else None
+    if out is None or not out.any():
+        out = np.ones(len(res.test), dtype=bool)
+    sel = lambda a: np.where(out, np.asarray(a, dtype=float), np.nan)  # noqa: E731
+    phys_test_rmse = rmse(sel(p_test), m_test)
+    n_out = int(out.sum())
     tiles = [
         {"label": "학습 구간 RMSE (물리)", "value": f"{rmse(p_train, m_train):.2f}", "unit": unit,
          "note": f"{len(res.train):,}행"},
-        {"label": "외삽 구간 RMSE (물리)", "value": f"{phys_test_rmse:.2f}", "unit": unit,
-         "note": f"{len(res.test):,}행 · 학습에 없던 영역", "status": "good"},
+        {"label": "외삽 행 RMSE (물리)", "value": f"{phys_test_rmse:.2f}", "unit": unit,
+         "note": f"{n_out:,}행 · 학습 운전영역 밖", "status": "good"},
     ]
+    mls = []
     if res.baseline is not None:
-        bl_rmse = rmse(res.baseline_test, m_test)
+        mls.append(("다항 2차", res.baseline_test))
+    for name, (_, p_te) in (getattr(res, "extra_baselines", None) or {}).items():
+        mls.append((name.replace("ML ", ""), p_te))
+    for name, p_te in mls:
+        bl_rmse = rmse(sel(p_te), m_test)
         ratio = bl_rmse / max(phys_test_rmse, 1e-9)
-        tiles.append({"label": "외삽 구간 RMSE (ML)", "value": f"{bl_rmse:.2f}", "unit": unit,
-                      "note": f"물리모델 대비 {ratio:.1f}배",
+        tiles.append({"label": f"외삽 행 RMSE (ML {name})", "value": f"{bl_rmse:.2f}",
+                      "unit": unit, "note": f"물리모델 대비 {ratio:.1f}배",
                       "status": "bad" if ratio > 1.5 else "warn"})
+    if chk is not None and np.isfinite(chk.extrapolation):
+        tiles.append({"label": "검증의 외삽 비율", "value": f"{chk.extrapolation * 100:.0f}",
+                      "unit": "%", "note": ("미래 · 시간순" if chk.is_future
+                                            else "미래 아님 (시간 섞임)"),
+                      "status": "good" if chk.is_future and chk.is_extrapolation else "bad"})
     rep.tiles(tiles)
+    if chk is not None:
+        for w in chk.warnings():
+            rep.note(Report._emphasis(w), kind="bad")
 
     dr = getattr(res, "data_report", None)
     if dr is not None:
@@ -119,6 +139,8 @@ def calibration_report(cfg, res, out_path: str | Path) -> Path:
                           dr.quality.lines() if dr.quality else [], "0. 데이터 정리 내역")
 
     rep.h2("1. 무엇을 검증했는가")
+    if chk is not None:
+        rep.bullets(chk.lines())
     rep.bullets([
         f"동일한 <b>학습 구간 데이터만</b> 써서 물리모델을 보정하고 ML 기준모델을 학습시켰다. "
         f"(조건 <code>{cfg.train_query}</code>)",
@@ -510,12 +532,20 @@ def analysis_report(result, out_path: str | Path) -> Path:
     tiles = []
     if s is not None:
         skill = s.skill
-        tiles.append({"label": "설명력 (교차검증 R²)", "value": f"{s.r2_cv:.3f}",
-                      "note": f"{s.model_name} · 시간블록 5-fold",
+        tiles.append({"label": "현재값 추정 R²", "value": f"{s.r2_cv:.3f}",
+                      "note": f"{s.model_name} · 전진 교차검증 · 같은 시각 측정값 사용",
                       "status": "good" if s.r2_cv > 0.7 else "warn" if s.r2_cv > 0.3 else "bad"})
-        tiles.append({"label": "예측오차 RMSE", "value": f"{s.rmse_cv:.3g}",
-                      "unit": f" {s.unit}",
-                      "note": f"평균예측 대비 {skill*100:.0f}% 개선" if np.isfinite(skill) else ""})
+        fc = result.forecast or {}
+        if fc.get("rmse") is not None and np.isfinite(fc.get("rmse", np.nan)):
+            v = fc["rmse_outside"] if np.isfinite(fc.get("rmse_outside", np.nan)) else fc["rmse"]
+            tiles.append({"label": "미래 예측 RMSE (외삽 행)", "value": f"{v:.3g}",
+                          "unit": f" {s.unit}",
+                          "note": f"운전 입력 {len(fc['drivers'])}개만 · 외삽 {fc['n_outside']:,}행"})
+        else:
+            tiles.append({"label": "현재값 추정 RMSE", "value": f"{s.rmse_cv:.3g}",
+                          "unit": f" {s.unit}",
+                          "note": (f"평균예측 대비 {skill*100:.0f}% 개선"
+                                   if np.isfinite(skill) else "")})
     sure = [b for b in result.balances if b.confidence == "확실"]
     tiles.append({"label": "자동 발견 물리 관계", "value": f"{len(sure)}", "unit": "개",
                   "note": "보존식·이중화 계측 (확실)",
@@ -585,7 +615,7 @@ def analysis_report(result, out_path: str | Path) -> Path:
         meas = result.df.loc[s.pred.index, cfg.target].to_numpy()[::step]
         rep.figure(timeseries_fig(
             idx, {"실측": meas, "예측 (교차검증)": s.pred.to_numpy()[::step]},
-            f"{cfg.target} [{s.unit}]", "시간블록 교차검증 예측"),
+            f"{cfg.target} [{s.unit}]", "전진 교차검증 예측 (현재값 추정)"),
             "각 구간은 그 구간을 빼고 학습한 모델로 예측한 값입니다. "
             "무작위 k-fold 를 쓰면 앞뒤 시점이 서로 새어 들어가 성능이 과대평가됩니다.")
         ok = np.isfinite(s.pred.to_numpy()) & np.isfinite(

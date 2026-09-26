@@ -13,8 +13,13 @@ data:
   tagmap: tagmap.yaml
 
 split:
-  train: "`SRC_DRY.util` <= 0.55"     # 저부하만 학습
-  test:  "`SRC_DRY.util` >= 0.62"     # 고부하는 전부 외삽 검증
+  # 세 구간, 전부 시간순. 후보는 validate 로 고르고, test 는 **고르는 데 쓰지 않는다.**
+  # test 로 고른 뒤 test 오차를 성능으로 보고하면 선택 누수다 (고른 구간이 유리하다).
+  # 고르는 구간(validate)도 외삽이어야 한다 — 학습 범위 안에서 고르면 외삽 능력을 안 본다.
+  # 램프업(3/21~) 뒤로 선택 구간과 시험 구간을 나란히 둔다.
+  train:    "index < '2025-03-20'"
+  validate: "index >= '2025-03-21' and index < '2025-03-25'"
+  test:     "index >= '2025-03-26'"
 
 target: STK.C_dry
 slot: SCR                             # 교체할 컴포넌트

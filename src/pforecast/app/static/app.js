@@ -296,7 +296,7 @@ function barChart(host, opt) {
 // ── 상태 ────────────────────────────────────────────────────────────────
 const S = {
   csv: null, profile: null, units: {}, target: null, timeCol: null,
-  controllable: [], analysis: null, jobId: null,
+  controllable: [], drivers: [], analysis: null, jobId: null,
   modelPath: null, meta: null, drivers: {}, kpis: [], limits: {},
 };
 
@@ -333,7 +333,7 @@ async function pickDataset(path) {
   try {
     S.profile = await api('/api/profile', { csv: path });
     S.timeCol = S.profile.time_column;
-    S.units = {}; S.target = null; S.controllable = [];
+    S.units = {}; S.target = null; S.controllable = []; S.drivers = [];
     S.profile.columns.forEach(c => (S.units[c.name] = c.unit));
     renderProfile();
   } catch (e) {
@@ -381,6 +381,14 @@ function renderProfile() {
       onchange: () => { S.target = c.name; renderTargetBar(); $$('#coltable tr').forEach(tr =>
         tr.classList.toggle('picked', tr.dataset.name === c.name)); },
     });
+    const drv = h('input', {
+      type: 'checkbox', checked: S.drivers.includes(c.name), disabled: !c.usable,
+      title: '미래 시점에도 미리 아는 값 (생산계획·기상예보·설정값). 미래 예측은 이 값들만으로 합니다.',
+      onchange: e => {
+        S.drivers = e.target.checked ? [...S.drivers, c.name] : S.drivers.filter(x => x !== c.name);
+        renderTargetBar();
+      },
+    });
     const ctrl = h('input', {
       type: 'checkbox', checked: S.controllable.includes(c.name), disabled: !c.usable,
       onchange: e => {
@@ -406,7 +414,7 @@ function renderProfile() {
         ? h('span', { class: 'badge good' }, '사용')
         : h('span', { class: 'badge' }, c.status)),
       h('td', { class: 'issues' }, badges.length ? badges : '—'),
-      h('td', {}, targetRadio), h('td', {}, ctrl));
+      h('td', {}, targetRadio), h('td', {}, drv), h('td', {}, ctrl));
   });
 
   pane.append(h('div', { class: 'card' },
@@ -417,7 +425,8 @@ function renderProfile() {
         h('thead', {}, h('tr', {},
           h('th', {}, '컬럼'), h('th', {}, '단위'), h('th', {}, '최소'), h('th', {}, '최대'),
           h('th', {}, '결측'), h('th', {}, '상태'), h('th', {}, '이상'),
-          h('th', {}, '타깃'), h('th', {}, '제어'))),
+          h('th', {}, '타깃'), h('th', { title: '미래에도 미리 아는 값' }, '입력'),
+          h('th', {}, '제어'))),
         h('tbody', {}, rows))),
     h('div', { id: 'targetbar' })));
   renderTargetBar();
@@ -451,8 +460,11 @@ function renderTargetBar() {
   bar.append(h('div', { class: 'actions' },
     h('button', { class: 'btn', disabled: !ok, onclick: runAnalysis },
       ok ? `‘${S.target}’ 분석 실행` : '타깃을 선택하세요'),
-    h('span', { class: 'sub' }, S.controllable.length
-      ? `제어 가능: ${S.controllable.join(', ')}` : '제어 가능한 변수를 체크하면 개선안도 계산합니다')));
+    h('span', { class: 'sub' }, [
+      S.drivers.length ? `미래 예측 입력 ${S.drivers.length}개`
+                       : "'입력'(미래에도 아는 값)을 체크하면 미래 예측 성능을 따로 잽니다",
+      S.controllable.length ? `제어 가능: ${S.controllable.join(', ')}`
+                            : '제어 가능한 변수를 체크하면 개선안도 계산합니다'].join(' · '))));
 }
 
 const tile = (k, v, unit, note, status) => h('div', { class: 'tile' + (status ? ' ' + status : '') },
@@ -472,7 +484,7 @@ async function runAnalysis() {
     const { job } = await api('/api/analyze', {
       csv: S.csv, target: S.target, target_unit: S.units[S.target] || '',
       timestamp: S.timeCol || 'timestamp', units: S.units,
-      controllable: S.controllable, train_fraction: 0.6,
+      controllable: S.controllable, drivers: S.drivers, train_fraction: 0.6,
     });
     S.jobId = job.id;
     poll(job.id);
@@ -499,11 +511,14 @@ function renderAnalysis() {
   const a = S.analysis, s = a.surrogate, body = $('#analyze-body');
   body.innerHTML = '';
 
+  const fc = a.forecast || {};
   body.append(h('div', { class: 'tiles' },
-    tile('설명력 R²', s ? fmt(s.r2_cv, 3) : '—', '', '시간블록 교차검증',
+    tile('현재값 추정 R²', s ? fmt(s.r2_cv, 3) : '—', '', '전진 교차검증 · 같은 시각 측정값 사용',
          s && s.r2_cv > 0.7 ? 'good' : s && s.r2_cv > 0.3 ? 'warn' : 'bad'),
-    tile('예측오차 RMSE', s ? fmt(s.rmse_cv) : '—', s ? ' ' + (s.unit || '') : '',
-         s ? `평균예측 대비 ${fmt(s.skill * 100, 0)}% 개선` : ''),
+    fc.rmse !== undefined && fc.rmse !== null
+      ? tile('미래 예측 RMSE (외삽 행)', fmt(fc.rmse_outside ?? fc.rmse), s ? ' ' + (s.unit || '') : '',
+             `운전 입력 ${fc.drivers.length}개만 · 외삽 ${(fc.n_outside || 0).toLocaleString('ko-KR')}행`)
+      : tile('미래 예측', '—', '', "'입력' 컬럼을 지정하면 잽니다"),
     tile('자동 발견 물리 관계', String(a.balances.filter(b => b.confidence === '확실').length), '개',
          '보존식·이중화 계측 (확실)',
          a.balances.some(b => b.confidence === '확실') ? 'good' : ''),
@@ -567,7 +582,7 @@ function renderAnalysis() {
       h('span', {}, h('i', { style: `background:${COLORS()[0]}` }), '단독 (개별 해석 가능)')));
 
     if (s.pred) {
-      body.append(h('h2', {}, '예측 추종 (시간블록 교차검증)'));
+      body.append(h('h2', {}, '현재값 추정 추종 (전진 교차검증 — 앞 구간으로만 학습)'));
       const c2 = h('div', { class: 'chart' });
       body.append(h('div', { class: 'card' }, c2));
       lineChart(c2, {

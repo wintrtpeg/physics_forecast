@@ -30,7 +30,7 @@ import yaml
 
 from .calib import CalibrationSpec, build_param_rows, calibrate, simulate
 from .core.units import from_si
-from .data import TagMap, read_csv
+from .data import TagMap
 from .lib import EquationComponent
 from .scenario import load_model
 
@@ -65,6 +65,9 @@ class SelectionConfig:
     #: 후보들이 서로 갈리는 지점의 변수 (예: 스크러버 액가스비 ``SCR.LG``).
     #: 후보가 구분되지 않을 때 "이 변수를 더 흔들어야 한다"고 알려주는 데 쓴다.
     discriminator: str = ""
+    #: 후보를 **고르는** 구간. 비워 두면 test 로 고르게 되는데, 그러면 고른 구간의 오차를
+    #: 성능으로 보고하는 셈이라 낙관적이다(선택 누수). test 는 최종 평가에만 쓴다.
+    validate_query: str = ""
 
     @classmethod
     def load(cls, path: str | Path) -> "SelectionConfig":
@@ -85,6 +88,7 @@ class SelectionConfig:
             name=d.get("name", Path(path).stem), model=model,
             csv=rel(data.get("csv", "")), tagmap=rel(data.get("tagmap", "")),
             train_query=split.get("train", ""), test_query=split.get("test", ""),
+            validate_query=split.get("validate", ""),
             target=d.get("target", ""), slot=d.get("slot", ""),
             common_calibrate=cal.get("common") or [],
             observations=cal.get("observations") or [],
@@ -122,6 +126,10 @@ class CandidateResult:
     closure_params: list[str] = field(default_factory=list)
     at_bound_names: list[str] = field(default_factory=list)
     discriminator_span: tuple[float, float] | None = None
+    #: 최종 시험 구간 (선택에 쓰지 않음). validate 구간이 있을 때만.
+    final_rmse: float = float("nan")
+    final_bias: float = float("nan")
+    final_pred: pd.Series | None = None
 
 
 @dataclass
@@ -161,6 +169,8 @@ class SelectionResult:
                 "최악 상관": r.worst_corr,
                 "최대 상대표준오차[%]": r.max_rel_stderr,
                 "경계에 붙은 파라미터": r.at_bound,
+                **({f"최종 시험 RMSE [{u}] (선택에 안 씀)": r.final_rmse}
+                   if self.config.validate_query else {}),
             })
         df = pd.DataFrame(rows).sort_values(f"외삽 RMSE [{u}]").reset_index(drop=True)
         return df
@@ -233,6 +243,17 @@ class SelectionResult:
         best = ok[0]
         u = best.unit
         out.append(f"외삽 오차가 가장 작은 후보는 **{best.id}** ({best.test_rmse:.3g} {u}) 입니다.")
+        for name, chk in (getattr(self, "checks", None) or {}).items():
+            out.extend(f"[{name} 구간] {w}" for w in chk.warnings())
+        if self.config.validate_query:
+            if np.isfinite(best.final_rmse):
+                out.append(
+                    f"선택에 쓰지 않은 최종 시험 구간에서 {best.id} 의 RMSE 는 "
+                    f"**{best.final_rmse:.3g} {u}** 입니다 — 이 숫자가 보고할 성능입니다.")
+        else:
+            out.append(
+                "**후보를 고른 구간과 성능을 잰 구간이 같습니다.** 위 1위의 오차는 낙관적입니다 "
+                "(선택 누수). 설정에 `split.validate` 를 따로 두면 test 는 최종 평가에만 씁니다.")
 
         # ① 실무적으로 구분되는가. 이게 1등 발표보다 훨씬 중요하다.
         #    n 이 수천이면 통계적 유의성은 거의 항상 나온다 - 기준이 될 수 없다.
@@ -372,7 +393,9 @@ def _aicc(pred_df: pd.DataFrame, meas_df: pd.DataFrame, sigmas: dict[str, float]
 def evaluate_candidate(cfg: SelectionConfig, cand: Candidate, tm: TagMap,
                        train: pd.DataFrame, test: pd.DataFrame,
                        inputs_cols: list[str], obs_cols: list[str],
-                       verbose: bool = True) -> CandidateResult:
+                       verbose: bool = True,
+                       final: pd.DataFrame | None = None) -> CandidateResult:
+    """``test`` 는 후보를 고르는 구간, ``final`` 은 고르는 데 쓰지 않는 최종 시험 구간."""
     unit = next((e.unit for e in tm.observations if e.primary == cfg.target), "1")
     params = list(dict.fromkeys(cfg.common_calibrate + cand.calibrate))
     if verbose:
@@ -433,7 +456,15 @@ def evaluate_candidate(cfg: SelectionConfig, cand: Candidate, tm: TagMap,
         except (KeyError, AttributeError):
             span = None
 
+    fin_rmse = fin_bias = float("nan")
+    fin_pred = None
+    if final is not None and len(final):
+        fin_pred = simulate(model, build_param_rows(model, final[inputs_cols], model.p0(), exp),
+                            [cfg.target], index=final.index).values[cfg.target]
+        fin_rmse, fin_bias, _ = _rmse(fin_pred, final[cfg.target], unit)
+
     return CandidateResult(
+        final_rmse=fin_rmse, final_bias=fin_bias, final_pred=fin_pred,
         id=cand.id, description=cand.description or "", n_params=k,
         train_rmse=tr_rmse, test_rmse=te_rmse, test_bias=te_bias, test_r2=te_r2,
         aicc=_aicc(pred_tr, train[obs_cols], tm.sigmas(), k),
@@ -445,19 +476,50 @@ def evaluate_candidate(cfg: SelectionConfig, cand: Candidate, tm: TagMap,
     )
 
 
+def _selection_masks(cfg: SelectionConfig, frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    def q(expr):
+        return (frame.index.isin(frame.query(expr).index) if expr
+                else np.zeros(len(frame), dtype=bool))
+    tr = q(cfg.train_query) if cfg.train_query else np.ones(len(frame), dtype=bool)
+    va = q(cfg.validate_query) & ~tr
+    te = (q(cfg.test_query) if cfg.test_query else np.ones(len(frame), dtype=bool)) & ~tr & ~va
+    return {"학습": tr, "선택": va, "시험": te, "기타": ~(tr | va | te)}
+
+
 def run_selection(cfg: SelectionConfig, verbose: bool = True) -> SelectionResult:
+    from .data import read_csv_report
+    from .data.split import check_split
     tm = TagMap.load(cfg.tagmap)
-    inputs, obs = read_csv(cfg.csv, tm)
+    inputs, obs, _ = read_csv_report(cfg.csv, tm, split=lambda f: _selection_masks(cfg, f))
     df = inputs.join(obs, how="inner").dropna()
-    train = df.query(cfg.train_query) if cfg.train_query else df
-    test = df.query(cfg.test_query) if cfg.test_query else df
+    masks = _selection_masks(cfg, df)
+    train = df[masks["학습"]]
+    test = df[masks["시험"]]
+    validate = df[masks["선택"]] if cfg.validate_query else None
+    choose = validate if validate is not None else test
     obs_cols = [c for c in (cfg.observations or list(obs.columns)) if c in df.columns]
     if cfg.target not in obs_cols:
         raise ValueError(f"target {cfg.target!r} 이 관측 목록에 없습니다: {obs_cols}")
+    checks = {"선택": check_split(train, choose, list(inputs.columns))}
+    if validate is not None:
+        # 후보는 train 으로만 보정하므로 시험 구간의 외삽 여부도 train 기준으로 본다.
+        # 미래 여부는 선택 구간 뒤인지까지 본다.
+        chk = check_split(train, test, list(inputs.columns))
+        after = check_split(validate, test)
+        chk.n_test_before_train_end = max(chk.n_test_before_train_end,
+                                          after.n_test_before_train_end)
+        checks["시험"] = chk
     if verbose:
-        print(f"데이터 {len(df)}행 | 학습 {len(train)}행 | 외삽검증 {len(test)}행")
+        extra = f" | 선택 {len(validate)}행" if validate is not None else ""
+        print(f"데이터 {len(df)}행 | 학습 {len(train)}행{extra} | 시험 {len(test)}행")
+        for name, chk in checks.items():
+            for w in chk.warnings():
+                print(f"  !! [{name}] " + w.replace("**", ""))
         print(f"후보 {len(cfg.candidates)}개 비교")
-    results = [evaluate_candidate(cfg, c, tm, train, test, list(inputs.columns), obs_cols,
-                                  verbose)
+    results = [evaluate_candidate(cfg, c, tm, train, choose, list(inputs.columns), obs_cols,
+                                  verbose, final=test if validate is not None else None)
                for c in cfg.candidates]
-    return SelectionResult(config=cfg, results=results, train=train, test=test, tagmap=tm)
+    out = SelectionResult(config=cfg, results=results, train=train, test=choose, tagmap=tm)
+    out.checks = checks                              # type: ignore[attr-defined]
+    out.final = test if validate is not None else None   # type: ignore[attr-defined]
+    return out

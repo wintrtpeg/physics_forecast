@@ -71,10 +71,27 @@ def test_envelope_distance_is_zero_inside_and_positive_outside():
 
 def test_time_blocked_folds_never_shuffle():
     folds = time_blocked_folds(100, 5)
-    assert len(folds) == 5
+    assert len(folds) == 4                  # 첫 블록은 앞선 데이터가 없어 검증하지 않는다
     for tr, te in folds:
         assert len(np.intersect1d(tr, te)) == 0
         assert np.all(np.diff(te) == 1), "검증 블록은 연속된 시간이어야 한다"
+        assert tr.max() < te.min(), "미래 데이터로 학습하면 안 된다"
+
+
+def test_folds_leave_a_gap_before_each_validation_block():
+    for tr, te in time_blocked_folds(1000, 5, gap=12):
+        assert te.min() - tr.max() == 13
+
+
+def test_lags_never_use_future_feature_values():
+    from pforecast.analyze.surrogate import find_lags
+    n = 600
+    rng = np.random.default_rng(5)
+    x = np.cumsum(rng.normal(0, 1, n))
+    # 타깃이 피처보다 '앞선다' (피처의 미래 값이 타깃을 설명) — 이 지연은 쓰면 안 된다
+    df = pd.DataFrame({"x": x, "y": np.roll(x, -4)})
+    lag = find_lags(df, "y", ["x"], max_lag=8)[0]
+    assert lag.best_lag >= 0
 
 
 def test_lag_detection_finds_a_known_shift():

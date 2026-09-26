@@ -15,6 +15,7 @@ data:
   tagmap: tagmap.yaml
 
 split:
+  # 시간순. 학습 끝(5/31)과 검증 시작(6/10) 사이 9일 간격, 그 사이에 증설이 있다.
   train: "index < '2025-06-01'"
   test:  "index >= '2025-06-10'"
 

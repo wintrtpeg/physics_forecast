@@ -60,17 +60,34 @@ FLOW_SENSOR = dict(unit="kg/s", noise=0.012, bias=0.0)
 
 
 def utilization_profile(n: int, rng: np.random.Generator) -> np.ndarray:
-    """현실적인 가동율 시계열: 완만한 추세 + 주간 주기 + 단기 변동 + 가끔 감산."""
+    """현실적인 가동율 시계열: 완만한 추세 + 주간 주기 + 단기 변동 + 가끔 감산.
+
+    마지막 열흘은 **신제품 램프업**으로 가동율이 한 단계 올라간다. 앞 20일로 학습하고
+    뒤 열흘을 맞히면, 그게 곧 '학습 범위 밖의 미래'를 예측하는 검증이 된다.
+    (예전에는 한 달 내내 완만히 오르게 만들고 가동율 값으로 학습/검증을 갈랐는데,
+    그러면 검증 행의 88% 가 학습보다 과거였다 — 미래 예측 검증이 아니었다.)
+    """
     t = np.arange(n)
-    trend = 0.46 + 0.16 * t / max(n - 1, 1)                  # 램프업 중인 라인
+    day = t / 288.0
+    trend = np.where(day < 20.0, 0.42 + 0.12 * day / 20.0,        # 기존 제품: 서서히 증가
+                     0.75 + 0.10 * np.clip((day - 21.0) / 9.0, 0, 1))  # 램프업 후
+    ramp = (day >= 20.0) & (day < 21.0)                           # 하루 동안 전환
+    trend = np.where(ramp, 0.54 + (0.75 - 0.54) * (day - 20.0), trend)
     weekly = 0.035 * np.sin(2 * np.pi * t / (7 * 288))
     daily = 0.025 * np.sin(2 * np.pi * t / 288 + 0.7)
-    noise = np.cumsum(rng.normal(0, 0.006, n))
-    noise -= np.linspace(noise[0], noise[-1], n)
+    # 단기 변동: 시간상수 6시간, 표준편차 0.02 의 AR(1). (예전의 누적합 잡음은 한 달에
+    # ±0.3 까지 떠돌아 추세를 덮었다 — 가동율이 학습 구간에서 이미 0.95 에 닿았다.)
+    phi = np.exp(-1.0 / 72.0)
+    e = rng.normal(0, 0.02 * np.sqrt(1 - phi ** 2), n)
+    noise = np.empty(n)
+    noise[0] = rng.normal(0, 0.02)
+    for i in range(1, n):
+        noise[i] = phi * noise[i - 1] + e[i]
     u = trend + weekly + daily + noise
-    # 감산/PM 구간
+    # 감산/PM 구간 (램프업 이전 기간에만 — 이후에 넣으면 학습 범위 안으로 돌아온다)
+    early = int(20 * 288)
     for _ in range(max(1, n // 2200)):
-        s = rng.integers(0, max(n - 300, 1))
+        s = rng.integers(0, max(min(n, early) - 300, 1))
         w = int(rng.integers(60, 280))
         u[s:s + w] *= rng.uniform(0.45, 0.75)
     return np.clip(u, 0.05, 0.95)

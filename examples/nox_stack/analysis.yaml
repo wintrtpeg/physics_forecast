@@ -34,6 +34,17 @@ units:
   F2_UT_SCR01_BR_IMP_FLOW:  kg/s
   F2_UT_SCR01_HDR_FLOW:     kg/s
 
+# 미래 시점에도 미리 아는 값 (생산계획의 가동율, 기상예보의 외기, 설정값).
+# 미래 예측 성능은 이것들만으로 잰다. 굴뚝 유량·압력·지류 유량은 같은 시각의 결과라
+# 미래에는 없다 — 그걸 쓰면 '현재값 추정'이지 예측이 아니다.
+drivers:
+  - F2_FAB_DRY_UTIL
+  - F2_FAB_CVD_UTIL
+  - F2_FAB_WET_UTIL
+  - F2_FAB_IMP_UTIL
+  - F2_UT_AMB_TEMP
+  - F2_UT_SCR01_FAN_HZ
+
 # 운전자가 실제로 바꿀 수 있는 변수만 적는다. 개선 탐색은 여기만 움직인다.
 controllable:
   - F2_UT_SCR01_FAN_HZ
@@ -41,6 +52,7 @@ controllable:
 objective: minimize
 
 split:
-  train_fraction: 0.6        # 시간순 앞 60% 학습, 뒤 40% 검증 (무작위 분할 금지)
+  train_fraction: 0.6        # 시간순 앞 60% 학습, 하루 띄우고 나머지 검증 (무작위 분할 금지)
+  embargo: 1D
 
 report: out/analysis.html

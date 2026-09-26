@@ -436,6 +436,7 @@ class Api:
             objective=body.get("objective", "minimize"),
             train_fraction=float(body.get("train_fraction", 0.6)),
             steady_only=bool(body.get("steady_only", False)),
+            drivers=body.get("drivers") or [],
         )
         out_dir = self.ws.root / "out"
         out_dir.mkdir(exist_ok=True)
@@ -538,6 +539,10 @@ def _analysis_payload(res, report_rel: str) -> dict:
                      "quality": res.quality.lines() if res.quality is not None else []},
         "untrainable": [{"feature": f, "train_value": _num(v), "test_min": _num(lo),
                          "test_max": _num(hi)} for f, v, lo, hi in res.untrainable],
+        "split": res.split.to_dict() if res.split is not None else None,
+        "forecast": ({k: (_num(v) if isinstance(v, (int, float, np.floating)) else v)
+                      for k, v in res.forecast.items() if k != "pred"}
+                     if res.forecast else {}),
         "holdout_outside": _num(res.holdout_outside),
         "holdout_rmse": _num(res.holdout_rmse),
         "improvement": None if res.improvement is None else {

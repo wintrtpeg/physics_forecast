@@ -85,8 +85,10 @@ def score_quality(tab, q, truth) -> dict:
     return out
 
 
-def score_analysis(cfg_path) -> dict:
+def score_analysis(cfg_path, csv=None) -> dict:
     cfg = AnalysisConfig.load(cfg_path)
+    if csv is not None:
+        cfg.csv = str(csv)
     t0 = time.perf_counter()
     res = run_analysis(cfg, verbose=False)
     s = res.surrogate
@@ -100,22 +102,9 @@ def score_analysis(cfg_path) -> dict:
         "top_cluster": s.clusters[0].members if s and s.clusters else [],
         "top_cluster_pct": s.clusters[0].importance_pct if s and s.clusters else None,
         "balances": bal,
+        "split": res.split.to_dict() if res.split is not None else None,
+        "forecast": {k: v for k, v in res.forecast.items() if k != "pred"},
     }
-
-
-def _ml_on_drivers(res) -> tuple[np.ndarray, np.ndarray]:
-    """같은 학습 구간·같은 입력(운전 변수)으로 학습한 그래디언트 부스팅."""
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    feats = res.inputs_cols
-    tr = res.train.dropna(subset=feats + [TARGET])
-    m = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.08, min_samples_leaf=20,
-                                      l2_regularization=1.0, random_state=0)
-    m.fit(tr[feats].to_numpy(), tr[TARGET].to_numpy())
-    te = res.test[feats].to_numpy()
-    ok = np.all(np.isfinite(te), axis=1)
-    pred = np.full(len(te), np.nan)
-    pred[ok] = m.predict(te[ok])
-    return pred, m
 
 
 def score_workflow(cfg: WorkflowConfig, truth: pd.DataFrame, label: str) -> tuple[dict, object]:
@@ -127,11 +116,16 @@ def score_workflow(cfg: WorkflowConfig, truth: pd.DataFrame, label: str) -> tupl
     true_c = truth.loc[te, "true:STK.C_dry"].to_numpy()
     meas = conv(res.test[TARGET])
     phys = conv(res.physics_test[TARGET])
-    poly = conv(res.baseline_test) if res.baseline_test is not None else np.full(len(te), np.nan)
-    hgb, _ = _ml_on_drivers(res)
-    hgb = conv(hgb)
+    models = [("물리모델", phys)]
+    if res.baseline_test is not None:
+        models.append(("ML 다항(2차)", conv(res.baseline_test)))
+    for name, (_, p_te) in res.extra_baselines.items():
+        models.append((name, conv(p_te)))
+    # 채점은 학습 운전영역 밖(외삽) 행만. 이 설계에서는 검증 행 전부가 해당된다.
+    out = res.split.outside if res.split.outside is not None else np.ones(len(te), bool)
     rows = {}
-    for name, pred in [("물리모델", phys), ("ML 다항릿지", poly), ("ML 부스팅", hgb)]:
+    for name, pred in models:
+        pred = np.where(out, pred, np.nan)
         # 초과 판정은 1시간 평균 기준 (5분 값은 잡음이 크다)
         hr = pd.DataFrame({"p": pred, "t": true_c}, index=te).resample("1h").mean().dropna()
         exceed = hr["t"] > LIMIT
@@ -159,6 +153,7 @@ def score_workflow(cfg: WorkflowConfig, truth: pd.DataFrame, label: str) -> tupl
         "excluded_rows": cal.n_excluded if cal is not None else 0,
         "clipped": dict(res.clipped), "changepoints": cps,
         "test_true_range": [float(np.nanmin(true_c)), float(np.nanmax(true_c))],
+        "split": res.split.to_dict(),
     }, res
 
 
@@ -167,10 +162,10 @@ def score_changepoints(cps: list[dict], anomalies: dict, tol_days: int = 2) -> d
     ev = anomalies["EV"]
     truth = [
         ("레시피 변경 (DRY 배출 +15%, 비계측)", ev["recipe_change"], {"STK.C_dry"}, True),
-        ("정압 전송기 교체 +12 mmAq", ev["fan_sp_offset"], {"FAN.dp_mmAq"}, True),
+        ("정압 전송기 교체 (영점 오프셋)", ev["fan_sp_offset"], {"FAN.dp_mmAq"}, True),
         ("충전재 세정 (차압·효율 복원)", ev["packing_clean"][1],
          {"SCR.dp_mmAq", "STK.C_dry", "STK.Q_n", "FAN.dp_mmAq"}, True),
-        ("NOx 분석계 교체 −3", ev["analyzer_swap"], {"STK.C_dry"}, True),
+        ("NOx 분석계 교체 (오프셋)", ev["analyzer_swap"], {"STK.C_dry"}, True),
         ("순환수 증량 (모델 NTU 지수 0.55 vs 실제 0.62)", ev["water_increase"], {"STK.C_dry"}, False),
         ("증설 (팬 곡선 마모가 드러남)", ev["expansion"], None, False),
     ]
@@ -204,7 +199,11 @@ def score_changepoints(cps: list[dict], anomalies: dict, tol_days: int = 2) -> d
 
 
 def write_markdown(sc: dict, path: Path) -> None:
+    ds = sc.get("dataset") or {}
+    kind = ("시험용 변형 — 개발 중 한 번도 보지 않은 데이터 (사건 날짜·교정 시각·결함 크기도 다름)"
+            if ds.get("holdout") else "개발용 데이터 (탐지 임계값을 이 데이터를 보며 조정했다)")
     L = ["# 현장형 더미 데이터 채점표", "",
+         f"데이터: {kind}, 시드 {ds.get('seed')}", "",
          f"생성: {sc['generated']} · 소요 {sc['total_seconds']/60:.1f}분", ""]
     ing = sc["ingest"]
     L += ["## 1. 파일 읽기", "",
@@ -226,16 +225,26 @@ def write_markdown(sc: dict, path: Path) -> None:
     L += ["", f"정상 점 {tq['clean_points']:,}개 중 오탐 {tq['false_pos']}개. 펌프 정지(값 0 유지)는 "
           f"{'지우지 않음' if sc['quality']['_zero_hold_kept'] else '지움(오류)'}.", ""]
     an = sc["analysis"]
+    fc = an.get("forecast") or {}
     L += ["## 3. 데이터 주도 분석 (L0~L3)", "",
-          f"* 대리모델 교차검증 R² {an['r2_cv']:.3f}, 검증구간 {an['holdout_outside']*100:.0f}% 가 학습 포락선 밖",
+          f"* 현재값 추정(같은 시각 측정값 사용) 전진 교차검증 R² {an['r2_cv']:.3f}",
+          (f"* 미래 예측(운전 입력만, 시간순 분할): 검증 RMSE {fc['rmse']:.2f}, "
+           f"외삽 행 {fc['n_outside']:,}개에서 {fc['rmse_outside']:.2f}, "
+           f"내삽 행 {fc['n_inside']:,}개에서 {fc['rmse_inside']:.2f} mg/Sm³"
+           if fc.get("rmse") is not None else "* 미래 예측: 운전 입력 미지정"),
           f"* 학습 구간에서 변하지 않아 대리모델이 배울 수 없는 변수: {', '.join(an['untrainable']) or '없음'}"]
     for b in an["balances"]:
         L.append(f"* [{b['confidence']}] {b['formula']} — {b['note'] or '이득 1.00'}")
     L.append("")
     for wf in sc["workflows"]:
-        L += [f"## 4. 물리모델 vs ML — 학습 1~5월, 검증 6/10~8월 ({wf['label']})", "",
-              f"검증 구간은 설치대수 24→30, 외기·가동율 모두 학습 범위 밖. "
-              f"계측 잡음 하한(측정 vs 참값 RMSE) {wf['noise_floor_rmse']:.2f} mg/Sm³.", "",
+        sp = wf["split"]
+        L += [f"## 4. 물리모델 vs ML — 미래 · 외삽 검증 ({wf['label']})", "",
+              f"* 미래 예측인가: {'예' if sp['is_future'] else '**아니오**'} "
+              f"(검증 행 중 학습보다 과거 {sp['n_test_before_train_end']}개, "
+              f"간격 {sp['embargo_days']:.1f}일)",
+              f"* 외삽인가: 검증 행의 **{sp['extrapolation'] * 100:.0f}%** 가 학습 운전영역 밖 "
+              "(채점은 그 행들만)",
+              f"* 계측 잡음 하한(측정 vs 참값 RMSE) {wf['noise_floor_rmse']:.2f} mg/Sm³", "",
               "| 모델 | 참값 대비 RMSE | 편향 | 측정값 대비 RMSE | 초과 시간 적중 | 오경보 |",
               "|---|---:|---:|---:|---:|---:|"]
         for name, m in wf["models"].items():
@@ -262,27 +271,34 @@ def write_markdown(sc: dict, path: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="정제 없는 비교를 건너뜀")
+    ap.add_argument("--data", default=str(DATA),
+                    help="채점할 데이터 폴더 (field_raw.csv + _answer/). 시험용 변형은 data/holdout")
+    ap.add_argument("--name", default="scorecard", help="결과 파일 이름")
     args = ap.parse_args()
-    if not (DATA / "field_raw.csv").exists():
+    data = Path(args.data)
+    if not (data / "field_raw.csv").exists():
         sys.exit("먼저 make_field_data.py 를 실행하세요")
     OUT.mkdir(exist_ok=True)
     t_all = time.perf_counter()
-    anomalies = json.loads((DATA / "_answer" / "anomalies.json").read_text(encoding="utf-8"))
+    anomalies = json.loads((data / "_answer" / "anomalies.json").read_text(encoding="utf-8"))
 
     print("[1/4] 파일 읽기 + 값 이상 탐지", flush=True)
-    tab = read_table(DATA / "field_raw.csv")
+    tab = read_table(data / "field_raw.csv")
     q = assess(tab.df)
-    truth = pd.read_csv(DATA / "_answer" / "field_truth.csv", index_col=0, parse_dates=True,
+    truth = pd.read_csv(data / "_answer" / "field_truth.csv", index_col=0, parse_dates=True,
                         low_memory=False).reindex(tab.df.index)
     sc = {"generated": pd.Timestamp.now().isoformat(timespec="seconds"),
           "ingest": score_ingest(tab, anomalies), "quality": score_quality(tab, q, truth)}
 
+    sc["dataset"] = {"path": str(data), "seed": anomalies.get("seed"),
+                     "holdout": anomalies.get("holdout", False), "var": anomalies.get("var")}
     print("[2/4] 데이터 주도 분석", flush=True)
-    sc["analysis"] = score_analysis(HERE / "analysis.yaml")
+    sc["analysis"] = score_analysis(HERE / "analysis.yaml", data / "field_raw.csv")
 
     print("[3/4] 보정 + 외삽 검증 (정제 적용)", flush=True)
     sc["workflows"] = []
     cfg = WorkflowConfig.load(HERE / "calibration.yaml")
+    cfg.csv = str(data / "field_raw.csv")
     cfg.report_out = None
     cfg.params_out = None
     wf, _ = score_workflow(cfg, truth, "정제 적용")
@@ -292,6 +308,7 @@ def main() -> None:
     if not args.quick:
         print("[4/4] 보정 + 외삽 검증 (값 정제 없이 — 비교용)", flush=True)
         cfg2 = WorkflowConfig.load(HERE / "calibration.yaml")
+        cfg2.csv = str(data / "field_raw.csv")
         cfg2.report_out = cfg2.params_out = None
         cfg2.clean = False
         cfg2.diagnose = False
@@ -299,10 +316,10 @@ def main() -> None:
         sc["workflows"].append(wf2)
 
     sc["total_seconds"] = time.perf_counter() - t_all
-    (OUT / "scorecard.json").write_text(json.dumps(sc, ensure_ascii=False, indent=1, default=str),
-                                        encoding="utf-8")
-    write_markdown(sc, OUT / "scorecard.md")
-    print((OUT / "scorecard.md").read_text(encoding="utf-8"))
+    (OUT / f"{args.name}.json").write_text(
+        json.dumps(sc, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    write_markdown(sc, OUT / f"{args.name}.md")
+    print((OUT / f"{args.name}.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

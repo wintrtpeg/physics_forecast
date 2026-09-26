@@ -96,6 +96,20 @@ class SurrogateResult:
     pred: pd.Series | None = None
     fold_scores: list[float] = field(default_factory=list)
     model: object = None
+    #: 학습에 적용한 지연 {피처: 행 수}. 예측할 때도 똑같이 적용해야 한다.
+    applied_lags: dict[str, int] = field(default_factory=dict)
+
+    def predict(self, df: pd.DataFrame) -> pd.Series:
+        """학습 때와 같은 지연을 적용해 예측한다 (지연 피처는 과거 값만 쓴다)."""
+        X = df[self.features].copy()
+        for f, lag in self.applied_lags.items():
+            X[f] = X[f].shift(lag)
+        A = X.to_numpy(dtype=float)
+        ok = np.all(np.isfinite(A), axis=1)
+        out = np.full(len(A), np.nan)
+        if ok.any():
+            out[ok] = self.model.predict(A[ok])
+        return pd.Series(out, index=df.index)
 
     @property
     def skill(self) -> float:
@@ -115,7 +129,7 @@ class SurrogateResult:
     def importance_table(self) -> pd.DataFrame:
         return pd.DataFrame([{
             "피처": i.feature, "중요도[%]": i.importance_pct,
-            f"RMSE 증가": i.importance,
+            "RMSE 증가": i.importance,
             "최대상관 상대": i.max_corr_with, "상관": i.max_corr,
             "해석주의": "다른 변수와 얽힘" if i.entangled else "",
         } for i in self.importances])
@@ -123,14 +137,18 @@ class SurrogateResult:
 
 def find_lags(df: pd.DataFrame, target: str, features: list[str],
               max_lag: int = 12) -> list[LagInfo]:
-    """피처를 앞뒤로 밀어 보며 상관이 가장 커지는 지연을 찾는다."""
+    """피처를 **과거 쪽으로만** 밀어 보며 상관이 가장 커지는 지연을 찾는다.
+
+    음수 지연(피처의 미래 값으로 현재 타깃을 설명)은 허용하지 않는다. 상관은 더 좋게
+    나올 수 있지만, 예측 시점에는 존재하지 않는 정보다 — 누수다.
+    """
     y = pd.to_numeric(df[target], errors="coerce")
     out = []
     for f in features:
         x = pd.to_numeric(df[f], errors="coerce")
         best, best_c = 0, 0.0
         c0 = float(x.corr(y)) if x.std() > 0 else 0.0
-        for lag in range(-max_lag, max_lag + 1):
+        for lag in range(0, max_lag + 1):
             c = x.shift(lag).corr(y)
             if np.isfinite(c) and abs(c) > abs(best_c):
                 best, best_c = lag, float(c)
@@ -139,15 +157,21 @@ def find_lags(df: pd.DataFrame, target: str, features: list[str],
     return out
 
 
-def time_blocked_folds(n: int, k: int = 5) -> list[tuple[np.ndarray, np.ndarray]]:
-    """시간순 블록 교차검증. 각 블록을 한 번씩 검증에 쓰고 나머지로 학습한다."""
+def time_blocked_folds(n: int, k: int = 5, gap: int = 0) -> list[tuple[np.ndarray, np.ndarray]]:
+    """전진(forward-chaining) 교차검증: 블록 i 는 **그보다 앞선 블록만으로** 학습해 맞힌다.
+
+    예전에는 블록 i 를 뺀 나머지 전부(뒤의 블록 포함)로 학습했다. 무작위 k-fold 보다는
+    낫지만 여전히 미래로 과거를 맞히는 셈이라 성능이 부풀려진다 — 증설 뒤의 데이터로
+    학습하고 증설 전을 맞히면 '증설 효과'를 이미 본 것이다. ``gap`` 행만큼 학습 끝과
+    검증 시작을 띄운다 (지연 피처가 경계를 넘지 않게).
+    """
     idx = np.arange(n)
     bounds = np.linspace(0, n, k + 1).astype(int)
     folds = []
-    for i in range(k):
+    for i in range(1, k):
         te = idx[bounds[i]:bounds[i + 1]]
-        tr = np.concatenate([idx[:bounds[i]], idx[bounds[i + 1]:]])
-        if len(te) and len(tr):
+        tr = idx[:max(bounds[i] - gap, 0)]
+        if len(te) and len(tr) >= 20:
             folds.append((tr, te))
     return folds
 
@@ -207,6 +231,16 @@ def correlation_clusters(df: pd.DataFrame, features: list[str],
     return [sorted(v, key=features.index) for v in buckets.values()]
 
 
+def _forward_mean_rmse(y: np.ndarray, folds) -> float:
+    err = []
+    for tr, te in folds:
+        err.append(y[te] - float(np.mean(y[tr])))
+    if not err:
+        return float(np.std(y))
+    e = np.concatenate(err)
+    return float(np.sqrt(np.mean(e ** 2)))
+
+
 def partial_dependence(model, X: np.ndarray, j: int, grid: np.ndarray,
                        sample: int = 400, seed: int = 0) -> np.ndarray:
     """1차원 부분의존도. 다른 변수는 실제 분포에서 표본추출해 평균낸다."""
@@ -228,10 +262,12 @@ def fit_surrogate(df: pd.DataFrame, target: str, features: list[str], unit: str 
     lags = find_lags(df, target, features, max_lag) if apply_lags else []
     work = df[[target] + features].copy()
     used = list(features)
+    applied: dict[str, int] = {}
     if apply_lags:
         for li in lags:
-            if li.best_lag != 0 and abs(li.corr_at_lag) > abs(li.corr_at_zero) * 1.02:
+            if li.best_lag > 0 and abs(li.corr_at_lag) > abs(li.corr_at_zero) * 1.02:
                 work[li.feature] = work[li.feature].shift(li.best_lag)
+                applied[li.feature] = li.best_lag
     work = work.dropna()
     if len(work) < 50:
         raise ValueError(f"유효한 행이 {len(work)}개뿐입니다. 결측/지연 설정을 확인하세요.")
@@ -241,7 +277,7 @@ def fit_surrogate(df: pd.DataFrame, target: str, features: list[str], unit: str 
 
     preds = np.full(len(y), np.nan)
     fold_scores = []
-    for tr, te in time_blocked_folds(len(y), n_folds):
+    for tr, te in time_blocked_folds(len(y), n_folds, gap=max_lag):
         m, _ = _fit_model(X[tr], y[tr], seed)
         p = m.predict(X[te])
         preds[te] = p
@@ -256,10 +292,11 @@ def fit_surrogate(df: pd.DataFrame, target: str, features: list[str], unit: str 
         rmse_cv=rmse_cv, mae_cv=float(np.mean(np.abs(preds[ok] - y[ok]))),
         r2_cv=1.0 - float(np.sum((preds[ok] - y[ok]) ** 2)) / ss_tot if ss_tot > 0 else np.nan,
         rmse_train=float(np.sqrt(np.mean((model.predict(X) - y) ** 2))),
-        baseline_rmse=float(np.std(y)),
+        # 비교 기준도 같은 규칙: 검증 블록마다 '그 이전 학습 데이터의 평균'으로 예측한 오차
+        baseline_rmse=_forward_mean_rmse(y, time_blocked_folds(len(y), n_folds, gap=max_lag)),
         envelope=Envelope.fit(work, used),
         pred=pd.Series(preds, index=work.index, name=f"{target}_pred"),
-        fold_scores=fold_scores, model=model, lags=lags,
+        fold_scores=fold_scores, model=model, lags=lags, applied_lags=applied,
     )
 
     raw = permutation_importance(model, X, y, used, seed=seed)

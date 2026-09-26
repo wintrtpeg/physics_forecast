@@ -23,5 +23,6 @@ objective: minimize
 
 split:
   train_fraction: 0.6
+  embargo: 1D
 
 report: out/analysis.html
