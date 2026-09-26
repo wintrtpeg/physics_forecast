@@ -41,6 +41,9 @@ calibrate:
     - DCT_MAIN.K              # 메인 덕트 저항 (오염/퇴적으로 설계값과 달라진다)
     - SCR.K                   # 충전층 저항 (막힘 정도)
   max_rows: 120               # 층화 추출. 행 수보다 운전구간의 폭이 중요하다.
+  # 1시간 평균 행 중 드문 운전상태(입력공간 최원점) 30% + 시간 균등 70%.
+  # 예전 방식(5분 행 시간 간격)은 stride. 근거: docs/improvement_log.md
+  sampling: space_filling
   prior_weight: 0.05          # 설계값에서 과도하게 벗어나지 않게 하는 약한 정칙화
 
 baseline:

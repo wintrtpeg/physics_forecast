@@ -107,3 +107,30 @@ def test_calibration_uses_rows_with_partial_observations(nox):
     finally:
         nox.parameters[j].value = before
         nox.system.components["SRC_DRY"].set_param("ef_process", before)
+
+
+def test_simulation_recovers_after_a_pump_stop(nox):
+    """펌프 정지(액가스비 ≈ 0) 시점의 해에서 출발하면 펌프가 다시 돈 시점을 못 푼다.
+
+    예전에는 실패하면 출발점이 갱신되지 않아 그 뒤 몇 주가 연쇄적으로 빠졌다 (시드 5150,
+    검증 구간 65%). 이제는 기본 출발점에서 한 번 더 푼다.
+    """
+    from pforecast.calib.runner import simulate as sim
+    from pforecast.core.units import to_si
+    vals = {"SRC_DRY.ef_process": to_si(12.453, "mg/s"), "SRC_DRY.ef_idle": to_si(1.105, "mg/s"),
+            "SRC_CVD.ef_process": to_si(7.852, "mg/s"), "SCR.ntu_a": 27.637,
+            "DCT_MAIN.K": 28.168, "SCR.K": 70.93}
+    saved = {k: nox.parameters[nox.par_index(k)].value for k in vals}
+    try:
+        for k, v in vals.items():
+            nox.parameters[nox.par_index(k)].value = v
+        n = 3
+        inp = pd.DataFrame({"SRC_DRY.util": [0.8, 0.49, 0.49], "SRC_CVD.util": [0.78] * n,
+                            "SRC_WET.util": [0.8] * n, "SRC_IMP.util": [0.83] * n,
+                            "SRC_DRY.n_tools": [30.0] * n, "STK.T_amb": [303.0] * n,
+                            "FAN.n_ratio": [61 / 60] * n, "SCR.L": [42 / 3600, 0.0, 42 / 3600]})
+        res = sim(nox, build_param_rows(nox, inp), ["STK.C_dry"])
+        assert res.ok.all()
+    finally:
+        for k, v in saved.items():
+            nox.parameters[nox.par_index(k)].value = v

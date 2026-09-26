@@ -18,9 +18,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from ..core.solvers import solve_steady
 from ..core.units import from_si
-from .runner import build_param_rows, resolve_targets
+from .runner import build_param_rows, resolve_targets, solve_with_fallback
 
 
 @dataclass
@@ -152,8 +151,12 @@ def calibrate(
     spec: CalibrationSpec,
     expansion: dict[str, list[str]] | None = None,
     verbose: bool = True,
+    weights: pd.Series | None = None,
 ) -> CalibrationResult:
-    """경계가 있는 비선형 최소제곱으로 물리 파라미터를 추정한다."""
+    """경계가 있는 비선형 최소제곱으로 물리 파라미터를 추정한다.
+
+    ``weights`` (행 인덱스 -> 가중치, 평균 1 로 정규화) 를 주면 행마다 잔차에 sqrt(w) 를 곱한다.
+    """
     from scipy.optimize import least_squares
 
     model.build()
@@ -196,7 +199,7 @@ def calibrate(
     x = model.x0()
     keep = np.ones(len(base_rows), dtype=bool)
     for i, p in enumerate(base_rows):
-        r = solve_steady(model, p, x0=x)
+        r = solve_with_fallback(model, p, x)
         if r.success:
             x = r.x
         else:
@@ -209,6 +212,12 @@ def calibrate(
     meas = obs.to_numpy(dtype=float)
     has = np.isfinite(meas)
     n_rows = len(base_rows)
+    if weights is not None:
+        w = weights.reindex(df.index).fillna(0.0).to_numpy(dtype=float)
+        w = w / max(float(w.mean()), 1e-300)
+        row_scale = np.sqrt(np.clip(w, 0.0, None))[:, None]
+    else:
+        row_scale = None
     warm = {"x": model.x0()}
     n_eval = [0]
 
@@ -220,7 +229,7 @@ def calibrate(
         x = warm["x"].copy()
         good = 0
         for i, p in enumerate(rows):
-            r = solve_steady(model, p, x0=x)
+            r = solve_with_fallback(model, p, x)
             if not r.success:
                 continue
             x = r.x
@@ -238,6 +247,8 @@ def calibrate(
         # 측정이 비어 있는 칸은 0 — 정보가 없을 뿐 벌점 대상이 아니다.
         res = np.where(np.isfinite(res), res, 1e3)
         res = np.where(has, res, 0.0)
+        if row_scale is not None:
+            res = res * row_scale
         flat = res.ravel() / np.sqrt(n_rows)
         prior = spec.prior_weight * (y - theta0 / scale)
         return np.concatenate([flat, prior])

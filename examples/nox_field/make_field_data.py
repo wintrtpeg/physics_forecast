@@ -94,6 +94,17 @@ TRUE_CONST = {
     "FAN.c2": -71.0,              # 팬 마모 (설계 -68) <- 보정 대상 아님: 모델 오차
 }
 
+#: ``--step-test``: 툴의 개선 피드백("순환수·송풍기 방향은 검증된 적 없음 — 단계 시험을
+#: 하라")을 운전원이 따른 경우. 학습 끝 무렵 낮 12시간씩 값을 바꿔 둔다. (시작, 끝, 값)
+STEP_TEST: dict | None = None
+STEP_TEST_PLAN = {
+    "water_m3h": [("2025-05-22 08:00", "2025-05-22 20:00", 24.0),
+                  ("2025-05-23 08:00", "2025-05-23 20:00", 42.0),
+                  ("2025-05-24 08:00", "2025-05-24 20:00", 50.0)],
+    "fan_hz": [("2025-05-25 08:00", "2025-05-25 20:00", 61.5),
+               ("2025-05-26 08:00", "2025-05-26 20:00", 55.0)],
+}
+
 SPAN_GAS = 160.0          # 분석계 스팬 가스 (레인지 200 의 80%)
 DRIFT_PER_DAY = 0.12      # mg/Sm3/일, 월 1회 수동 교정으로 0 복귀
 CAL_SKIP = 0.10           # 자동 점검을 건너뛰는 날의 비율
@@ -192,6 +203,11 @@ def process_truth(idx: pd.DatetimeIndex, rng) -> tuple[pd.DataFrame, pd.DataFram
     for s, v in FAN_HZ:
         hz[np.asarray(idx >= _t(s))] = v
     water = np.where(idx >= _t(EV["water_increase"]), 42.0, 33.0)
+    if STEP_TEST:
+        for a, b, v in STEP_TEST["water_m3h"]:
+            water = np.where(_between(idx, a, b), v, water)
+        for a, b, v in STEP_TEST["fan_hz"]:
+            hz = np.where(_between(idx, a, b), v, hz)
     water = water + _ar1(n, 36, 0.25, rng)
     pump_off = _between(idx, *EV["pump_maint"]) | _between(idx, *EV["packing_clean"])
     water = np.where(pump_off, 0.0, water)
@@ -632,9 +648,14 @@ def main() -> None:
     ap.add_argument("--reuse", action="store_true", help="저장된 물리 시뮬레이션을 재사용")
     ap.add_argument("--holdout", action="store_true",
                     help="사건 날짜·교정 시각·결함 크기까지 시드로 흔든 시험용 변형")
+    ap.add_argument("--step-test", action="store_true",
+                    help="툴 권고대로 학습 끝 무렵 순환수·송풍기 단계 시험을 한 변형")
     args = ap.parse_args()
     if args.holdout:
         randomize(args.seed)
+    if args.step_test:
+        global STEP_TEST
+        STEP_TEST = STEP_TEST_PLAN
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -668,7 +689,8 @@ def main() -> None:
              "3/9 하루 누락, 끝 콤마와 빈 줄", **info)
     (ans / "anomalies.json").write_text(
         json.dumps({"events": sh.events, "EV": EV, "fan_hz": FAN_HZ, "var": VAR,
-                    "true_const": TRUE_CONST, "seed": args.seed, "holdout": args.holdout},
+                    "true_const": TRUE_CONST, "seed": args.seed, "holdout": args.holdout,
+                    "step_test": STEP_TEST},
                    ensure_ascii=False, indent=1),
         encoding="utf-8")
 

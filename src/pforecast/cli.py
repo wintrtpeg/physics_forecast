@@ -110,6 +110,28 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_improve(args) -> int:
+    from pathlib import Path
+
+    from .improve import run_improve
+    from .workflow import WorkflowConfig
+    cfg = WorkflowConfig.load(args.config)
+    if args.max_rows:
+        cfg.max_rows = args.max_rows
+    res = run_improve(cfg, n_folds=args.folds, fold_days=args.fold_days,
+                      drift=not args.no_drift)
+    print(f"\n완료 ({res.seconds:.0f}s)\n")
+    for line in res.lines():
+        print(line)
+    out = Path(args.out) if args.out else (Path(cfg.report_out).with_name("improve.md")
+                                          if cfg.report_out else None)
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(res.to_markdown(), encoding="utf-8")
+        print(f"\n저장: {out}")
+    return 0
+
+
 def cmd_select(args) -> int:
     import pickle
     from .report import selection_report
@@ -312,6 +334,15 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("-o", "--out", help="HTML 리포트 경로")
     c.add_argument("--max-rows", type=int, help="보정에 쓸 최대 행 수")
     c.set_defaults(func=cmd_calibrate)
+
+    c = sub.add_parser("improve", help="개선 피드백: 학습 구간 안에서 보정 설계 비교 + 다음에 고칠 것")
+    c.add_argument("config")
+    c.add_argument("-o", "--out", help="결과 마크다운 경로")
+    c.add_argument("--max-rows", type=int, help="보정에 쓸 최대 행 수")
+    c.add_argument("--folds", type=int, default=2, help="내부 전진 폴드 수 (기본 2)")
+    c.add_argument("--fold-days", type=float, default=30.0, help="폴드 하나의 검증 일수")
+    c.add_argument("--no-drift", action="store_true", help="파라미터 시변성 계산 생략")
+    c.set_defaults(func=cmd_improve)
 
     c = sub.add_parser("run", help="what-if 시나리오 실행")
     c.add_argument("scenario")

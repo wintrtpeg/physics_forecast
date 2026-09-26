@@ -1,4 +1,4 @@
-generated: '2026-09-26T06:04:09'
+generated: '2026-09-26T11:10:55'
 model: nox_stack
 meta:
   config: SCR-01 NOx 모델 보정
@@ -6,26 +6,26 @@ meta:
   train_query: index < '2025-03-20'
 parameters:
   SRC_DRY.ef_process:
-    value: 4.7354373375
+    value: 7.5816870043
     unit: mg/s
     desc: 대당 가동 시 추가 NOx 발생량
   SRC_DRY.ef_idle:
-    value: 1.3025997621
+    value: 0.9189660884
     unit: mg/s
     desc: 대당 대기 시 NOx 발생량
   SRC_CVD.ef_process:
-    value: 8.1058132171
+    value: 4.7639570383
     unit: mg/s
     desc: 대당 가동 시 추가 NOx 발생량
   SCR.ntu_a:
-    value: 7.4390591108
+    value: 6.9192579308
     unit: '1'
     desc: NTU 계수
   DCT_MAIN.K:
-    value: 23.5661108669
+    value: 23.5242922009
     unit: 1/m4
     desc: 덕트 저항계수 f*L/(2*D*A^2)
   SCR.K:
-    value: 71.1579446029
+    value: 70.9446072007
     unit: 1/m4
     desc: 충전층 저항계수

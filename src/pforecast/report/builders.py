@@ -132,6 +132,12 @@ def calibration_report(cfg, res, out_path: str | Path) -> Path:
     if chk is not None:
         for w in chk.warnings():
             rep.note(Report._emphasis(w), kind="bad")
+    nf = getattr(res, "physics_failed", 0)
+    if nf:
+        rep.note(Report._emphasis(
+            f"**물리모델이 검증 {len(res.test):,}행 중 {nf:,}행({nf / max(len(res.test), 1) * 100:.1f}%)에서 "
+            "수렴하지 못했습니다.** 아래 비교표는 푼 행만으로 계산되므로 실제보다 좋아 보일 수 "
+            "있습니다. 그 구간의 입력(펌프 정지, 경계 밖 값)을 확인하세요."), kind="bad")
 
     dr = getattr(res, "data_report", None)
     if dr is not None:

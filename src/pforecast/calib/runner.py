@@ -48,6 +48,22 @@ def build_param_rows(model, inputs: pd.DataFrame, base_p: np.ndarray | None = No
     return rows
 
 
+def solve_with_fallback(model, p: np.ndarray, x_warm: np.ndarray):
+    """이전 시점의 해에서 풀고, 안 되면 모델 기본 출발점에서 한 번 더 푼다.
+
+    따뜻한 출발점이 독이 될 때가 있다. 순환펌프가 선 시점(액가스비 ≈ 0, 제거효율 0)의
+    해에서 펌프가 다시 돈 시점을 풀면 뉴턴법이 발산한다. 실패하면 출발점이 갱신되지 않으므로
+    그 뒤 모든 시점이 같은 나쁜 출발점에서 시작해 **연쇄적으로** 실패한다 — 현장형 데이터
+    한 벌(시드 5150)에서 검증 구간의 65% 가 이렇게 빠졌고, 빠진 행은 채점에서도 조용히
+    제외되어 성능이 좋아 보였다. 같은 행을 기본 출발점에서 풀면 바로 수렴한다.
+    """
+    r = solve_steady(model, p, x0=x_warm)
+    if r.success:
+        return r
+    r2 = solve_steady(model, p, x0=model.x0())
+    return r2 if r2.success else r
+
+
 def resolve_targets(model, names: list[str]) -> tuple[list[tuple[str, int]], list[str]]:
     """관측 대상 이름을 (미지수 인덱스) 또는 (출력식 이름) 으로 해석한다."""
     var_targets: list[tuple[str, int]] = []
@@ -89,7 +105,7 @@ def simulate(model, p_rows: np.ndarray, targets: list[str], x0: np.ndarray | Non
     x = model.x0() if x0 is None else np.asarray(x0, dtype=float)
     total = 0
     for i, p in enumerate(p_rows):
-        r = solve_steady(model, p, x0=x)
+        r = solve_with_fallback(model, p, x)
         total += r.n_newton
         if r.success:
             x = r.x

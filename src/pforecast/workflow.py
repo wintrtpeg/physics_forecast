@@ -15,6 +15,7 @@ import pandas as pd
 import yaml
 
 from .calib import CalibrationSpec, PolyRidgeBaseline, build_param_rows, calibrate, simulate
+from .calib.design import select_rows
 from .calib.diagnostics import residual_changepoints
 from .calib.estimator import _metrics
 from .core.units import from_si
@@ -45,6 +46,8 @@ class WorkflowConfig:
     clean: bool = True                 # 값 이상(교정 창·고착·스파이크)을 결측으로
     loss: str = "linear"               # 보정 손실: linear | soft_l1 | huber
     f_scale: float = 3.0
+    #: 보정 행 선택: space_filling (1시간 평균 + 드문 운전상태 포함) | stride (시간 균등)
+    sampling: str = "space_filling"
     diagnose: bool = True              # 잔차 변화점 진단
 
     @classmethod
@@ -85,6 +88,7 @@ class WorkflowConfig:
             clean=bool(data.get("clean", True)),
             loss=str(cal.get("loss", "linear")),
             f_scale=float(cal.get("f_scale", 3.0)),
+            sampling=str(cal.get("sampling", "space_filling")),
             diagnose=bool(d.get("diagnose", True)),
         )
 
@@ -110,6 +114,8 @@ class WorkflowResult:
     split: object = None                       # SplitCheck — 미래인가, 외삽인가
     #: 추가 ML 기준모델 {이름: (학습 예측, 검증 예측)} — 같은 입력·같은 학습 구간
     extra_baselines: dict = field(default_factory=dict)
+    #: 물리모델이 수렴하지 못한 검증 행 수 (비교표에서 빠지므로 반드시 따로 보고한다)
+    physics_failed: int = 0
 
 
 def _split_masks(cfg: WorkflowConfig, frame: pd.DataFrame) -> dict[str, np.ndarray]:
@@ -174,7 +180,9 @@ def run_workflow(cfg: WorkflowConfig, verbose: bool = True) -> WorkflowResult:
                                f_scale=cfg.f_scale)
         if verbose:
             print(f"보정 중: {len(cfg.params)}개 파라미터, 최대 {cfg.max_rows}행 ...")
-        res.calibration = calibrate(model, train[inputs_cols], train[obs_cols], spec,
+        rows = select_rows(train, cfg.max_rows, inputs_cols, obs_cols, method=cfg.sampling)
+        spec.max_rows = max(len(rows), 1)
+        res.calibration = calibrate(model, rows[inputs_cols], rows[obs_cols], spec,
                                     expansion=expansion, verbose=False)
         if cfg.params_out:
             save_params(model, cfg.params_out, cfg.params,
@@ -187,6 +195,10 @@ def run_workflow(cfg: WorkflowConfig, verbose: bool = True) -> WorkflowResult:
                                  res.clipped).values
     res.physics_test = _predict(model, test, inputs_cols, obs_cols, expansion,
                                 res.clipped).values
+    res.physics_failed = int(res.physics_test.isna().all(axis=1).sum())
+    if verbose and res.physics_failed:
+        print(f"  !! 물리모델이 검증 {len(test)}행 중 {res.physics_failed}행에서 수렴하지 못했습니다 "
+              f"({res.physics_failed / max(len(test), 1) * 100:.1f}%). 비교표는 푼 행만으로 계산됩니다.")
 
     # 잔차에 남은 계단 = 모델이 모르는 변화 (센서 교체, 레시피, 오염/세정 ...)
     if cfg.diagnose:

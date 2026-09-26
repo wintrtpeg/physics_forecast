@@ -123,18 +123,23 @@ def score_workflow(cfg: WorkflowConfig, truth: pd.DataFrame, label: str) -> tupl
         models.append((name, conv(p_te)))
     # 채점은 학습 운전영역 밖(외삽) 행만. 이 설계에서는 검증 행 전부가 해당된다.
     out = res.split.outside if res.split.outside is not None else np.ones(len(te), bool)
+    # 초과 시간(분모)은 참값으로만 정한다 — 모델마다 다르면 안 된다. 예측을 못 낸 시간(수렴
+    # 실패)은 조용히 빼지 않고 '놓침'으로 센다. 예전에는 빠진 행이 채점에서 제외되어 수렴에
+    # 실패한 모델이 더 좋아 보였다.
+    hr_t = pd.Series(np.where(out, true_c, np.nan), index=te).resample("1h").mean().dropna()
+    exceed = hr_t > LIMIT
     rows = {}
     for name, pred in models:
         pred = np.where(out, pred, np.nan)
-        # 초과 판정은 1시간 평균 기준 (5분 값은 잡음이 크다)
-        hr = pd.DataFrame({"p": pred, "t": true_c}, index=te).resample("1h").mean().dropna()
-        exceed = hr["t"] > LIMIT
+        hr_p = pd.Series(pred, index=te).resample("1h").mean().reindex(hr_t.index)
+        over = (hr_p > LIMIT).fillna(False)
         rows[name] = {
             "rmse_vs_true": _rmse(pred, true_c), "bias_vs_true": _bias(pred, true_c),
             "rmse_vs_measured": _rmse(pred, meas),
+            "predicted_frac": float(np.isfinite(pred[out]).mean()) if out.any() else float("nan"),
             "exceed_hours_true": int(exceed.sum()),
-            "exceed_hit": int((exceed & (hr["p"] > LIMIT)).sum()),
-            "false_alarm_hours": int((~exceed & (hr["p"] > LIMIT)).sum()),
+            "exceed_hit": int((exceed & over).sum()),
+            "false_alarm_hours": int((~exceed & over).sum()),
         }
     cal = res.calibration
     params = {}
@@ -144,6 +149,24 @@ def score_workflow(cfg: WorkflowConfig, truth: pd.DataFrame, label: str) -> tupl
                          "unit": u}
     cps = [c.to_dict() for c in res.changepoints]
     train_true = truth.loc[res.train.index, "true:STK.C_dry"].to_numpy()
+    band = None
+    if cal is not None and getattr(cfg, "_band", False):
+        # 학습 기간 토막별 설비 상태로 예측 구간을 각각 풀어 본 폭이 참값 평균을 덮는가
+        from pforecast.calib import CalibrationSpec
+        from pforecast.calib.design import parameter_drift, state_band
+        spec = CalibrationSpec(params=cal.names, observations=res.obs_cols,
+                               sigmas=res.tagmap.sigmas(), prior_weight=cfg.prior_weight)
+        drift = parameter_drift(res.model, res.train, res.inputs_cols, res.obs_cols, spec,
+                                res.tagmap.expansion())
+        te_in = res.test[res.inputs_cols].dropna()
+        te_in = te_in.iloc[:: max(1, len(te_in) // 150)]
+        vals = [v for _, v in state_band(res.model, drift, te_in, TARGET, "mg/Nm3",
+                                         res.tagmap.expansion())]
+        tmean = float(truth.loc[te_in.index, "true:STK.C_dry"].mean())
+        pmean = float(np.nanmean(conv(res.physics_test.loc[te_in.index, TARGET])))
+        band = {"lo": min(vals), "hi": max(vals), "true_mean": tmean, "point_mean": pmean,
+                "covered": bool(min(vals) <= tmean <= max(vals)), "values": vals,
+                "drift": {d.name: d.trend for d in drift}}
     return {
         "label": label, "seconds": secs, "n_train": len(res.train), "n_test": len(te),
         "noise_floor_rmse": _rmse(meas, true_c),
@@ -154,6 +177,7 @@ def score_workflow(cfg: WorkflowConfig, truth: pd.DataFrame, label: str) -> tupl
         "clipped": dict(res.clipped), "changepoints": cps,
         "test_true_range": [float(np.nanmin(true_c)), float(np.nanmax(true_c))],
         "split": res.split.to_dict(),
+        "band": band,
     }, res
 
 
@@ -166,21 +190,22 @@ def score_changepoints(cps: list[dict], anomalies: dict, tol_days: int = 2) -> d
         ("충전재 세정 (차압·효율 복원)", ev["packing_clean"][1],
          {"SCR.dp_mmAq", "STK.C_dry", "STK.Q_n", "FAN.dp_mmAq"}, True),
         ("NOx 분석계 교체 (오프셋)", ev["analyzer_swap"], {"STK.C_dry"}, True),
-        ("순환수 증량 (모델 NTU 지수 0.55 vs 실제 0.62)", ev["water_increase"], {"STK.C_dry"}, False),
-        ("증설 (팬 곡선 마모가 드러남)", ev["expansion"], None, False),
+        ("순환수 증량", ev["water_increase"], {"STK.C_dry"}, False),
+        ("증설 (DRY 24→30대)", ev["expansion"], None, False),
     ]
     truth += [("분석계 월간 교정 (드리프트 복귀)", f"2025-{m:02d}-01 10:00", {"STK.C_dry"}, False)
               for m in range(2, 9)]
     for when, hz in anomalies.get("fan_hz", [])[1:]:
-        truth.append((f"송풍기 설정 {hz:g} Hz (팬 곡선 마모)", when, None, False))
+        truth.append((f"송풍기 설정 {hz:g} Hz", when, None, False))
 
     def match(c):
+        # 날짜가 맞는 정답을 **전부** 적는다. 첫 번째만 적으면 겹친 사건(순환수 증량과 같은 날의
+        # 월간 교정)을 한쪽으로 단정하게 된다 — 실제로 그렇게 잘못 해석한 적이 있다.
         d = pd.Timestamp(c["date"])
-        for desc, when, obs, _ in truth:
-            if abs((d - pd.Timestamp(when).normalize()).days) <= tol_days and \
-                    (obs is None or c["observation"] in obs):
-                return desc
-        return None
+        hits = [desc for desc, when, obs, _ in truth
+                if abs((d - pd.Timestamp(when).normalize()).days) <= tol_days
+                and (obs is None or c["observation"] in obs)]
+        return " / ".join(dict.fromkeys(hits)) or None
 
     detected = [{**{k: c[k] for k in ("date", "observation", "shift", "kind")},
                  "truth": match(c)} for c in cps]
@@ -205,6 +230,10 @@ def write_markdown(sc: dict, path: Path) -> None:
     L = ["# 현장형 더미 데이터 채점표", "",
          f"데이터: {kind}, 시드 {ds.get('seed')}", "",
          f"생성: {sc['generated']} · 소요 {sc['total_seconds']/60:.1f}분", ""]
+    dz = sc.get("design") or {}
+    if dz:
+        L += [f"보정 설계: 행 선택 `{dz.get('sampling')}`, 파라미터 {len(dz.get('params', []))}개 "
+              f"({', '.join(dz.get('params', []))})", ""]
     ing = sc["ingest"]
     L += ["## 1. 파일 읽기", "",
           f"* 인코딩 {ing['encoding']}, 헤더 {ing['header_rows']}행, 단위 행 {ing['unit_row_parsed']}개 해석",
@@ -245,13 +274,19 @@ def write_markdown(sc: dict, path: Path) -> None:
               f"* 외삽인가: 검증 행의 **{sp['extrapolation'] * 100:.0f}%** 가 학습 운전영역 밖 "
               "(채점은 그 행들만)",
               f"* 계측 잡음 하한(측정 vs 참값 RMSE) {wf['noise_floor_rmse']:.2f} mg/Sm³", "",
-              "| 모델 | 참값 대비 RMSE | 편향 | 측정값 대비 RMSE | 초과 시간 적중 | 오경보 |",
-              "|---|---:|---:|---:|---:|---:|"]
+              "| 모델 | 참값 대비 RMSE | 편향 | 측정값 대비 RMSE | 예측한 행 | 초과 시간 적중 | 오경보 |",
+              "|---|---:|---:|---:|---:|---:|---:|"]
         for name, m in wf["models"].items():
             L.append(f"| {name} | {m['rmse_vs_true']:.2f} | {m['bias_vs_true']:+.2f} | "
-                     f"{m['rmse_vs_measured']:.2f} | {m['exceed_hit']}/{m['exceed_hours_true']} | "
-                     f"{m['false_alarm_hours']} |")
+                     f"{m['rmse_vs_measured']:.2f} | {m.get('predicted_frac', float('nan')) * 100:.1f}% | "
+                     f"{m['exceed_hit']}/{m['exceed_hours_true']} | {m['false_alarm_hours']} |")
         L += ["", f"보정에서 뺀 행 {wf['excluded_rows']}개, 범위 밖이라 자른 입력 {wf['clipped'] or '없음'}.", ""]
+        b = wf.get("band")
+        if b:
+            L += [f"상태 변동 폭 (학습 기간 토막별 설비 상태로 검증 구간을 각각 풀어 본 평균): "
+                  f"{b['lo']:.2f}~{b['hi']:.2f} mg/Sm³, 참값 평균 {b['true_mean']:.2f} → "
+                  f"{'**덮음**' if b['covered'] else '**벗어남**'} (점 예측 평균 {b['point_mean']:.2f})",
+                  "파라미터 시변성: " + ", ".join(f"{k} {v}" for k, v in b["drift"].items()), ""]
         cs = wf.get("changepoint_score")
         if cs:
             L += ["잔차 변화점 — 숨긴 사건:", "", "| 사건 | 날짜 | 잡힘 | 움직인 관측 | 해석 유형 |",
@@ -274,6 +309,12 @@ def main() -> None:
     ap.add_argument("--data", default=str(DATA),
                     help="채점할 데이터 폴더 (field_raw.csv + _answer/). 시험용 변형은 data/holdout")
     ap.add_argument("--name", default="scorecard", help="결과 파일 이름")
+    ap.add_argument("--sampling", choices=["space_filling", "stride"],
+                    help="보정 행 선택 방식 (설정 파일을 덮어씀). stride 는 예전 방식")
+    ap.add_argument("--band", action="store_true",
+                    help="상태 변동 폭(학습 기간 토막별 상태로 푼 예측 폭)이 참값을 덮는지도 잰다")
+    ap.add_argument("--extra-params", default="",
+                    help="보정 대상에 더할 파라미터 (쉼표 구분). 예: SCR.ntu_b,FAN.c2")
     args = ap.parse_args()
     data = Path(args.data)
     if not (data / "field_raw.csv").exists():
@@ -301,6 +342,11 @@ def main() -> None:
     cfg.csv = str(data / "field_raw.csv")
     cfg.report_out = None
     cfg.params_out = None
+    if args.sampling:
+        cfg.sampling = args.sampling
+    cfg.params = list(cfg.params) + [p for p in args.extra_params.split(",") if p]
+    sc["design"] = {"sampling": cfg.sampling, "params": list(cfg.params)}
+    cfg._band = args.band
     wf, _ = score_workflow(cfg, truth, "정제 적용")
     wf["changepoint_score"] = score_changepoints(wf["changepoints"], anomalies)
     sc["workflows"].append(wf)
@@ -312,6 +358,7 @@ def main() -> None:
         cfg2.report_out = cfg2.params_out = None
         cfg2.clean = False
         cfg2.diagnose = False
+        cfg2.sampling, cfg2.params = cfg.sampling, list(cfg.params)
         wf2, _ = score_workflow(cfg2, truth, "값 정제 없음")
         sc["workflows"].append(wf2)
 

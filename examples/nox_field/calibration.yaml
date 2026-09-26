@@ -28,6 +28,9 @@ calibrate:
     - DCT_MAIN.K
     - SCR.K
   max_rows: 150
+  # 1시간 평균 행 중 드문 운전상태(입력공간 최원점) 30% + 시간 균등 70%.
+  # 예전 방식(5분 행 시간 간격)은 stride. 근거: docs/improvement_log.md
+  sampling: space_filling
   prior_weight: 0.05
 
 baseline:
