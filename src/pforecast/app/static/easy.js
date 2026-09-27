@@ -11,6 +11,7 @@ const EZ = {
   check: null, checkSeq: 0,
   mode: 'physics', model: null, catalog: null, fmap: {}, tmap: null, extra: {},
   params: [], band: false, limit: '',
+  closures: {}, advice: null, adviceKey: null, adviceRun: null,
   job: null, result: null, hidden: {},
 };
 
@@ -96,7 +97,7 @@ async function ezSelectCsv(path) {
     Object.assign(EZ, { profile: prof, presets: pre.presets || [], preset: (pre.presets || [])[0] || null,
       target: null, features: [], units: {}, train: [null, null], test: [null, null], check: null,
       timeline: null, fmap: {}, tmap: null, extra: {}, params: [], model: null, catalog: null,
-      result: null, spark: {}, limit: '', hidden: {}, filter: '' });
+      result: null, spark: {}, limit: '', hidden: {}, filter: '', closures: {}, advice: null, adviceKey: null });
     prof.columns.forEach(c => (EZ.units[c.name] = c.unit || ''));
     // 같은 태그를 쓰는 설정이 있으면 타깃·입력·단위를 미리 채운다
     const p = EZ.preset;
@@ -349,6 +350,11 @@ function ezBody(extra) {
         .filter(([col, m]) => col !== EZ.target && !EZ.features.includes(col) && m.targets && m.targets.length)
         .map(([col, m]) => ({ column: col, targets: m.targets, unit: m.unit || EZ.units[col] || '1', sigma: m.sigma })),
       params: EZ.params, band: EZ.band,
+      // 기본값과 다른 선택만 보낸다 (기본값은 모델 그대로)
+      closures: Object.fromEntries(Object.entries(EZ.closures).filter(([k, v]) => {
+        const sl = ((EZ.catalog && EZ.catalog.closures) || []).find(c => c.key === k);
+        return v && (!sl || v !== sl.default);
+      })),
     });
   }
   if (EZ.limit !== '' && isFinite(+EZ.limit)) b.limit = +EZ.limit;
@@ -548,7 +554,8 @@ async function ezRenderPhysics(pane) {
   const models = EZ.modelsList || [];
   const sel = h('select', { onchange: async e => {
     // 다른 계통의 변수 이름이 따라붙지 않게 연결을 전부 비운다
-    Object.assign(EZ, { model: e.target.value, catalog: null, params: [], fmap: {}, tmap: null, extra: {} });
+    Object.assign(EZ, { model: e.target.value, catalog: null, params: [], fmap: {}, tmap: null, extra: {},
+                        closures: {}, advice: null, adviceKey: null });
     await ezRenderPhysics(pane);
   } },
     h('option', { value: '' }, '— 모델을 고르세요 —'),
@@ -634,7 +641,136 @@ async function ezRenderPhysics(pane) {
       h('span', { class: 'sub' }, cat.declared_params.length ? ' 모델이 권하는 것을 골라 두었습니다' : ' 타깃에 민감한 것을 골라 두었습니다')),
     h('div', { class: 'note', style: 'margin-top:10px' }, '많이 고를수록 좋은 게 아닙니다. 데이터로 서로 구분되지 않는 파라미터를 같이 풀면 값이 흔들립니다 — 결과 화면의 식별성 경고를 보세요.'),
     h('div', { class: 'prms' }, prow)));
+  if ((cat.closures || []).length) pane.append(ezClosureCard());
   ezCheckMapping();
+}
+
+// ── 구성방정식 후보: 코드가 추리고 근거를 붙이면, 고르는 건 사용자 ─────────────
+const ST_CLS = { '추천': 'good', '근소하게 나음': 'good', '불안정': 'warn', '현재 식': '', '비슷함': '', '나쁨': 'bad', '제외': 'bad', '구별 불가': 'warn', '비교 안 함': '' };
+
+function ezAdviceKey() {
+  const b = ezBody(true);
+  return JSON.stringify([b.csv, b.target, b.features, b.train, b.test, b.embargo_days, b.model, b.feature_map,
+                         b.target_map, b.extra_obs, b.params]);
+}
+
+function ezClosureCard() {
+  const card = h('div', { class: 'card', id: 'ez-closures' });
+  ezDrawClosures(card);
+  return card;
+}
+
+function ezDrawClosures(card) {
+  card = card || $('#ez-closures'); if (!card) return;
+  card.innerHTML = '';
+  const cat = EZ.catalog.closures || [];
+  const adv = EZ.advice;
+  const stale = adv && EZ.adviceKey !== ezAdviceKey();
+  const bySlot = {}; (adv ? adv.slots : []).forEach(s => (bySlot[s.key] = s));
+  const run = EZ.adviceRun;
+  card.append(h('div', { class: 'card-head' }, h('h3', {}, '구성방정식 — 후보에서 고르기'),
+    h('span', { class: 'sub' }, '보존법칙은 고정하고, 장비 특성을 나타내는 식만 후보로 바꿔 봅니다')));
+  card.append(h('div', { class: 'actions', style: 'margin:0 0 10px' },
+    h('button', { class: 'btn', id: 'ez-advise', disabled: !!run, onclick: ezAdvise },
+      adv ? '다시 비교하기' : '데이터로 후보 비교하기'),
+    h('span', { class: 'sub', style: 'margin:0' },
+      '학습 기간만 씁니다 (앞부분으로 보정 → 1일 간격 → 끝부분으로 채점). 예측 기간은 보지 않습니다. 후보 수만큼 보정하므로 수 분 걸립니다.')));
+  if (run) card.append(h('div', { class: 'card inset' }, h('div', { class: 'card-head' }, h('h3', {}, '후보 비교 중'),
+    h('span', { class: 'sub' }, `${Math.round((Date.now() - run.t0) / 1000)}초`)), h('div', { class: 'progress' }, h('i')),
+    h('div', { class: 'sub', style: 'margin:8px 0 0' }, run.msg)));
+  if (EZ.adviceError) card.append(h('div', { class: 'note bad' }, h('b', {}, '비교하지 못했습니다. '), EZ.adviceError));
+  if (adv) {
+    const sp = adv.split;
+    card.append(h('div', { class: 'note' + (stale ? ' warn' : '') },
+      stale ? h('b', {}, '기간·연결이 바뀌었습니다 — 결과가 오래되었습니다. 다시 비교하세요. ') : null,
+      `보정 ${sp.inner[0].slice(0, 10)} ~ ${sp.inner[1].slice(0, 10)} (${sp.n_rows}행) · 간격 ${sp.embargo_days}일 · `,
+      `검증 ${sp.validate[0].slice(0, 10)} ~ ${sp.validate[1].slice(0, 10)} (${sp.n_validate_hours}시간, 외삽 행 ${fmt(sp.validate_outside_pct, 0)}%) · `,
+      `보정 ${adv.n_calibrations}회 · ${fmt(adv.seconds / 60, 1)}분`));
+    (adv.notes || []).forEach(n => card.append(h('div', { class: 'note warn' }, n)));
+  }
+  // 슬롯: 비교 결과가 있으면 영향 큰 순, '영향 작음'은 접어 둔다
+  const order = adv ? adv.slots.map(s => s.key) : cat.map(c => c.key);
+  const rows = order.map(k => cat.find(c => c.key === k)).filter(Boolean);
+  const main = rows.filter(c => !bySlot[c.key] || bySlot[c.key].status !== '영향 작음');
+  const minor = rows.filter(c => bySlot[c.key] && bySlot[c.key].status === '영향 작음');
+  main.forEach(c => card.append(ezSlotView(c, bySlot[c.key])));
+  if (minor.length) card.append(h('details', { class: 'fold', style: 'margin-top:10px' },
+    h('summary', {}, h('b', {}, `예측값에 영향이 작아 비교하지 않은 식 ${minor.length}개`),
+      h('span', { class: 'sub' }, ' 파라미터를 10% 바꿔도 예측값이 1% 미만으로 변합니다. 직접 바꿀 수는 있습니다.')),
+    minor.map(c => ezSlotView(c, bySlot[c.key]))));
+}
+
+function ezSlotView(c, a) {
+  const cur = EZ.closures[c.key] || c.current;
+  const chips = [];
+  if (a) {
+    chips.push(h('span', { class: 'chip static' }, `예측값 영향 ${fmt(a.relevance_pct, 1)}%`));
+    a.excitation.forEach(e => chips.push(h('span', { class: 'chip static' + (e.ok ? '' : ' warnchip') },
+      `${e.var} 변화 폭 ${fmt(e.span_pct, 0)}%`)));
+    a.residual_corr.filter(r => Math.abs(r.r) >= 0.2).forEach(r => chips.push(h('span', { class: 'chip static' },
+      `현재 식 잔차 ↔ ${r.var} 상관 ${r.r >= 0 ? '+' : ''}${fmt(r.r, 2)}`)));
+  }
+  const cands = c.candidates.map(o => {
+    const e = a ? a.candidates.find(x => x.id === o.id) : null;
+    const st = e && e.status;
+    const ev = [];
+    if (e && e.evaluated && e.val_rmse !== undefined) {
+      ev.push(`검증 RMSE ${fmt(e.val_rmse)} (${EZ.advice.split.scored_on})`
+        + (e.val_halves ? ` · 앞/뒤 절반 ${fmt(e.val_halves[0])}/${fmt(e.val_halves[1])}` : ''));
+      const v = e.vs_current || e.vs_recommended;
+      if (v) ev.push(`${e.vs_current ? '현재 식' : '추천'} 대비 ${v.diff >= 0 ? '+' : ''}${fmt(v.diff)} ± ${fmt(v.se)} → ${v.verdict}`);
+      const own = e.id === a.current ? e.fit : (e.new_params || []);
+      if (own.length && e.ident) ev.push(`${e.id === a.current ? '보정 파라미터' : '새 파라미터 ' + own.map(p => p.split('.').pop()).join(', ')} `
+        + `상대표준오차 ${fmt(e.ident.max_rel_se_pct, 0)}% · 최악 상관 ${fmt(e.ident.worst_corr, 2)}`);
+    }
+    return h('label', { class: 'cand' + (cur === o.id ? ' on' : '') },
+      h('input', { type: 'radio', name: 'cl-' + c.key, checked: cur === o.id,
+        onchange: () => { EZ.closures[c.key] = o.id; ezDrawClosures(); } }),
+      h('div', { class: 'cbody' },
+        h('div', { class: 'ct' }, h('b', {}, o.title), h('span', { class: 'badge' }, o.role_label),
+          st ? h('span', { class: 'badge ' + (ST_CLS[st] || '') }, st) : null,
+          o.id === c.default ? h('span', { class: 'sub', style: 'margin:0' }, '기본값') : null),
+        h('div', { class: 'fm', html: fmla(o.formula, new Set((e ? e.fit : o.fit).map(p => p.split('.').pop()))) }),
+        ev.length ? h('div', { class: 'cev' }, ev.join(' · ')) : null,
+        e && e.reasons.length ? h('ul', { class: 'log' }, e.reasons.map(r => h('li', {}, r))) : null,
+        h('div', { class: 'cnote' }, o.note)));
+  });
+  return h('div', { class: 'slot' },
+    h('div', { class: 'shead' }, h('b', {}, `${c.component} — ${c.title}`), h('span', { class: 'mono sub' }, c.key),
+      a && a.recommended ? h('span', { class: 'badge good', style: 'margin-left:auto' },
+        `추천: ${(c.candidates.find(o => o.id === a.recommended) || {}).title || a.recommended}`) : null),
+    chips.length ? h('div', { class: 'xchips' }, chips) : null,
+    a && a.message ? h('div', { class: 'smsg' }, a.message) : null,
+    h('div', { class: 'cands' }, cands));
+}
+
+async function ezAdvise() {
+  if (EZ.adviceRun) return;
+  EZ.adviceError = null;
+  EZ.adviceRun = { t0: Date.now(), msg: '시작하는 중…' };
+  ezDrawClosures();
+  const tick = setInterval(() => ezDrawClosures(), 1000);
+  const key = ezAdviceKey();
+  try {
+    const { job } = await api('/api/easy/closures', ezBody(true));
+    for (;;) {
+      await new Promise(r => setTimeout(r, 1500));
+      const j = await api('/api/job?id=' + job.id);
+      EZ.adviceRun.msg = j.message || j.status;
+      if (j.status === 'running') continue;
+      if (j.status === 'error') throw new Error(j.error);
+      EZ.advice = j.result; EZ.adviceKey = key; break;
+    }
+    // 추천을 골라 둔다 — 바꾸는 것은 사용자
+    EZ.advice.slots.forEach(sl => { EZ.closures[sl.key] = sl.recommended; });
+    const changed = EZ.advice.slots.filter(sl => sl.recommended !== sl.default);
+    toast(changed.length ? `추천대로 ${changed.length}개 식을 바꿔 두었습니다 — 직접 바꿀 수 있습니다`
+                         : '모든 슬롯에서 현재 식 유지가 추천됐습니다');
+  } catch (e) {
+    EZ.adviceError = e.message;
+  } finally {
+    clearInterval(tick); EZ.adviceRun = null; ezDrawClosures();
+  }
 }
 
 function ezPresetTarget() {

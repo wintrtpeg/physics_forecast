@@ -29,6 +29,7 @@ import pandas as pd
 from .core.units import from_si
 from .data.split import check_split
 from .data.tagmap import TagEntry, TagMap
+from .scenario import load_model
 
 #: 예측 결과 차트에 보내는 최대 점 수 (브라우저가 가볍게 그리는 선)
 MAX_POINTS = 2400
@@ -78,6 +79,8 @@ class EasyConfig:
     band: bool = False                            # 상태 변동 폭 (느림)
     limit: float | None = None                    # y 관리기준 (초과 시간 채점)
     name: str = "easy"
+    #: 구성방정식 선택 {"SCR.eta": "langmuir"} — 사용자가 후보 비교를 보고 고른 것
+    closures: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +461,103 @@ def _predict_nan(fn, X):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 구성방정식 후보 (사용자가 고른다 — 코드는 후보를 추리고 근거를 붙일 뿐)
+# ---------------------------------------------------------------------------
+
+def apply_closure_choices(system, choices: dict[str, str] | None) -> list[str]:
+    """선택을 시스템에 적용하고 '슬롯 = 후보 이름' 목록을 돌려준다 (기본값과 같은 것은 뺀다)."""
+    from .lib.closures import apply_closures, closure_slots
+
+    choices = dict(choices or {})
+    apply_closures(system, choices)
+    out = []
+    for inst, sl in closure_slots(system):
+        cid = choices.get(f"{inst}.{sl.key}")
+        if cid and cid != sl.default:
+            out.append(f"{inst}.{sl.key} = {sl.option(cid).title}")
+    return out
+
+
+def closure_params(system, params: list[str], choices: dict[str, str] | None) -> list[str]:
+    """고른 후보에 맞게 보정 파라미터를 고친다: 빠진 후보의 파라미터는 빼고 새 후보의 것을 더한다."""
+    out = list(params)
+    for full, cid in (choices or {}).items():
+        inst, key = full.split(".", 1)
+        comp = system.components.get(inst)
+        if comp is None or not hasattr(comp, "slot"):
+            continue
+        sl = comp.slot(key)
+        if cid == sl.default:
+            continue                  # 기본 후보를 고른 것은 보정 목록을 바꾸지 않는다
+        opt = sl.option(cid)
+        slot_ps = {f"{inst}.{p}" for o in sl.options for p in o.params}
+        out = [p for p in out if p not in slot_ps or p.split(".", 1)[1] in opt.params]
+        out += [f"{inst}.{p}" for p in opt.fit]
+    return list(dict.fromkeys(out))
+
+
+def closure_catalog(system) -> list[dict]:
+    """모델의 구성방정식 슬롯과 후보 (화면에서 직접 고를 때). 계통에 있는 컴포넌트가 슬롯을 정한다."""
+    from .lib.closures import ROLE_LABEL, closure_slots
+    from .lib.explain import title_of
+
+    out = []
+    for inst, sl in closure_slots(system):
+        comp = system.components[inst]
+        cur = comp.closure_choices.get(sl.key, sl.default)
+        out.append({"key": f"{inst}.{sl.key}", "instance": inst, "slot": sl.key, "title": sl.title,
+                    "component": title_of(comp), "current": cur, "default": sl.default,
+                    "candidates": [{"id": o.id, "title": o.title, "role": o.role,
+                                    "role_label": ROLE_LABEL.get(o.role, ""), "formula": o.law.formula,
+                                    "fit": [f"{inst}.{p}" for p in o.fit], "note": o.note,
+                                    "needs": [f"{inst}.{n}" for n in o.needs]} for o in sl.options]})
+    return out
+
+
+def advise_easy(cfg: EasyConfig, root: str | Path = ".", progress: Callable[[str], None] | None = None,
+                max_rows: int = 60, slots: list[str] | None = None) -> dict:
+    """구성방정식 후보 비교. **학습 기간만** 쓴다 (예측 기간은 채점에도 선택에도 안 쓴다)."""
+    from .closure_advice import AdviceConfig, advise_closures
+    from .workflow import WorkflowConfig, load_dataset
+
+    errs = period_errors(cfg.train, cfg.test, cfg.embargo_days)
+    if errs:
+        raise ValueError(" / ".join(e.replace("**", "") for e in errs))
+    if not (cfg.model and cfg.target_map and cfg.target_map.targets
+            and any(m.targets for m in cfg.feature_map.values())):
+        raise ValueError("후보 비교는 물리모델이 있어야 합니다. 모델을 고르고 y·x 를 모델 변수에 연결하세요.")
+    say = progress or (lambda m: None)
+    root = Path(root)
+    out_dir = root / "out" / "easy"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    say("학습 기간 데이터 정리 중")
+    tm = _tagmap(cfg, True)
+    tm_path = out_dir / f"{_slug(cfg.name or Path(cfg.csv).stem)}.advice.tagmap.yaml"
+    tm.dump(tm_path)
+    a, b, c, d = period_bounds(cfg.train, cfg.test)
+    spec = {"yaml": cfg.model} if str(cfg.model).endswith((".yaml", ".yml")) else {"python": cfg.model}
+    wcfg = WorkflowConfig(name=cfg.name, csv=str(cfg.csv), tagmap=str(tm_path),
+                          train_query=f"index >= '{a}' and index < '{b}'",
+                          test_query=f"index >= '{c}' and index < '{d}'", model=spec)
+    tmap, df, train, _test, ic, oc, _rep = load_dataset(wcfg, return_report=True)
+    del _test                                      # 예측 기간은 여기서 쓰지 않는다
+    y_col = next(e.primary for e in tmap.observations if e.tag == cfg.target)
+    x_cols = {e.primary for e in tmap.inputs if e.tag in cfg.features}
+    inputs = [c2 for c2 in ic if c2 in x_cols]
+    obs = [e.primary for e in tmap.observations if not e.primary.startswith(("x::", "y::"))]
+    train = train[train[y_col].notna()]
+    system = load_model(spec)
+    model = system.compile()
+    model.build()
+    common = [p for p in (cfg.params or suggest_params(model, cfg.target_map.targets[0])) if _has_param(model, p)]
+    res = advise_closures(spec, tmap, train, inputs, obs, y_col, common, current=cfg.closures,
+                          cfg=AdviceConfig(max_rows=max_rows, slots=slots,
+                                           embargo_days=max(1.0, cfg.embargo_days)), progress=say)
+    res["target_column"] = cfg.target
+    return res
+
+
 def _segments(system) -> list[list[str]]:
     """연결을 따라 계통 흐름을 끊지 않고 이어지는 구간들로 나눈다 (합류·분기에서 끊음)."""
     succ: dict[str, list[str]] = {}
@@ -556,7 +656,6 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
              progress: Callable[[str], None] | None = None) -> dict:
     from .calib import CalibrationSpec, calibrate
     from .calib.design import select_rows
-    from .scenario import load_model
     from .workflow import WorkflowConfig, _predict, load_dataset
 
     t0 = time.perf_counter()
@@ -625,14 +724,19 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
     if physics:
         say("물리모델 조립 중")
         system = load_model(wcfg.model)
+        chosen = apply_closure_choices(system, cfg.closures)
         model = system.compile()
         model.build()
-        params = [p for p in (cfg.params or suggest_params(model, cfg.target_map.targets[0]))
-                  if _has_param(model, p)]
+        params = closure_params(system, cfg.params or suggest_params(model, cfg.target_map.targets[0]),
+                                cfg.closures)
+        params = [p for p in params if _has_param(model, p)]
+        if chosen:
+            notes.append("구성방정식 선택: " + " · ".join(chosen)
+                         + f". 보정 파라미터: {', '.join(params)}")
         if not params:
             raise ValueError("보정할 파라미터가 없습니다. 모델에 보정 대상을 고르세요.")
         rows = select_rows(train, cfg.max_rows, model_inputs, model_obs)
-        spec = CalibrationSpec(params=params, observations=model_obs, sigmas=tmap.sigmas(),
+        spec = CalibrationSpec(params=params, observations=model_obs, sigmas=tmap.sigmas(train),
                                max_rows=max(len(rows), 1), prior_weight=0.05)
         say(f"물리 파라미터 {len(params)}개 보정 중 ({len(rows)}행, 드문 운전상태 포함) — 1~3분")
         cal = calibrate(model, rows[model_inputs], rows[model_obs], spec,
@@ -796,8 +900,9 @@ def _write_calibration_yaml(path, cfg: EasyConfig, wcfg, tm_path, params, x_cols
     model_path = cfg.model
     d = {
         "name": cfg.name,
-        "model": {"yaml": model_path} if str(model_path).endswith((".yaml", ".yml"))
-        else {"python": model_path, "builder": "build"},
+        "model": {**({"yaml": model_path} if str(model_path).endswith((".yaml", ".yml"))
+                     else {"python": model_path, "builder": "build"}),
+                  **({"closures": dict(cfg.closures)} if cfg.closures else {})},
         "data": {"csv": str(Path(cfg.csv).resolve()), "tagmap": str(Path(tm_path).resolve())},
         "split": {"train": wcfg.train_query, "test": wcfg.test_query},
         "calibrate": {"params": list(params), "max_rows": cfg.max_rows, "sampling": "space_filling"},
@@ -827,5 +932,6 @@ def config_from_body(body: dict, resolve: Callable[[str], Path]) -> EasyConfig:
         max_rows=int(body.get("max_rows", 150)), band=bool(body.get("band", False)),
         limit=float(body["limit"]) if body.get("limit") not in (None, "") else None,
         name=body.get("name") or Path(body["csv"]).stem,
+        closures={str(k): str(v) for k, v in (body.get("closures") or {}).items() if v},
     )
 

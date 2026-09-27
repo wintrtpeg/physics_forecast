@@ -132,6 +132,47 @@ def cmd_improve(args) -> int:
     return 0
 
 
+def cmd_closures(args) -> int:
+    """구성방정식 후보 추천 (학습 구간만). 고르는 것은 사람 — 결과를 보고 설정의 model.closures 에 적는다."""
+    from .closure_advice import AdviceConfig, advise_closures
+    from .scenario import load_model
+    from .workflow import WorkflowConfig, load_dataset
+
+    cfg = WorkflowConfig.load(args.config)
+    tm, df, train, _test, ic, oc = load_dataset(cfg)
+    del _test                                   # 시험 구간은 후보 선택에 쓰지 않는다
+    obs = [c for c in (cfg.observations or oc) if c in df.columns]
+    target = args.target or cfg.baseline_target
+    model = load_model(cfg.model).compile()
+    common = [p for p in cfg.params if p in {q.name for q in model.parameters}]
+    res = advise_closures(cfg.model, tm, train, ic, obs, target, common,
+                          current=(cfg.model or {}).get("closures") if isinstance(cfg.model, dict) else None,
+                          cfg=AdviceConfig(max_rows=args.max_rows, slots=args.slot or None),
+                          progress=lambda m: print("  · " + m, flush=True))
+    sp = res["split"]
+    print(f"\n보정 {sp['inner'][0][:10]}~{sp['inner'][1][:10]} ({sp['n_rows']}행) | 간격 {sp['embargo_days']}일 | "
+          f"검증 {sp['validate'][0][:10]}~{sp['validate'][1][:10]} ({sp['n_validate_hours']}시간, "
+          f"외삽 행 {sp['validate_outside_pct']:.0f}%) | 보정 {res['n_calibrations']}회 {res['seconds']:.0f}s")
+    for n in res["notes"]:
+        print("  !! " + n)
+    for sl in res["slots"]:
+        print(f"\n[{sl['key']}] {sl['component']} — {sl['title']}  ({sl['status']}, 예측값 영향 "
+              f"{sl['relevance_pct']:.1f}%)  추천: {sl['recommended']}")
+        for e in sl["excitation"]:
+            print(f"    변화 폭 {e['var']}: {e['span_pct']:.1f}%")
+        for r in sl["residual_corr"]:
+            print(f"    현재 식 잔차 ↔ {r['var']}: r={r['r']:+.2f}")
+        for c in sl["candidates"]:
+            v = f"검증 RMSE {c['val_rmse']:.3f} {res['unit']}" if c.get("val_rmse") is not None and \
+                c.get("evaluated") and c.get("val_rmse") == c.get("val_rmse") else ""
+            print(f"    - {c['id']:16s} {c['status']:6s} {v}  {'; '.join(c['reasons'])}")
+        if sl["message"]:
+            print("    → " + sl["message"])
+    print("\n고른 식은 설정 파일에 적습니다:\n  model:\n    closures: {" + ", ".join(
+        f"{s['key']}: {s['recommended']}" for s in res["slots"] if s["recommended"] != s["default"]) + "}")
+    return 0
+
+
 def cmd_select(args) -> int:
     import pickle
     from .report import selection_report
@@ -334,6 +375,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("-o", "--out", help="HTML 리포트 경로")
     c.add_argument("--max-rows", type=int, help="보정에 쓸 최대 행 수")
     c.set_defaults(func=cmd_calibrate)
+
+    c = sub.add_parser("closures", help="구성방정식 후보 추천 (학습 구간만, 고르는 것은 사람)")
+    c.add_argument("config", help="pf calibrate 설정 YAML")
+    c.add_argument("--target", help="채점할 관측 (기본: baseline.target)")
+    c.add_argument("--slot", action="append", help="이 슬롯만 비교 (예: SCR.eta). 여러 번 줄 수 있음")
+    c.add_argument("--max-rows", type=int, default=60, help="보정 행 수 (기본 60)")
+    c.set_defaults(func=cmd_closures)
 
     c = sub.add_parser("improve", help="개선 피드백: 학습 구간 안에서 보정 설계 비교 + 다음에 고칠 것")
     c.add_argument("config")

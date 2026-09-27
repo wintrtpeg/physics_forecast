@@ -61,7 +61,9 @@ pf demo                                # CLI 전 과정 (구조검사 → 풀이
 2. **변수** — 예측할 값 y 하나, 입력 x 여러 개 (미리 아는 값만 — 결과값은 누수)
 3. **기간** — 차트 위를 끌어서 학습·예측 기간. 예측은 학습 끝 + 간격(≥1일) 뒤로만
    고를 수 있고, 외삽 비율과 입력별 범위를 바로 보여줍니다
-4. **모델·실행** — 물리모델 + ML(다항·부스팅) 또는 ML 만. 컬럼 ↔ 모델 변수 연결, 단위 검사
+4. **모델·실행** — 물리모델 + ML(다항·부스팅) 또는 ML 만. 컬럼 ↔ 모델 변수 연결, 단위 검사.
+   구성방정식(제거효율·발생량·압력손실)은 코드가 데이터로 후보를 추려 추천하고 사용자가 고릅니다
+   ([`docs/closures.md`](docs/closures.md))
 5. **결과** — 외삽 행 기준 RMSE, 시계열·산점도·막대, 비교 표, 보정 파라미터, 예측 CSV
 
 현장형 더미 데이터(8개월)를 올려 ‘앞 60% 학습’ 그대로 돌리면 예측 기간 외삽 행 RMSE 가
@@ -77,7 +79,8 @@ python examples/nox_stack/make_synthetic_data.py  # 가상 현장 데이터 30�
 pf calibrate examples/nox_stack/calibration.yaml  # 보정 + 외삽 검증 + HTML 리포트
 pf improve   examples/nox_stack/calibration.yaml  # 개선 피드백: 다음에 무엇을 고칠지 (학습 구간만, 약 10분)
 pf run       examples/nox_stack/scenarios.yaml -o out/scenario.html   # what-if
-pf select    examples/nox_stack/selection.yaml    # 구성방정식 후보 비교
+pf select    examples/nox_stack/selection.yaml    # 구성방정식 후보 비교 (YAML 후보)
+pf closures  examples/nox_field/calibration.yaml  # 구성방정식 후보 추천 (학습 구간만, 고르는 건 사람)
 pf analyze   examples/nox_stack/analysis.yaml     # 데이터 주도 분석 + XAI 대시보드
 pf equations examples/nox_stack/system.yaml --dims # 조립된 방정식과 차원 확인
 
@@ -416,6 +419,7 @@ src/pforecast/
 │  ├─ server.py          # JSON API + 업로드 + 작업 큐 + 모델 캐시
 │  └─ static/            # 바닐라 JS SPA, SVG 차트 직접 구현 (easy.js = 간편 예측 5단계)
 ├─ easy.py               # 간편 예측: 기간 규칙(누수 거절) · 컬럼↔모델 연결 · 물리+ML 실행
+├─ closure_advice.py     # 구성방정식 후보 추천 (선별 → 보정 → 검증, 학습 구간만)
 ├─ selection.py          # 구성방정식 후보 비교·판정
 ├─ params.py             # 보정값 저장/적용 (라인별로 파일만 교체)
 ├─ workflow.py           # 데이터 → 보정 → 검증 → 리포트

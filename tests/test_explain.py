@@ -39,6 +39,39 @@ def test_tunable_parameters_live_only_in_closures(comp):
         assert kinds == {CLOSURE}, f"{type(comp).__name__}.{name} 가 {kinds} 에 들어 있습니다"
 
 
+def _all_choices():
+    """구성방정식 후보를 하나씩 끼운 컴포넌트 (기본 후보가 아닌 것까지 전부)."""
+    for comp in COMPONENTS:
+        for sl in getattr(type(comp), "CLOSURES", ()):
+            for opt in sl.options:
+                c = type(comp)("X", closures={sl.key: opt.id}) if not isinstance(comp, Mixer) else comp
+                yield pytest.param(c, id=f"{type(comp).__name__}.{sl.key}={opt.id}")
+
+
+@pytest.mark.parametrize("comp", list(_all_choices()))
+def test_every_closure_candidate_keeps_the_rules(comp):
+    """후보를 바꿔 끼워도: 식의 파라미터가 실제로 있고, 보정 파라미터는 구성방정식에만."""
+    test_laws_name_real_parameters(comp)
+    test_tunable_parameters_live_only_in_closures(comp)
+    for sl in type(comp).CLOSURES:
+        law = comp.closure(sl.key).law
+        assert law.kind == CLOSURE and law in comp.laws()
+        assert set(comp.closure(sl.key).fit) <= set(law.params)
+
+
+def test_every_slot_has_a_baseline_and_a_standard():
+    from pforecast.lib.closures import BASELINE, STANDARD
+    for comp in COMPONENTS:
+        for sl in getattr(type(comp), "CLOSURES", ()):
+            roles = {o.role for o in sl.options}
+            assert STANDARD in roles and sl.option(sl.default).role == STANDARD
+            # 하한선이 따로 없으면 표준형 자체가 가장 단순해야 한다 (파라미터 1개)
+            assert BASELINE in roles or len(sl.option(sl.default).fit) == 1
+            for o in sl.options:
+                for p in o.fit:
+                    assert o.params[p].default != 0, f"{sl.key}.{o.id}.{p} 설계값 0 은 보정 불가"
+
+
 def test_declared_components_show_their_equations():
     system = load_model({"yaml": "examples/chiller_plant/system.yaml"})
     chiller = system.components["CHILLER"]

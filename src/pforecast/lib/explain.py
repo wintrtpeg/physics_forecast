@@ -48,7 +48,12 @@ class Law:
 
 
 def laws_of(comp) -> list[Law]:
-    """컴포넌트의 사람이 읽는 식. ``LAWS`` 가 없으면 선언식(YAML)을 그대로 쓴다."""
+    """컴포넌트의 사람이 읽는 식. ``LAWS`` 가 없으면 선언식(YAML)을 그대로 쓴다.
+
+    구성방정식 슬롯이 있는 컴포넌트는 ``laws()`` 가 지금 고른 후보의 식을 끼워 준다.
+    """
+    if hasattr(comp, "laws"):
+        return comp.laws()
     laws = getattr(type(comp), "LAWS", None)
     if laws:
         return list(laws)

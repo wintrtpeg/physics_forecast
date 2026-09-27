@@ -534,7 +534,12 @@ class Api:
             p["sensitivity_pct"] = _num(sens.get(p["value"]))
         suggested = cat["declared_params"] or [
             k for k, v in sorted(sens.items(), key=lambda kv: -kv[1]) if v > 1.0][:4]
-        return {**cat, "suggested": suggested}
+        # 구성방정식 슬롯과 후보 (계통에 있는 컴포넌트 종류가 정한다)
+        from ..easy import closure_catalog
+        from ..scenario import load_model
+        path = self.ws.resolve(rel)
+        system = load_model({"yaml": str(path)} if path.suffix in (".yaml", ".yml") else {"python": str(path)})
+        return {**cat, "suggested": suggested, "closures": closure_catalog(system)}
 
     def easy_check(self, body) -> dict:
         from ..easy import check, config_from_body, mapping_issues
@@ -544,6 +549,26 @@ class Api:
         if body.get("model") and (cfg.target_map is not None or cfg.feature_map):
             out["mapping_issues"] = mapping_issues(self.ws.model(body["model"]), cfg)
         return out
+
+    def easy_closures(self, body) -> dict:
+        """구성방정식 후보 비교 (학습 기간만). 보정을 후보 수만큼 하므로 작업으로 돌린다."""
+        from ..easy import advise_easy, config_from_body, mapping_issues, period_errors
+        cfg = config_from_body(body, self.ws.resolve)
+        errs = period_errors(cfg.train, cfg.test, cfg.embargo_days)
+        if errs:
+            raise ValueError(" / ".join(e.replace("**", "") for e in errs))
+        if cfg.model:
+            issues = mapping_issues(self.ws.model(body["model"]), cfg)
+            if issues:
+                raise ValueError("컬럼 연결을 고치세요: " + " / ".join(
+                    f"{i['column']} → {i['target']}: {i['message']}" for i in issues))
+        root = self.ws.root
+        slots = body.get("slots") or None
+
+        def work(job: Job):
+            return advise_easy(cfg, root, progress=lambda m: setattr(job, "message", m), slots=slots)
+
+        return {"job": self.jobs.start("closures", work).payload()}
 
     def easy_run(self, body) -> dict:
         from ..easy import config_from_body, mapping_issues, period_errors, run_easy
@@ -648,6 +673,7 @@ _ROUTES: dict[str, str] = {
     "/api/easy/catalog": "easy_catalog",
     "/api/easy/check": "easy_check",
     "/api/easy/run": "easy_run",
+    "/api/easy/closures": "easy_closures",
 }
 
 

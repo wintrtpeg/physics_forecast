@@ -86,13 +86,22 @@ def load_yaml_model(path: str | Path) -> System:
 
 
 def load_model(spec: dict | str | Path, **kwargs) -> System:
-    """시나리오 파일의 ``model:`` 항목을 해석한다."""
+    """시나리오 파일의 ``model:`` 항목을 해석한다.
+
+    ``closures: {SCR.eta: langmuir}`` 가 있으면 구성방정식 후보를 바꿔 끼운다
+    (앱의 후보 비교에서 사용자가 고른 것).
+    """
     if isinstance(spec, (str, Path)):
         p = Path(spec)
         return load_yaml_model(p) if p.suffix in (".yaml", ".yml") else load_python_model(p, **kwargs)
     if "yaml" in spec:
-        return load_yaml_model(spec["yaml"])
-    if "python" in spec:
-        return load_python_model(spec["python"], spec.get("builder", "build"),
-                                 **(spec.get("args") or {}))
-    raise ModelError("model 항목에는 python: 또는 yaml: 이 필요합니다")
+        system = load_yaml_model(spec["yaml"])
+    elif "python" in spec:
+        system = load_python_model(spec["python"], spec.get("builder", "build"),
+                                   **(spec.get("args") or {}))
+    else:
+        raise ModelError("model 항목에는 python: 또는 yaml: 이 필요합니다")
+    if spec.get("closures"):
+        from ..lib.closures import apply_closures
+        apply_closures(system, spec["closures"])
+    return system

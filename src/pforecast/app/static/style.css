@@ -501,3 +501,19 @@ code.fp.fit { background: var(--accent); color: #fff; }
 table.xset td:first-child { color: var(--ink-3); width: 150px; }
 table.xset td { text-align: left; white-space: normal; }
 @media (max-width: 640px) { .law { grid-template-columns: 1fr; gap: 4px; } }
+
+/* 구성방정식 후보 */
+.card.inset { box-shadow: none; background: var(--panel-2); margin: 0 0 10px; }
+.slot { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+.shead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.smsg { font-size: 12.5px; color: var(--ink-2); margin: 8px 0 0; max-width: 100ch; }
+.warnchip { background: var(--warn-soft) !important; }
+.cands { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+label.cand { display: grid; grid-template-columns: 20px 1fr; gap: 8px; align-items: start; border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 11px; cursor: pointer; }
+label.cand.on { border-color: var(--accent); background: var(--accent-soft); }
+label.cand input { margin-top: 3px; accent-color: var(--accent); }
+.cand .ct { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+.cand .cev { font-size: 12px; color: var(--ink-2); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.cand .cnote { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+.cand ul.log { font-size: 12px; margin-top: 4px; }

@@ -103,6 +103,27 @@ class SelectionConfig:
         )
 
 
+def paired_abs_error(meas, pa, pb, min_n: int = 30):
+    """같은 시점끼리 두 예측의 절대오차 차이 (b − a) 평균, 표준오차, 유효 표본수.
+
+    시계열 잔차는 강하게 자기상관되어 있다. 1차 자기상관으로 유효 표본수를 깎지 않으면
+    무엇이든 "유의미하게 다르다"고 나온다. 표본이 모자라면 ``None``.
+    """
+    meas, pa, pb = (np.asarray(v, float) for v in (meas, pa, pb))
+    d = np.abs(pb - meas) - np.abs(pa - meas)
+    d = d[np.isfinite(d)]
+    n = len(d)
+    if n < min_n:
+        return None
+    sd = float(np.std(d, ddof=1))
+    if sd <= 0:
+        return None
+    c = np.corrcoef(d[:-1], d[1:])[0, 1] if n > 2 else 0.0
+    rho = float(np.clip(c if np.isfinite(c) else 0.0, 0.0, 0.999))
+    n_eff = max(n * (1.0 - rho) / (1.0 + rho), 2.0)
+    return float(np.mean(d)), float(sd / np.sqrt(n_eff)), float(n_eff)
+
+
 @dataclass
 class CandidateResult:
     id: str
@@ -189,22 +210,7 @@ class SelectionResult:
         if a.test_pred is None or b.test_pred is None or tgt not in self.test:
             return None
         conv = lambda v: np.array([from_si(float(x), unit) for x in np.asarray(v, float)])  # noqa: E731
-        meas = conv(self.test[tgt])
-        ea = np.abs(conv(a.test_pred) - meas)
-        eb = np.abs(conv(b.test_pred) - meas)
-        d = eb - ea
-        d = d[np.isfinite(d)]
-        n = len(d)
-        if n < 30:
-            return None
-        sd = float(np.std(d, ddof=1))
-        if sd <= 0:
-            return None
-        c = np.corrcoef(d[:-1], d[1:])[0, 1] if n > 2 else 0.0
-        rho = float(np.clip(c if np.isfinite(c) else 0.0, 0.0, 0.999))
-        n_eff = max(n * (1.0 - rho) / (1.0 + rho), 2.0)
-        se = sd / np.sqrt(n_eff)
-        return float(np.mean(d)), float(se), float(n_eff)
+        return paired_abs_error(conv(self.test[tgt]), conv(a.test_pred), conv(b.test_pred))
 
     def pairwise_table(self) -> pd.DataFrame:
         """최선 후보 대비 각 후보의 외삽 오차 차이와 유의성."""

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from ..core import symbolic as S
 from ..core.component import Component, ParamSpec, PortSpec, Scope, VarSpec
+from .closures import ClosureMixin, SlotLaw, pressure_slot
 from .explain import CLOSURE, CONSERVATION, STATE, Law
 from .gas import FLUE_GAS, G_ACCEL, GasMedium, density, enthalpy, gas_port, mixture_cp
 
@@ -68,7 +69,7 @@ class GasComponent(Component):
         return {}
 
 
-class Duct(GasComponent):
+class Duct(ClosureMixin, GasComponent):
     """덕트 구간: 마찰 압력손실 + 주위로의 열손실.
 
     dp = K * mdot*|mdot| / rho  (K [1/m^4] 는 f*L/(2*D*A^2) 를 하나로 묶은 값)
@@ -76,7 +77,6 @@ class Duct(GasComponent):
     """
 
     PARAMS = {
-        "K": ParamSpec(0.5, "1/m4", "덕트 저항계수 f*L/(2*D*A^2)", lo=0.0, hi=1e5, tunable=True),
         "UA": ParamSpec(0.0, "W/K", "덕트 외벽 총괄 열전달", lo=0.0, hi=1e6, tunable=True),
         "T_amb": ParamSpec(25.0, "degC", "주위 온도"),
     }
@@ -84,10 +84,14 @@ class Duct(GasComponent):
         "dp": VarSpec("Pa", start=50.0, desc="압력손실"),
         "rho": VarSpec("kg/m3", start=1.15, lo=0.05, hi=10.0, desc="밀도"),
     }
+    CLOSURES = (pressure_slot("friction", "마찰 압력손실",
+                              ParamSpec(0.5, "1/m4", "덕트 저항계수 f*L/(2*D*A^2)", lo=0.0, hi=1e5,
+                                        tunable=True)),)
     LAWS = (
         LAW_MASS,
         LAW_DENSITY,
-        Law(CLOSURE, "마찰 압력손실", "p_{in} − p_{out} = Δp,   Δp = `K` · ṁ|ṁ| / ρ"),
+        Law(CONSERVATION, "운동량 (압력 강하)", "p_{in} − p_{out} = Δp"),
+        SlotLaw("friction"),
         Law(CONSERVATION, "에너지 보존", "ṁ · c_{p} · (T_{out} − T_{in}) = −Q_{loss}"),
         Law(CLOSURE, "외벽 열손실", "Q_{loss} = `UA` · ((T_{in} + T_{out})/2 − `T_amb`)"),
         LAW_SPECIES,
@@ -105,7 +109,7 @@ class Duct(GasComponent):
         return [
             a.mdot + b.mdot,
             s.rho - density(a, self.medium),
-            s.dp - s.K * S.signed_pow(a.mdot, 2.0) / s.rho,
+            s.dp - self.closure_expr("friction", s, m=a.mdot, rho=s.rho),
             a.p - b.p - s.dp,
             b.T * (C + half_UA) - ((C - half_UA) * a.T + s.UA * s.T_amb),
             *self._species_transport(a, b),
@@ -122,7 +126,7 @@ class Duct(GasComponent):
         from .gas import density_num
         w = {sp: state.get(f"w_{sp}", 0.0) for sp in self.medium.species}
         rho = density_num(101325.0, state["T"], w, self.medium)
-        return {"rho": rho, "dp": self.param_value("K") * state["mdot"] ** 2 / rho}
+        return {"rho": rho, "dp": self.closure_value("friction", m=state["mdot"], rho=rho)}
 
 
 class Fan(GasComponent):
