@@ -804,6 +804,12 @@ function ezRenderResult() {
         h('th', {}, '편향'), h('th', {}, 'R²'), h('th', {}, r.limit !== null && r.limit !== undefined ? '초과 적중' : ''))),
       h('tbody', {}, rowsT)))));
 
+  if (r.explain && (r.explain.physics || (r.explain.ml || []).length)) {
+    // 설명이 깨져도 결과(차트·표)는 보여야 한다
+    try { body.append(ezExplainCard(r)); }
+    catch (e) { body.append(h('div', { class: 'note bad' }, '모델 설명을 그리지 못했습니다: ' + e.message)); }
+  }
+
   if (r.calibration) {
     const c = r.calibration;
     body.append(h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h3', {}, '보정된 물리 파라미터'),
@@ -835,6 +841,107 @@ function ezRenderResult() {
     r.files.config ? h('a', { class: 'btn ghost', href: '/' + r.files.config, target: '_blank', title: 'pf calibrate / pf improve 로 다시 돌릴 수 있는 설정' }, '설정 파일(YAML)') : null,
     h('button', { class: 'btn ghost', onclick: () => ezGo('ez-period') }, '← 기간 바꿔 다시'),
     h('button', { class: 'btn ghost', onclick: () => ezGo('ez-model') }, '← 모델 바꿔 다시')));
+}
+
+// ── 모델 설명 ───────────────────────────────────────────────────────────
+// 식 표기: _{..} 아래첨자, ^{..} 위첨자, `이름` 은 파라미터 (보정한 것은 강조)
+function fmla(text, fitted) {
+  let s = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  s = s.replace(/`([A-Za-z_][A-Za-z0-9_]*)`/g, (_, p) =>
+    `<code class="fp${fitted && fitted.has(p) ? ' fit' : ''}" title="${fitted && fitted.has(p) ? '보정한 파라미터' : '파라미터'}">${p}</code>`);
+  for (let i = 0; i < 3; i++) s = s.replace(/_\{([^{}]*)\}/g, '<sub>$1</sub>').replace(/\^\{([^{}]*)\}/g, '<sup>$1</sup>');
+  return s;
+}
+
+function ezExplainCard(r) {
+  const P = PAL(), ex = r.explain, tabs = [];
+  if (ex.physics) tabs.push({ key: 'physics', label: '물리모델', color: P.physics });
+  (ex.ml || []).forEach(m => tabs.push({ key: m.name, label: m.name, color: colorOf(m.kind, P) }));
+  if (!EZ.explainTab || !tabs.some(t => t.key === EZ.explainTab)) EZ.explainTab = tabs[0].key;
+  const pane = h('div', { class: 'xpane' });
+  const seg = h('div', { class: 'seg', role: 'tablist' });
+  const show = () => {
+    seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.key === EZ.explainTab));
+    pane.innerHTML = '';
+    if (EZ.explainTab === 'physics') pane.append(...ezExplainPhysics(ex.physics, r));
+    else pane.append(...ezExplainML(ex.ml.find(m => m.name === EZ.explainTab)));
+  };
+  tabs.forEach(t => seg.append(h('button', { 'data-key': t.key, role: 'tab', onclick: () => { EZ.explainTab = t.key; show(); } },
+    h('i', { class: 'sw', style: `background:${t.color}` }), ' ', t.label)));
+  show();
+  return h('div', { class: 'card', id: 'ez-explain' },
+    h('div', { class: 'card-head' }, h('h3', {}, '모델 설명 — 무엇으로 어떻게 예측했나'),
+      h('span', { class: 'sub' }, '같은 학습 데이터·같은 입력으로 만든 세 모델의 식과 설정')),
+    seg, pane);
+}
+
+function ezExplainPhysics(x, r) {
+  const out = [];
+  const nfit = x.groups.reduce((a, g) => a + g.fitted.length, 0);
+  out.push(h('div', { class: 'xchips' },
+    h('span', { class: 'chip static' }, h('b', {}, `방정식 ${x.counts.equations}개`), ` = 미지수 ${x.counts.unknowns}개`),
+    h('span', { class: 'chip static' }, `컴포넌트 ${x.counts.components}개`),
+    h('span', { class: 'chip static' }, `보정한 파라미터 ${nfit}개`)));
+  out.push(h('p', { class: 'xtext' }, x.solve));
+
+  // 흐름
+  out.push(h('div', { class: 'xsec' }, h('div', { class: 'k' }, '계통 흐름'),
+    h('div', { class: 'flows' }, x.segments.map(seg => h('div', { class: 'flow' },
+      seg.flatMap((n, i) => [i ? h('span', { class: 'arr' }, '→') : null, h('span', { class: 'node' }, n)]))))));
+
+  // 예측값과 입력
+  const t = x.target;
+  const inRows = x.inputs.map(i => {
+    const laws = [...new Set(i.uses.flatMap(u => u.laws))];
+    const tg = i.uses.map(u => u.target);
+    return h('tr', {}, h('td', { class: 'name' }, i.column),
+      h('td', { class: 'mono' }, tg.length > 2 ? `${tg[0]} 외 ${tg.length - 1}개` : tg.join(', '),
+        i.scale !== 1 ? h('span', { class: 'sub' }, ` × ${+i.scale.toPrecision(4)}`) : null),
+      h('td', { class: 'wrap' }, laws.map(l => h('span', { class: 'lawchip' }, l))));
+  });
+  out.push(h('div', { class: 'xsec' }, h('div', { class: 'k' }, '데이터가 식에 들어가는 곳'),
+    h('div', { class: 'note', style: 'margin:0 0 8px' }, h('b', {}, `예측값 ${t.column}`), ` = 모델의 ${t.variable}`,
+      t.desc ? ` — ${t.desc}` : '', t.component ? ` (${t.component})` : ''),
+    h('div', { class: 'tablewrap' }, h('table', { class: 'xin' },
+      h('thead', {}, h('tr', {}, h('th', {}, '입력 컬럼'), h('th', {}, '모델 파라미터'), h('th', {}, '들어가는 식'))),
+      h('tbody', {}, inRows)))));
+
+  // 컴포넌트별 식
+  const groups = x.groups.map(g => {
+    const fitted = new Set(g.fitted.map(f => f.param));
+    return h('details', { class: 'xgroup', open: true },
+      h('summary', {}, h('b', {}, g.title), h('span', { class: 'mono sub' }, ` ${g.instances.join(', ')}`),
+        g.fitted.length ? h('span', { class: 'badge good' }, `보정 ${g.fitted.length}`) : null),
+      h('div', { class: 'laws' }, g.laws.map(l => h('div', { class: 'law' },
+        h('span', { class: 'kind k-' + ({ '보존법칙': 'c', '상태·정의': 's', '구성방정식': 'x', '경계조건': 'b' }[l.kind] || 'd') }, l.kind),
+        h('div', {}, h('div', { class: 'lt' }, l.title), h('div', { class: 'fm', html: fmla(l.formula, fitted) }))))),
+      g.fitted.length ? h('div', { class: 'fitline' }, '보정: ', g.fitted.flatMap((f, i) => [i ? ' · ' : '',
+        h('code', { class: 'fp fit' }, `${f.instance}.${f.param}`),
+        ` ${fmt(f.initial)} → ${fmt(f.fitted)}${f.unit && f.unit !== '1' ? ' ' + f.unit : ''} (${f.change_pct >= 0 ? '+' : ''}${fmt(f.change_pct, 1)}%)`])) : null);
+  });
+  out.push(h('div', { class: 'xsec' }, h('div', { class: 'k' }, '컴포넌트별 지배방정식'),
+    h('div', { class: 'kinds' }, Object.entries(x.kinds).filter(([k]) => x.groups.some(g => g.laws.some(l => l.kind === k)))
+      .map(([k, v]) => h('div', {}, h('span', { class: 'kind k-' + ({ '보존법칙': 'c', '상태·정의': 's', '구성방정식': 'x', '경계조건': 'b' }[k] || 'd') }, k), ' ', v))),
+    h('p', { class: 'xtext' }, x.connection),
+    groups));
+  out.push(h('div', { class: 'xsec' }, h('div', { class: 'k' }, '보정 방법'), h('p', { class: 'xtext' }, x.calibrate)));
+  return out;
+}
+
+function ezExplainML(m) {
+  return [
+    h('div', { class: 'xchips' }, h('span', { class: 'chip static' }, h('b', {}, m.algorithm))),
+    h('div', { class: 'xsec' }, h('div', { class: 'k' }, '식'), h('div', { class: 'fm big', html: fmla(m.formula) }),
+      h('p', { class: 'xtext' }, m.fit)),
+    h('div', { class: 'xsec' }, h('div', { class: 'k' }, '설정 (학습된 모델에서 읽은 값)'),
+      h('div', { class: 'tablewrap' }, h('table', { class: 'xset' },
+        h('tbody', {}, m.settings.map(([k, v]) => h('tr', {}, h('td', {}, k), h('td', {}, v))))))),
+    h('div', { class: 'xsec' }, h('div', { class: 'k' }, `입력 ${m.inputs.length}개 (물리모델과 같은 컬럼)`),
+      h('div', { class: 'wrap' }, m.inputs.map(c => h('span', { class: 'lawchip mono' + (m.frozen.includes(c) ? ' frozen' : '') },
+        c, m.frozen.includes(c) ? ' — 학습 동안 고정' : '')))),
+    h('div', { class: 'note warn' }, h('b', {}, '학습 범위 밖에서: '), m.extrapolation,
+      m.frozen.length ? ` 학습 동안 값이 한 번도 바뀌지 않은 입력(${m.frozen.join(', ')})은 이 모델이 효과를 배울 수 없습니다.` : ''),
+  ];
 }
 
 function tsChart(host, opt) {

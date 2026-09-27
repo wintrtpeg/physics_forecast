@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from ..core import symbolic as S
 from ..core.component import ParamSpec, PortSpec, Scope, VarSpec
-from .flow import GasComponent, _MIN_MDOT
+from .explain import BOUNDARY, CLOSURE, CONSERVATION, STATE, Law
+from .flow import LAW_DENSITY, GasComponent, _MIN_MDOT
 from .gas import (
     CP_WATER_LIQ, G_ACCEL, MOLAR_MASS, P_NORMAL, R_UNIVERSAL, T_NORMAL, T_REF,
     FLUE_GAS, GasMedium, density, enthalpy, gas_port, humidity_from_rh,
@@ -63,6 +64,17 @@ class ToolGroupSource(GasComponent):
     VARS = {
         "rho": VarSpec("kg/m3", start=1.12, lo=0.05, hi=10.0),
     }
+    LAWS = (
+        LAW_DENSITY,
+        Law(CLOSURE, "후드 병렬 저항 (압력으로 유량이 정해짐)",
+            "`p_room` − p = `dp_design` · (`rho_ref`/ρ) · (ṁ / ṁ_{ref})^{2},   "
+            "ṁ_{ref} = n_{eff} · `q_tool` · ρ_{N},   "
+            "n_{eff} = `n_tools` · (`idle_frac` + (1 − `idle_frac`) · `util`)"),
+        Law(BOUNDARY, "배기 온도", "T = `T_exh`"),
+        Law(CLOSURE, "NOx 발생량 (배출계수)", "ṁ · w_{NOx} = `n_tools` · (`ef_idle` + `util` · `ef_process`)"),
+        Law(STATE, "배기 습분 (Magnus 포화수증기압)", "w_{H₂O} = f(`rh_exh`, `T_exh`, p)"),
+        Law(BOUNDARY, "배기 산소 (건조 공기 조성)", "w_{O₂} = `w_O2` · (1 − w_{H₂O})"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"outlet": gas_port(self.medium, "out")}
@@ -146,6 +158,20 @@ class WetScrubber(GasComponent):
         "rho": VarSpec("kg/m3", start=1.13, lo=0.05, hi=10.0),
         "LG": VarSpec("1", start=1.5e-3, lo=1e-9, hi=1.0, desc="액가스비 (m3/m3)"),
     }
+    LAWS = (
+        Law(CONSERVATION, "질량 보존 (증발수 포함)", "ṁ_{out} = ṁ_{in} + ṁ_{evap}"),
+        LAW_DENSITY,
+        Law(STATE, "액가스비", "L/G = `L` / (ṁ_{in} / ρ)"),
+        Law(CLOSURE, "NOx 제거효율 (물질전달 단위수)",
+            "η = `eta_max` · (1 − e^{−NTU}),   NTU = `ntu_a` · (L/G)^{`ntu_b`}"),
+        Law(CONSERVATION, "NOx 보존 (제거분만 빠짐)", "ṁ_{out} · w_{NOx,out} = ṁ_{in} · w_{NOx,in} · (1 − η)"),
+        Law(CONSERVATION, "수분·산소 보존",
+            "ṁ_{out} · w_{H₂O,out} = ṁ_{in} · w_{H₂O,in} + ṁ_{evap},   ṁ_{out} · w_{O₂,out} = ṁ_{in} · w_{O₂,in}"),
+        Law(CLOSURE, "출구 포화 (단열 가습)", "w_{H₂O,out} = f(`rh_out`, T_{out}, p)"),
+        Law(CONSERVATION, "에너지 보존 (증발 냉각)",
+            "ṁ_{in} · h_{in} + ṁ_{evap} · c_{w} · (`T_water` − 0 °C) = ṁ_{out} · h_{out}"),
+        Law(CLOSURE, "충전층 압력손실", "p_{in} − p_{out} = Δp,   Δp = `K` · ṁ|ṁ| / ρ"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"a": gas_port(self.medium, "in"), "b": gas_port(self.medium, "out")}
@@ -240,6 +266,19 @@ class Stack(GasComponent):
         "y_O2_dry": VarSpec("1", start=0.208, lo=0.0, hi=0.30, desc="건조 기준 산소 몰분율"),
         "dp": VarSpec("Pa", start=100.0),
     }
+    LAWS = (
+        LAW_DENSITY,
+        Law(STATE, "표준상태(0 °C, 1 atm) 유량", "Q_{N} = ṁ / ρ_{N}"),
+        Law(STATE, "습식 기준 농도", "C_{wet} = ṁ · w_{NOx} / Q_{N}"),
+        Law(STATE, "수증기·산소 몰분율", "y_{H₂O} = w_{H₂O} · M_{mix} / M_{H₂O},   "
+            "y_{O₂,dry} · (1 − y_{H₂O}) = w_{O₂} · M_{mix} / M_{O₂}"),
+        Law(STATE, "건조 기준 환산 (TMS 비교값)", "C_{dry} = C_{wet} / (1 − y_{H₂O})"),
+        Law(STATE, "표준산소 보정 (o2_corr = 0 이면 건조 기준 농도와 같음)",
+            "C_{corr} = C_{dry} · (0.2095 − `o2_corr` · `O2_ref`) / (0.2095 − `o2_corr` · y_{O₂,dry})"),
+        Law(CLOSURE, "굴뚝 저항", "Δp = `K` · ṁ|ṁ| / ρ"),
+        Law(BOUNDARY, "대기 경계 + 통풍력", "p_{in} = `p_amb` + Δp − (ρ_{amb} − ρ) · g · `H`,   "
+            "ρ_{amb} = `p_amb` · M_{air} / (R · `T_amb`)"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"a": gas_port(self.medium, "in")}

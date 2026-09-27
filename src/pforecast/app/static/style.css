@@ -459,3 +459,45 @@ table.map th { text-align: left; }
 #ez-model-pane + .card { margin-top: 14px; }
 table.map input[type="number"] { width: 104px !important; }
 table.cmp td:nth-child(2), table.cmp th:nth-child(2) { text-align: left; }
+
+/* 모델 설명 */
+#ez-explain .seg { margin-bottom: 14px; flex-wrap: wrap; }
+.xpane { display: flex; flex-direction: column; gap: 16px; }
+.xchips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip.static { cursor: default; }
+.chip.static:hover { background: var(--panel); }
+.xtext { font-size: 13px; color: var(--ink-2); margin: 6px 0 0; max-width: 90ch; line-height: 1.65; }
+.xsec > .k { font-size: 12px; font-weight: 700; color: var(--ink-3); letter-spacing: .03em; margin-bottom: 8px; }
+.flows { display: flex; flex-direction: column; gap: 6px; }
+.flow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.flow .node { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; padding: 3px 8px;
+              border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); color: var(--ink); }
+.flow .arr { color: var(--ink-3); font-size: 12px; }
+table.xin td, table.xin th { text-align: left; vertical-align: top; }
+td.wrap, div.wrap { white-space: normal; display: flex; flex-wrap: wrap; gap: 4px; }
+.lawchip { font-size: 11.5px; padding: 2px 8px; border-radius: 20px; background: var(--accent-soft); color: var(--ink-2); }
+.lawchip.frozen { background: var(--warn-soft); }
+.kinds { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--ink-2); margin-bottom: 6px; }
+.kind { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 5px; white-space: nowrap;
+        border: 1px solid var(--line); color: var(--ink-2); background: var(--panel); min-width: 64px; text-align: center; }
+.kind.k-c { border-color: var(--ink-2); color: var(--ink); }
+.kind.k-x { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.kind.k-b { border-style: dashed; }
+details.xgroup { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; margin-top: 8px; }
+details.xgroup summary { cursor: pointer; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+details.xgroup summary .badge { margin-left: auto; }
+.laws { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.law { display: grid; grid-template-columns: 76px 1fr; gap: 10px; align-items: start; }
+.law .lt { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.fm { font-family: "Cambria Math", "Times New Roman", serif; font-size: 14.5px; color: var(--ink); line-height: 1.7;
+      overflow-wrap: anywhere; }
+.fm.big { font-size: 16px; }
+.fm sub, .fm sup { font-size: 70%; }
+code.fp { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; padding: 0 3px; border-radius: 4px;
+           background: var(--panel-2); color: var(--ink-2); }
+code.fp.fit { background: var(--accent); color: #fff; }
+.fitline { font-size: 12px; color: var(--ink-2); margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line);
+           display: flex; flex-wrap: wrap; gap: 2px 4px; align-items: baseline; }
+table.xset td:first-child { color: var(--ink-3); width: 150px; }
+table.xset td { text-align: left; white-space: normal; }
+@media (max-width: 640px) { .law { grid-template-columns: 1fr; gap: 4px; } }

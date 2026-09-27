@@ -159,6 +159,18 @@ def test_ml_only_run_scores_the_future_and_writes_predictions(ws_server):
     pred = pd.read_csv(root / res["files"]["predictions"], index_col=0, encoding="utf-8-sig")
     assert pd.Timestamp(pred.index.min()) >= pd.Timestamp("2025-03-22")
     assert "실측" in pred.columns and "ML 부스팅" in pred.columns
+    # 결과에 쓴 알고리즘과 설정을 같이 돌려준다 (설정값은 학습된 객체에서 읽은 것)
+    ex = res["explain"]
+    assert ex["physics"] is None
+    ml = {m["name"]: m for m in ex["ml"]}
+    assert set(ml) == set(names)
+    for m in ml.values():
+        assert m["formula"] and m["extrapolation"] and m["inputs"] == BODY["features"]
+    boost = dict(ml["ML 부스팅"]["settings"])
+    assert boost["학습률 ν"] == "0.08" and boost["트리 수 M"].endswith("(최대 300)")
+    poly = dict(ml["ML 다항(2차)"]["settings"])
+    k = len(BODY["features"])
+    assert poly["항 수"].startswith(str(1 + k + k * (k + 1) // 2))
 
 
 def test_an_input_frozen_in_training_is_reported(tmp_path):
@@ -175,3 +187,4 @@ def test_an_input_frozen_in_training_is_reported(tmp_path):
                      train=["2025-01-01", "2025-01-25"], test=["2025-02-01", "2025-02-09"])
     res = run_easy(cfg, tmp_path)
     assert any("N_UNITS" in n and "변하지 않" in n for n in res["notes"])
+    assert all(m["frozen"] == ["N_UNITS"] for m in res["explain"]["ml"])

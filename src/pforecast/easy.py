@@ -405,18 +405,46 @@ def _metrics(pred, meas) -> dict:
 
 
 def _ml_models(Xtr, ytr):
+    """(이름, 종류, 예측함수, 설명) 목록. 설명의 설정값은 학습된 객체에서 읽는다."""
     from .calib import PolyRidgeBaseline
     models = []
     ok = np.all(np.isfinite(Xtr), axis=1) & np.isfinite(ytr)
+    k, n = Xtr.shape[1], int(ok.sum())
     poly = PolyRidgeBaseline(degree=2)
-    poly.fit(Xtr[ok], ytr[ok], [f"x{i}" for i in range(Xtr.shape[1])])
-    models.append(("ML 다항(2차)", "poly", poly.predict))
+    poly.fit(Xtr[ok], ytr[ok], [f"x{i}" for i in range(k)])
+    models.append(("ML 다항(2차)", "poly", poly.predict, {
+        "algorithm": "다항 릿지 회귀 (2차, 교차항 포함)",
+        "formula": "ŷ = β_{0} + Σ_{i} β_{i} z_{i} + Σ_{i≤j} β_{ij} z_{i} z_{j},   "
+                   "z_{i} = (x_{i} − 평균_{i}) / 표준편차_{i}",
+        "fit": "정규방정식 (ZᵀZ + αI) β = Zᵀy 를 한 번에 풉니다. 평균·표준편차는 학습 행에서만 구합니다.",
+        "settings": [["차수", "2"], ["항 수", f"{len(poly.coef_)} (= 1 + {k} + {k * (k + 1) // 2})"],
+                     ["릿지 α", f"{poly.alpha:g}"], ["학습 행", f"{n:,}"]],
+        "extrapolation": "입력이 학습 범위를 넘으면 2차 곡면을 그대로 연장합니다. 학습 구간의 "
+                         "곡률이 계속된다고 가정하므로 멀리 갈수록 과대·과소 예측이 커집니다.",
+    }))
     try:
         from sklearn.ensemble import HistGradientBoostingRegressor
         gb = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.08, min_samples_leaf=20,
                                            l2_regularization=1.0, random_state=0)
         gb.fit(Xtr[ok], ytr[ok])
-        models.append(("ML 부스팅", "boost", gb.predict))
+        early = bool(getattr(gb, "do_early_stopping_", False))
+        models.append(("ML 부스팅", "boost", gb.predict, {
+            "algorithm": "그래디언트 부스팅 회귀 트리 (scikit-learn HistGradientBoostingRegressor)",
+            "formula": "ŷ = F_{0} + Σ_{m=1}^{M} ν · f_{m}(x),   f_{m} = 앞 단계 잔차(제곱오차 기울기)에 맞춘 회귀 트리",
+            "fit": "트리를 하나씩 더하며 남은 오차를 줄입니다. 각 입력은 학습 행의 분위수로 최대 "
+                   f"{gb.max_bins}개 구간으로 나눠 분기점을 찾습니다.",
+            "settings": [["트리 수 M", f"{gb.n_iter_} (최대 {gb.max_iter})"],
+                         ["학습률 ν", f"{gb.learning_rate:g}"],
+                         ["트리당 잎 수", f"최대 {gb.max_leaf_nodes}"],
+                         ["잎당 최소 행", f"{gb.min_samples_leaf}"],
+                         ["L2 정칙화", f"{gb.l2_regularization:g}"],
+                         ["조기 종료", (f"학습 행 안의 무작위 {gb.validation_fraction:.0%} 로 판단, "
+                                    f"{gb.n_iter_no_change}회 개선 없으면 멈춤 (예측 기간은 쓰지 않음)")
+                          if early else "사용 안 함"],
+                         ["학습 행", f"{n:,}"]],
+            "extrapolation": "트리는 학습 때 본 값 사이에서만 분기합니다. 입력이 학습 범위를 넘으면 "
+                             "가장 바깥 구간의 값을 그대로 내므로 예측이 평평해집니다.",
+        }))
     except ImportError:
         pass
     return models
@@ -428,6 +456,100 @@ def _predict_nan(fn, X):
     if ok.any():
         out[ok] = fn(X[ok])
     return out
+
+
+def _segments(system) -> list[list[str]]:
+    """연결을 따라 계통 흐름을 끊지 않고 이어지는 구간들로 나눈다 (합류·분기에서 끊음)."""
+    succ: dict[str, list[str]] = {}
+    pred: dict[str, list[str]] = {}
+    for a, b in system.connections:
+        ca, pa = a.split(".", 1)
+        cb = b.split(".", 1)[0]
+        role = system.components[ca].port_specs()[pa].role
+        src, dst = (ca, cb) if role == "out" else (cb, ca)
+        succ.setdefault(src, []).append(dst)
+        pred.setdefault(dst, []).append(src)
+    names = list(system.components)
+    starts = [n for n in names if len(pred.get(n, [])) != 1
+              or len(succ.get(pred[n][0], [])) != 1]
+    starts.sort(key=lambda n: len(pred.get(n, [])) > 0)      # 발생원(들어오는 것 없음)부터
+    segs = []
+    for s0 in starts:
+        seg, cur = [s0], s0
+        while len(succ.get(cur, [])) == 1:
+            nxt = succ[cur][0]
+            seg.append(nxt)
+            if len(pred.get(nxt, [])) != 1 or nxt in starts:
+                break
+            cur = nxt
+        segs.append(seg)
+    return segs
+
+
+def explain_physics(system, model, cfg: EasyConfig, fitted_table: list[dict],
+                    rows: int, n_obs: int) -> dict:
+    """결과 화면용 물리모델 설명: 흐름, 컴포넌트별 지배방정식, 입력·예측값이 들어가는 식."""
+    from .lib.explain import KIND_NOTE, laws_of, title_of
+
+    fitted = {r["parameter"]: r for r in fitted_table}
+    segments = _segments(system)
+    order = list(dict.fromkeys([n for seg in segments for n in seg] + list(system.components)))
+    groups: dict[str, dict] = {}
+    where: dict[str, str] = {}                      # 인스턴스 -> 그룹 키 (흐름 순서)
+    for name in order:
+        comp = system.components[name]
+        key = type(comp).__name__ if getattr(type(comp), "LAWS", None) else f"decl:{name}"
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"title": title_of(comp), "instances": [], "fitted": [],
+                               "laws": [{"kind": law.kind, "title": law.title, "formula": law.formula,
+                                         "params": list(law.params)} for law in laws_of(comp)]}
+        g["instances"].append(name)
+        where[name] = key
+    for full, r in fitted.items():
+        inst, short = full.split(".", 1)
+        if inst in where:
+            groups[where[inst]]["fitted"].append({**r, "instance": inst, "param": short})
+
+    def laws_with(full: str) -> list[str]:
+        inst, short = full.split(".", 1)
+        g = groups.get(where.get(inst, ""))
+        return [law["title"] for law in g["laws"] if short in law["params"]] if g else []
+
+    inputs = []
+    for col in cfg.features:
+        m = cfg.feature_map.get(col)
+        if not (m and m.targets):
+            continue
+        uses = []
+        for full in m.targets:
+            inst = full.split(".", 1)[0]
+            uses.append({"target": full, "component": groups[where[inst]]["title"] if inst in where else "",
+                         "laws": laws_with(full)})
+        inputs.append({"column": col, "scale": m.scale, "unit": m.unit, "uses": uses})
+
+    y_var = cfg.target_map.targets[0] if cfg.target_map and cfg.target_map.targets else None
+    obs_desc = declared_observables(model)
+    return {
+        "counts": {"equations": len(model.equations), "unknowns": int(model.n_vars),
+                   "components": len(system.components)},
+        "segments": segments,
+        "groups": list(groups.values()),
+        "inputs": inputs,
+        "target": {"column": cfg.target, "variable": y_var,
+                   "desc": obs_desc.get(y_var, "") if y_var else "",
+                   "component": groups[where[y_var.split(".")[0]]]["title"]
+                   if y_var and y_var.split(".")[0] in where else ""},
+        "kinds": KIND_NOTE,
+        "connection": "연결점에서는 압력이 같고, 질량유량의 합이 0 이며, 온도·조성이 그대로 전달됩니다.",
+        "solve": (f"예측 행마다(5분 간격이면 5분마다) 방정식 {len(model.equations)}개를 연립해 정상상태를 "
+                  "풉니다. 구조 해석(BLT)으로 작은 블록으로 나눈 뒤 블록별 뉴턴법을 쓰고, 직전 행의 해에서 "
+                  "출발합니다. 과거 데이터를 보고 답을 고르는 것이 아니라 그 시점의 입력으로 식을 풉니다."),
+        "calibrate": (f"보정은 학습 기간에서 고른 {rows}개 행(1시간 평균, 드문 운전상태 포함)과 관측 "
+                      f"{n_obs}개로 합니다. 목적함수는 (예측 − 실측)/계측 불확도의 제곱합이고, 설계값 쪽으로 "
+                      "약하게 당기는 항(가중 0.05)을 더합니다. 파라미터는 설계값의 0.2~5배 안에서만 움직입니다. "
+                      "보정하는 것은 구성방정식의 물리 계수뿐이고, 보존법칙은 건드리지 않습니다."),
+    }
 
 
 def run_easy(cfg: EasyConfig, root: str | Path = ".",
@@ -494,6 +616,7 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
     preds: dict[str, tuple[np.ndarray, np.ndarray]] = {}    # 이름 -> (학습 표본, 예측 전체)
     kinds: dict[str, str] = {}
     cal_payload = None
+    physics_explain = None
     physics_failed = 0
     band = None
     notes: list[str] = []
@@ -528,6 +651,8 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
                        "rel_stderr_pct": _f(r["rel_stderr_%"])} for _, r in t.iterrows()],
             "warnings": cal.identifiability_warnings(),
         }
+        physics_explain = explain_physics(system, model, cfg, cal_payload["table"], rows=cal.n_rows,
+                                          n_obs=len(model_obs))
         if cfg.band:
             say("상태 변동 폭 계산 중 (학습 기간을 네 토막으로 다시 보정)")
             from .calib.design import parameter_drift, state_band
@@ -561,10 +686,14 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
 
     say("ML(다항·부스팅) 학습 중")
     Xtr = train[x_cols].to_numpy(dtype=float)
-    for name, kind, fn in _ml_models(Xtr, train[y_col].to_numpy(dtype=float)):
+    ml_explain = []
+    for name, kind, fn, info in _ml_models(Xtr, train[y_col].to_numpy(dtype=float)):
         preds[name] = (to_disp(_predict_nan(fn, tr_sub[x_cols].to_numpy(dtype=float))),
                        to_disp(_predict_nan(fn, test[x_cols].to_numpy(dtype=float))))
         kinds[name] = kind
+        ml_explain.append({"name": name, "kind": kind, **info,
+                           "inputs": [x_tag[c] for c in x_cols],
+                           "frozen": [c for c in frozen]})
 
     # 4) 채점
     say("채점·정리 중")
@@ -615,6 +744,7 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
                   "train_start": str(train.index.min()), "train_end": str(train.index.max()),
                   "test_start": str(test.index.min()), "test_end": str(test.index.max())},
         "models": models, "series": series, "calibration": cal_payload,
+        "explain": {"physics": physics_explain, "ml": ml_explain},
         "physics_failed": physics_failed, "band": band, "notes": notes,
         "data_log": report.lines() if report is not None else [],
         "headline": headline, "limit": cfg.limit,

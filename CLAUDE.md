@@ -39,6 +39,8 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
 * 방정식 개수: `포트수 x 3 + 내부변수수`. 경계 컴포넌트만 이 규칙에서 벗어난다.
 * 차원이 있는 상수는 `S.const(9.80665, ACCEL)` 처럼 차원을 명시한다. 맨 숫자는 무차원이다.
 * `abs()` / `x**0.5` 대신 `S.smooth_abs()` / `S.signed_pow()` 를 쓴다. 뉴턴법이 깨진다.
+* 사람이 읽는 식은 `LAWS` 로 적는다 (`lib/explain.py`). 잔차식을 고치면 `LAWS` 도 고친다.
+  보정 파라미터는 **구성방정식에만** 나와야 한다 — `tests/test_explain.py` 가 검사한다.
 * `VarSpec` 의 경계는 "물리적으로 불가능한 영역"만 막는다. 참 해가 경계에 걸리면 수렴에
   실패한다 (건조 산소 몰분율 상한을 0.209 로 걸었다가 실제 값 0.2153 에서 실패한 적 있다).
 
@@ -138,7 +140,8 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
 * 모델을 바꾸면 KPI·관리기준·스윕 선택을 **전부 초기화**한다. 남기면 이전 계통의
   기준이 엉뚱하게 따라붙는다.
 * `h()` 헬퍼에 `{html:...}` 를 자식 자리로 넘기지 말 것 (속성 자리다). 지금은
-  TypeError 를 던지지만 원래는 `[object Object]` 가 화면에 찍혔다.
+  TypeError 를 던지지만 원래는 `[object Object]` 가 화면에 찍혔다. 자식 배열은 **한 단계만**
+  펼친다 — `map` 이 배열을 돌려주면 `flatMap` 을 쓴다 (모델 설명 카드가 이걸로 통째로 안 떴다).
 * 간편 예측(`easy.py`, `static/easy.js`)의 기간 규칙은 **화면과 서버 둘 다** 건다. 화면은
   예측 시작을 학습 끝 + 1일 + 간격 뒤로 밀고, 서버(`period_errors`)는 어긋나면 400 으로
   거절한다. 날짜는 양끝 포함(끝 날짜는 그날 24시까지).
