@@ -132,6 +132,25 @@ class System:
         for c in comps:
             self.add(c)
 
+    def replace(self, name: str, comp: Component) -> Component:
+        """같은 이름의 컴포넌트를 교체한다. 포트 이름이 같아야 연결이 유지된다.
+
+        구성방정식 후보를 바꿔 끼울 때 쓴다.
+        """
+        old = self.components.get(name)
+        if old is None:
+            raise ModelError(f"교체할 컴포넌트 {name!r} 가 없습니다. "
+                             f"가능: {sorted(self.components)}")
+        if comp.name != name:
+            raise ModelError(f"교체 컴포넌트의 이름이 다릅니다: {comp.name!r} != {name!r}")
+        missing = set(old.port_specs()) - set(comp.port_specs())
+        if missing:
+            raise ModelError(
+                f"{name} 교체 실패: 새 컴포넌트에 포트 {sorted(missing)} 가 없습니다. "
+                "연결이 끊어집니다.")
+        self.components[name] = comp
+        return comp
+
     def connect(self, a: str, b: str) -> None:
         """``connect("SRC1.outlet", "DUCT1.inlet")`` 형태로 포트를 잇는다."""
         self.connections.append((a, b))
@@ -232,8 +251,13 @@ class System:
                 comp_eqs = comp.equations(sc)
             except Exception as exc:  # 모델 작성 실수를 컴포넌트 이름과 함께 보여준다
                 raise ModelError(f"{cname}({type(comp).__name__}) 방정식 생성 실패: {exc}") from exc
+            labels = comp.equation_labels()
+            if labels is not None and len(labels) != len(comp_eqs):
+                raise ModelError(
+                    f"{cname}: 방정식 {len(comp_eqs)}개인데 이름은 {len(labels)}개입니다")
             for k, e in enumerate(comp_eqs):
-                push(e, cname, f"{cname} eq[{k}]")
+                name = labels[k] if labels is not None else f"eq[{k}]"
+                push(e, cname, f"{cname}.{name}")
 
         # 연결 방정식
         used: dict[str, str] = {}
@@ -321,7 +345,21 @@ class System:
 
 def _build_compiled(system: System, eqs: list[EquationInfo], scopes: dict[str, Scope],
                     estimates: dict[str, float] | None = None) -> "CompiledModel":
-    syms = S.collect_syms([e.expr for e in eqs])
+    outputs: dict[str, tuple[S.Expr, str]] = {}
+    for cname, comp in system.components.items():
+        for oname, (expr, unit) in comp.outputs(scopes[cname]).items():
+            outputs[f"{cname}.{oname}"] = (expr, unit)
+
+    # 출력식에만 등장하는 심볼도 잡아야 한다. 방정식에는 안 쓰이지만 리포트에는
+    # 쓰이는 기준값(정격용량 등)이 흔하다.
+    syms = S.collect_syms([e.expr for e in eqs] + [ex for ex, _ in outputs.values()])
+    eq_var_syms = {s.uid for s in S.collect_syms([e.expr for e in eqs]) if s.kind == "var"}
+    orphan = [s.name for s in syms
+              if s.kind == "var" and s.uid not in eq_var_syms]
+    if orphan:
+        raise ModelError(
+            "출력식이 어떤 방정식에도 없는 미지수를 참조합니다: " + ", ".join(sorted(orphan))
+            + "\n  출력은 방정식으로 결정된 값만 쓸 수 있습니다.")
     var_syms = [s for s in syms if s.kind == "var"]
     par_syms = [s for s in syms if s.kind == "par"]
     der_syms = [s for s in syms if s.kind == "der"]
@@ -381,11 +419,6 @@ def _build_compiled(system: System, eqs: list[EquationInfo], scopes: dict[str, S
         incidence.append(idx)
 
     report = analyze(incidence, len(var_syms))
-
-    outputs: dict[str, tuple[S.Expr, str]] = {}
-    for cname, comp in system.components.items():
-        for oname, (expr, unit) in comp.outputs(scopes[cname]).items():
-            outputs[f"{cname}.{oname}"] = (expr, unit)
 
     return CompiledModel(
         system=system, equations=eqs, variables=variables, parameters=parameters,

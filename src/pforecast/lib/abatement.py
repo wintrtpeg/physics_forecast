@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from ..core import symbolic as S
 from ..core.component import ParamSpec, PortSpec, Scope, VarSpec
-from .flow import GasComponent, _MIN_MDOT
+from .closures import EMISSION, SCRUBBER_ETA, ClosureMixin, SlotLaw, pressure_slot
+from .explain import BOUNDARY, CLOSURE, CONSERVATION, STATE, Law
+from .flow import LAW_DENSITY, GasComponent, _MIN_MDOT
 from .gas import (
     CP_WATER_LIQ, G_ACCEL, MOLAR_MASS, P_NORMAL, R_UNIVERSAL, T_NORMAL, T_REF,
     FLUE_GAS, GasMedium, density, enthalpy, gas_port, humidity_from_rh,
@@ -26,7 +28,7 @@ _D_MOLAR = (0, 1, 0, 0, -1, 0, 0)
 _D_RHO = (-3, 1, 0, 0, 0, 0, 0)
 
 
-class ToolGroupSource(GasComponent):
+class ToolGroupSource(ClosureMixin, GasComponent):
     """동일 공정 장비군의 배기 발생원 (경계 컴포넌트).
 
     **압력 구동 모델이다.** 유량을 상수로 고정하지 않는다. 각 장비의 후드/댐퍼를
@@ -52,8 +54,6 @@ class ToolGroupSource(GasComponent):
         "q_tool": ParamSpec(200.0, "Nm3/h", "설계 흡입압에서의 대당 배기 풍량", lo=0.0, hi=1e5, tunable=True),
         "dp_design": ParamSpec(150.0, "mmAq", "후드 설계 흡입압", lo=1.0, hi=1e4, tunable=True),
         "idle_frac": ParamSpec(0.35, "1", "대기 장비의 댐퍼 개도 비율", lo=0.0, hi=1.0),
-        "ef_idle": ParamSpec(0.5, "mg/s", "대당 대기 시 NOx 발생량", lo=0.0, hi=1e4, tunable=True),
-        "ef_process": ParamSpec(5.0, "mg/s", "대당 가동 시 추가 NOx 발생량", lo=0.0, hi=1e4, tunable=True),
         "T_exh": ParamSpec(45.0, "degC", "배기 온도"),
         "rh_exh": ParamSpec(0.45, "1", "배기 상대습도", lo=0.0, hi=1.0),
         "w_O2": ParamSpec(0.2314, "1", "배기 산소 질량분율 (건조 기준)", lo=0.0, hi=0.3),
@@ -63,6 +63,19 @@ class ToolGroupSource(GasComponent):
     VARS = {
         "rho": VarSpec("kg/m3", start=1.12, lo=0.05, hi=10.0),
     }
+    #: NOx 발생량 식은 후보 중에서 고른다 (배출계수 ef_idle, ef_process 는 후보가 가진다)
+    CLOSURES = (EMISSION,)
+    LAWS = (
+        LAW_DENSITY,
+        Law(CLOSURE, "후드 병렬 저항 (압력으로 유량이 정해짐)",
+            "`p_room` − p = `dp_design` · (`rho_ref`/ρ) · (ṁ / ṁ_{ref})^{2},   "
+            "ṁ_{ref} = n_{eff} · `q_tool` · ρ_{N},   "
+            "n_{eff} = `n_tools` · (`idle_frac` + (1 − `idle_frac`) · `util`)"),
+        Law(BOUNDARY, "배기 온도", "T = `T_exh`"),
+        SlotLaw("emission"),
+        Law(STATE, "배기 습분 (Magnus 포화수증기압)", "w_{H₂O} = f(`rh_exh`, `T_exh`, p)"),
+        Law(BOUNDARY, "배기 산소 (건조 공기 조성)", "w_{O₂} = `w_O2` · (1 − w_{H₂O})"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"outlet": gas_port(self.medium, "out")}
@@ -75,7 +88,7 @@ class ToolGroupSource(GasComponent):
                  / (S.const(R_UNIVERSAL, (2, 1, -2, -1, -1, 0, 0)) * S.const(T_NORMAL, _D_K)))
         n_eff = s.n_tools * (s.idle_frac + (S.const(1.0) - s.idle_frac) * s.util)
         m_ref = n_eff * s.q_tool * rho_n             # 설계 흡입압에서의 군 전체 유량
-        nox_rate = s.n_tools * (s.ef_idle + s.util * s.ef_process)
+        nox_rate = self.closure_expr("emission", s)
         return [
             s.rho - density(o, self.medium),
             # 병렬 후드 저항. n_eff=0 이면 m=0 으로 자연히 닫힌다.
@@ -93,7 +106,7 @@ class ToolGroupSource(GasComponent):
         return {
             "mdot": (-o.mdot, "kg/s"),
             "Q": (-o.mdot / s.rho, "CMM"),
-            "nox_rate": (s.n_tools * (s.ef_idle + s.util * s.ef_process), "g/h"),
+            "nox_rate": (self.closure_expr("emission", s), "g/h"),
             "n_active": (s.n_tools * s.util, "1"),
             "n_eff": (n_eff, "1"),
             "suction_mmAq": (o.p - s.p_room, "mmAq"),
@@ -110,13 +123,13 @@ class ToolGroupSource(GasComponent):
         rho_n = normal_density_num(w, self.medium)
         n_eff = n * (pv("idle_frac") + (1.0 - pv("idle_frac")) * util)
         mdot = max(n_eff * pv("q_tool") * rho_n, 1e-6)
-        w["NOx"] = n * (pv("ef_idle") + util * pv("ef_process")) / mdot
+        w["NOx"] = self.closure_value("emission") / mdot
         state = {"mdot": mdot, "T": T, **{f"w_{k}": v for k, v in w.items()}}
         rho = density_num(101325.0, T, w, self.medium)
         return {"ports": {"outlet": state}, "vars": {"rho": rho}}
 
 
-class WetScrubber(GasComponent):
+class WetScrubber(ClosureMixin, GasComponent):
     """습식 스크러버 (충전탑 기준).
 
     제거효율은 물질전달 단위수(NTU)에서 온다.
@@ -131,11 +144,7 @@ class WetScrubber(GasComponent):
     """
 
     PARAMS = {
-        "eta_max": ParamSpec(0.55, "1", "도달 가능 최대 제거효율", lo=0.0, hi=1.0, tunable=True),
-        "ntu_a": ParamSpec(0.9, "1", "NTU 계수", lo=1e-4, hi=100.0, tunable=True),
-        "ntu_b": ParamSpec(0.55, "1", "NTU L/G 지수", lo=0.05, hi=2.0, tunable=True),
         "L": ParamSpec(0.9, "m3/min", "순환수 유량", lo=1e-6, hi=100.0),
-        "K": ParamSpec(3.0, "1/m4", "충전층 저항계수", lo=0.0, hi=1e6, tunable=True),
         "rh_out": ParamSpec(0.97, "1", "출구 상대습도", lo=0.5, hi=1.0, tunable=True),
         "T_water": ParamSpec(22.0, "degC", "순환수 온도"),
     }
@@ -146,6 +155,26 @@ class WetScrubber(GasComponent):
         "rho": VarSpec("kg/m3", start=1.13, lo=0.05, hi=10.0),
         "LG": VarSpec("1", start=1.5e-3, lo=1e-9, hi=1.0, desc="액가스비 (m3/m3)"),
     }
+    #: 제거효율과 충전층 압력손실은 후보 중에서 고른다
+    CLOSURES = (
+        SCRUBBER_ETA,
+        pressure_slot("dp", "충전층 압력손실",
+                      ParamSpec(3.0, "1/m4", "충전층 저항계수", lo=0.0, hi=1e6, tunable=True)),
+    )
+    LAWS = (
+        Law(CONSERVATION, "질량 보존 (증발수 포함)", "ṁ_{out} = ṁ_{in} + ṁ_{evap}"),
+        LAW_DENSITY,
+        Law(STATE, "액가스비", "L/G = `L` / (ṁ_{in} / ρ)"),
+        SlotLaw("eta"),
+        Law(CONSERVATION, "NOx 보존 (제거분만 빠짐)", "ṁ_{out} · w_{NOx,out} = ṁ_{in} · w_{NOx,in} · (1 − η)"),
+        Law(CONSERVATION, "수분·산소 보존",
+            "ṁ_{out} · w_{H₂O,out} = ṁ_{in} · w_{H₂O,in} + ṁ_{evap},   ṁ_{out} · w_{O₂,out} = ṁ_{in} · w_{O₂,in}"),
+        Law(CLOSURE, "출구 포화 (단열 가습)", "w_{H₂O,out} = f(`rh_out`, T_{out}, p)"),
+        Law(CONSERVATION, "에너지 보존 (증발 냉각)",
+            "ṁ_{in} · h_{in} + ṁ_{evap} · c_{w} · (`T_water` − 0 °C) = ṁ_{out} · h_{out}"),
+        Law(CONSERVATION, "운동량 (압력 강하)", "p_{in} − p_{out} = Δp"),
+        SlotLaw("dp"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"a": gas_port(self.medium, "in"), "b": gas_port(self.medium, "out")}
@@ -153,20 +182,19 @@ class WetScrubber(GasComponent):
     def equations(self, s: Scope) -> list[S.Expr]:
         a, b = s.port("a"), s.port("b")
         m_out = -b.mdot
-        ntu = s.ntu_a * s.LG ** s.ntu_b
         cp_w = S.const(CP_WATER_LIQ, (2, 0, -2, -1, 0, 0, 0))
         return [
             a.mdot + b.mdot + s.m_evap,
             s.rho - density(a, self.medium),
             s.LG * (a.mdot / s.rho) - s.L,
-            s.eta - s.eta_max * (S.const(1.0) - S.exp(-ntu)),
+            s.eta - self.closure_expr("eta", s, LG=s.LG, T=a.T),
             m_out * b.w("NOx") - a.mdot * a.w("NOx") * (S.const(1.0) - s.eta),
             m_out * b.w("H2O") - (a.mdot * a.w("H2O") + s.m_evap),
             m_out * b.w("O2") - a.mdot * a.w("O2"),
             b.w("H2O") - humidity_from_rh(s.rh_out, b.T, b.p, self.medium),
             (a.mdot * enthalpy(a, self.medium) + b.mdot * enthalpy(b, self.medium)
              + s.m_evap * cp_w * (s.T_water - S.const(T_REF, _D_K))),
-            s.dp - s.K * S.signed_pow(a.mdot, 2.0) / s.rho,
+            s.dp - self.closure_expr("dp", s, m=a.mdot, rho=s.rho),
             a.p - b.p - s.dp,
         ]
 
@@ -192,7 +220,7 @@ class WetScrubber(GasComponent):
         rho = density_num(101325.0, state["T"], w_in, self.medium)
         Q = state["mdot"] / rho
         LG = max(pv("L") / max(Q, 1e-9), 1e-9)
-        eta = pv("eta_max") * (1.0 - math.exp(-pv("ntu_a") * LG ** pv("ntu_b")))
+        eta = self.closure_value("eta", LG=LG, T=state["T"])
         # 단열 가습: 출구 온도를 습구온도 근처로 잡는다(초기값이므로 근사로 충분)
         T_out = 0.45 * state["T"] + 0.55 * pv("T_water")
         w_h2o_out = humidity_from_rh_num(pv("rh_out"), T_out, 101325.0, self.medium)
@@ -205,7 +233,7 @@ class WetScrubber(GasComponent):
         return {
             "ports": {"b": out},
             "vars": {"eta": eta, "LG": LG, "m_evap": max(m_evap, 1e-6), "rho": rho,
-                     "dp": pv("K") * state["mdot"] ** 2 / rho},
+                     "dp": self.closure_value("dp", m=state["mdot"], rho=rho)},
         }
 
 
@@ -240,6 +268,19 @@ class Stack(GasComponent):
         "y_O2_dry": VarSpec("1", start=0.208, lo=0.0, hi=0.30, desc="건조 기준 산소 몰분율"),
         "dp": VarSpec("Pa", start=100.0),
     }
+    LAWS = (
+        LAW_DENSITY,
+        Law(STATE, "표준상태(0 °C, 1 atm) 유량", "Q_{N} = ṁ / ρ_{N}"),
+        Law(STATE, "습식 기준 농도", "C_{wet} = ṁ · w_{NOx} / Q_{N}"),
+        Law(STATE, "수증기·산소 몰분율", "y_{H₂O} = w_{H₂O} · M_{mix} / M_{H₂O},   "
+            "y_{O₂,dry} · (1 − y_{H₂O}) = w_{O₂} · M_{mix} / M_{O₂}"),
+        Law(STATE, "건조 기준 환산 (TMS 비교값)", "C_{dry} = C_{wet} / (1 − y_{H₂O})"),
+        Law(STATE, "표준산소 보정 (o2_corr = 0 이면 건조 기준 농도와 같음)",
+            "C_{corr} = C_{dry} · (0.2095 − `o2_corr` · `O2_ref`) / (0.2095 − `o2_corr` · y_{O₂,dry})"),
+        Law(CLOSURE, "굴뚝 저항", "Δp = `K` · ṁ|ṁ| / ρ"),
+        Law(BOUNDARY, "대기 경계 + 통풍력", "p_{in} = `p_amb` + Δp − (ρ_{amb} − ρ) · g · `H`,   "
+            "ρ_{amb} = `p_amb` · M_{air} / (R · `T_amb`)"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"a": gas_port(self.medium, "in")}

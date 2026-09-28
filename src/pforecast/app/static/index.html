@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>pforecast — 물리모델 + ML 예측</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%232a78d6'/></svg>">
+</head>
+<body>
+
+<header>
+  <div class="brand"><span class="dot"></span>pforecast<small>물리모델 + ML 예측</small></div>
+  <nav id="nav">
+    <button data-screen="home" aria-current="true">시작</button>
+    <span class="nav-sep" aria-hidden="true"></span>
+    <button data-screen="ez-data"><span class="step">1</span>데이터</button>
+    <button data-screen="ez-vars" disabled><span class="step">2</span>변수</button>
+    <button data-screen="ez-period" disabled><span class="step">3</span>기간</button>
+    <button data-screen="ez-model" disabled><span class="step">4</span>모델·실행</button>
+    <button data-screen="ez-result" disabled><span class="step">5</span>검증 결과</button>
+    <button data-screen="ez-forecast" disabled><span class="step">6</span>미래 예측</button>
+    <span class="nav-sep" aria-hidden="true"></span>
+    <button data-screen="builder">모델 만들기</button>
+    <span class="nav-sep" aria-hidden="true"></span>
+    <span class="nav-label">고급</span>
+    <button data-screen="data" class="adv">분석(XAI)</button>
+    <button data-screen="analyze" class="adv" disabled>분석 결과</button>
+    <button data-screen="model" class="adv">모델 구조</button>
+    <button data-screen="scenario" class="adv" disabled>시나리오</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="projchip" id="proj-chip" hidden></div>
+  <button class="icon-btn" id="theme" title="라이트/다크 전환">◐</button>
+</header>
+
+<main>
+  <!-- ═══ 시작 ═══════════════════════════════════════════════════ -->
+  <section class="screen active" id="screen-home">
+    <h1>무엇을 할까요?</h1>
+    <p class="sub">계통이 무엇이든 순서는 같습니다 — <b>데이터</b>(CSV)와 <b>계통 모델</b>(지배방정식)을 연결하고, 과거로 <b>검증</b>한 뒤, 계획을 넣어 <b>미래를 예측</b>합니다.</p>
+    <div class="homecards" id="home-cards"></div>
+    <div class="card" id="home-recent">
+      <div class="card-head"><h3>최근 프로젝트</h3><span class="sub">설정·결과를 이름 붙여 저장해 둔 것 (작업 폴더의 <code>projects/</code>)</span></div>
+      <div id="home-projects"><span class="sub">불러오는 중…</span></div>
+    </div>
+    <details class="card fold" id="home-flow">
+      <summary><b>어떻게 동작하나요?</b><span class="sub"> 계통에 상관없이 같은 흐름</span></summary>
+      <ol class="howto">
+        <li><b>데이터</b> — 현장 CSV 한 파일. 인코딩·헤더·날짜 표기·상태 문자열은 알아서 정리하고 고친 내역을 보여줍니다.</li>
+        <li><b>변수</b> — 예측할 값(y) 하나와, 미리 알 수 있는 입력(x: 계획·설정값·예보).</li>
+        <li><b>기간</b> — 학습 기간과 그 <b>뒤</b>의 검증 기간. 학습 범위 밖 운전조건이 섞이도록 고르면 물리모델과 ML 의 차이가 드러납니다.</li>
+        <li><b>모델·실행</b> — 계통 모델을 고르고 CSV 컬럼을 모델 변수에 연결. 물리 파라미터를 보정하고 ML(다항·부스팅)과 같은 조건으로 비교합니다.</li>
+        <li><b>검증 결과</b> — 학습 때 없던 조건에서의 오차, 사용한 방정식·알고리즘 설명.</li>
+        <li><b>미래 예측</b> — 계획 CSV(또는 최근 패턴을 조정해 만든 계획)를 넣어 예측하고, 설비 상태 변동 폭과 관리기준 초과 시간을 봅니다.</li>
+      </ol>
+      <p class="sub">계통 모델이 없으면 <b>모델 만들기</b>에서 컴포넌트를 골라 연결하거나(코드 없음), ML 만으로 비교할 수 있습니다. 계통 구조(무엇이 무엇에 연결되는가)는 데이터에서 유도할 수 없어 사람이 정합니다.</p>
+    </details>
+  </section>
+
+  <!-- ═══ 간편 예측 1. 데이터 ═════════════════════════════════════ -->
+  <section class="screen" id="screen-ez-data">
+    <h1>1. 데이터 올리기</h1>
+    <p class="sub">CSV 파일 하나면 됩니다. 엑셀 저장본(CP949)·여러 줄 헤더·‘오후 3:05’ 날짜·Bad/Comm Fail 같은 문자열은 알아서 정리하고, 무엇을 고쳤는지 보여줍니다.</p>
+    <label class="dropzone" id="dropzone" tabindex="0">
+      <input type="file" id="file" accept=".csv,.txt,text/csv" hidden>
+      <div class="dz-icon" aria-hidden="true">⇪</div>
+      <div class="dz-title">CSV 파일을 여기로 끌어다 놓거나 <u>클릭해서 고르세요</u></div>
+      <div class="dz-sub">파일은 이 PC 의 작업 폴더(<code>uploads/</code>)에만 저장됩니다. 외부로 나가지 않습니다.</div>
+      <div class="dz-progress" hidden><div class="progress"><i></i></div><span></span></div>
+    </label>
+    <div class="card" id="ez-recent">
+      <div class="card-head"><h3>작업 폴더에 있는 CSV</h3><span class="sub">전에 올렸거나 예제로 들어 있는 파일</span></div>
+      <div class="chips" id="ez-datasets"><span class="sub">불러오는 중…</span></div>
+    </div>
+    <div id="ez-data-summary"></div>
+  </section>
+
+  <!-- ═══ 간편 예측 2. 변수 ═══════════════════════════════════════ -->
+  <section class="screen" id="screen-ez-vars">
+    <h1>2. 무엇을 예측할까요?</h1>
+    <p class="sub"><b>예측할 값(y)</b> 하나와, 그 값을 설명할 <b>입력(x)</b>을 고르세요. 이름을 누르면 시계열이 보입니다.</p>
+    <div class="note">
+      <b>입력(x)에는 예측하는 시점에 미리 알 수 있는 값만 넣으세요</b> — 생산계획(가동률·장비 대수), 설정값, 기상 예보 같은 것.
+      같은 시각에 측정되는 결과값(출구 유량·차압·온도 등)을 넣으면 ‘미래 예측’이 아니라 ‘현재값 추정’이 됩니다 (데이터 누수).
+    </div>
+    <div id="ez-vars-body"></div>
+  </section>
+
+  <!-- ═══ 간편 예측 3. 기간 ═══════════════════════════════════════ -->
+  <section class="screen" id="screen-ez-period">
+    <h1>3. 학습 기간과 예측 기간</h1>
+    <p class="sub">예측 기간은 반드시 학습이 끝난 <b>뒤</b>여야 합니다. 차트 위를 끌어서 고르거나 날짜를 입력하세요. 규칙에 어긋나는 선택은 자동으로 막습니다.</p>
+    <div id="ez-period-body"></div>
+  </section>
+
+  <!-- ═══ 간편 예측 4. 모델·실행 ══════════════════════════════════ -->
+  <section class="screen" id="screen-ez-model">
+    <h1>4. 모델 고르고 실행</h1>
+    <p class="sub">물리모델과 ML(다항식·그래디언트 부스팅)을 <b>같은 학습 데이터, 같은 입력</b>으로 학습해 예측 기간에서 비교합니다.</p>
+    <div id="ez-model-body"></div>
+  </section>
+
+  <!-- ═══ 간편 예측 5. 결과 ═══════════════════════════════════════ -->
+  <section class="screen" id="screen-ez-result">
+    <h1>5. 검증 결과</h1>
+    <p class="sub" id="ez-result-sub">과거의 예측 기간에서 물리모델과 ML 을 비교합니다.</p>
+    <div id="ez-result-body"><div class="card"><div class="empty">4단계에서 실행하세요.</div></div></div>
+  </section>
+
+  <!-- ═══ 6. 미래 예측 ═══════════════════════════════════════════ -->
+  <section class="screen" id="screen-ez-forecast">
+    <h1>6. 미래 예측</h1>
+    <p class="sub">정답이 없는 미래입니다. 계획(입력 x 의 앞으로 값)을 넣으면 과거 전체로 학습한 모델이 예측합니다. 채점 대신 <b>설비 상태 변동 폭</b>과 <b>학습 범위 밖 여부</b>를 같이 보여줍니다.</p>
+    <div id="ez-forecast-body"></div>
+  </section>
+
+  <!-- ═══ 모델 만들기 ═════════════════════════════════════════════ -->
+  <section class="screen" id="screen-builder">
+    <h1>모델 만들기</h1>
+    <p class="sub">컴포넌트를 고르고 출구 → 입구로 연결하면 계통 모델이 됩니다. 고칠 때마다 방정식·미지수 개수, 연결, 설계점 풀이를 자동으로 검사합니다. 저장하면 4단계에서 고를 수 있습니다.</p>
+    <div id="builder-body"></div>
+  </section>
+
+  <!-- ─── 고급: 데이터 분석 ─────────────────────────────────── -->
+  <section class="screen" id="screen-data">
+    <h1>데이터 주도 분석 (XAI)</h1>
+    <p class="sub">단위를 지정하면 차원 해석과 보존식 탐지가 열립니다. 태그 이름에서 자동 추론한 값을 확인·수정하세요.</p>
+    <div class="split">
+      <div>
+        <div class="card">
+          <div class="card-head"><h3>데이터셋</h3></div>
+          <div class="list" id="datasets"><div class="empty">불러오는 중…</div></div>
+        </div>
+      </div>
+      <div id="profile-pane">
+        <div class="card"><div class="empty">왼쪽에서 CSV 를 선택하세요.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="screen" id="screen-analyze">
+    <h1>데이터 주도 분석</h1>
+    <p class="sub">자동으로 갈 수 있는 데까지 올라가고, 어디서 왜 막혔는지 보여줍니다.</p>
+    <div id="analyze-body"><div class="card"><div class="empty">‘분석(XAI)’에서 분석을 실행하세요.</div></div></div>
+  </section>
+
+  <section class="screen" id="screen-model">
+    <h1>물리 모델 구조</h1>
+    <p class="sub">지배방정식으로 조립된 계통. 풀기 전에 구조부터 검사합니다.</p>
+    <div class="split">
+      <div class="card">
+        <div class="card-head"><h3>모델</h3></div>
+        <div class="list" id="models"><div class="empty">불러오는 중…</div></div>
+      </div>
+      <div id="model-pane"><div class="card"><div class="empty">왼쪽에서 모델을 선택하세요.</div></div></div>
+    </div>
+  </section>
+
+  <section class="screen" id="screen-scenario">
+    <h1>시나리오 <span class="badge good">실시간</span></h1>
+    <p class="sub">손잡이를 움직이면 지배방정식을 그 자리에서 다시 풉니다. 과거 데이터에 없던 조건도 답이 나옵니다.</p>
+    <div class="split-wide">
+      <div class="card">
+        <div class="card-head"><h3>운전 조건</h3><span class="sub" id="solve-stat"></span></div>
+        <div id="drivers"><div class="empty">모델을 먼저 선택하세요.</div></div>
+        <div class="actions"><button class="btn ghost sm" id="reset-drivers">설계값으로</button></div>
+      </div>
+      <div id="scenario-pane"><div class="card"><div class="empty">‘모델 구조’에서 모델을 선택하세요.</div></div></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+<script src="/static/easy.js"></script>
+<script src="/static/forecast.js"></script>
+<script src="/static/builder.js"></script>
+<script src="/static/home.js"></script>
+</body>
+</html>

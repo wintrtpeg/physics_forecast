@@ -12,8 +12,15 @@ from ..core.units import from_si
 
 
 def build_param_rows(model, inputs: pd.DataFrame, base_p: np.ndarray | None = None,
-                     expansion: dict[str, list[str]] | None = None) -> np.ndarray:
-    """입력 DataFrame(SI) 을 시점별 파라미터 배열로 펼친다."""
+                     expansion: dict[str, list[str]] | None = None, clip: bool = True,
+                     clip_report: dict[str, int] | None = None) -> np.ndarray:
+    """입력 DataFrame(SI) 을 시점별 파라미터 배열로 펼친다.
+
+    ``clip`` 이면 파라미터가 선언한 물리 범위 밖의 입력을 경계로 자른다. 현장 값은
+    범위를 넘는다 — 순환펌프가 서면 유량계는 정확히 0 을 찍는데, 물질전달식
+    ``NTU = a·(L/G)^b`` 는 L=0 에서 기울기가 발산해 뉴턴법이 죽는다. 경계(1e-6)로
+    자르면 '효율 0' 이라는 올바른 물리가 나온다. 몇 행을 잘랐는지는 ``clip_report`` 에 남는다.
+    """
     p0 = model.p0() if base_p is None else np.asarray(base_p, dtype=float)
     rows = np.tile(p0, (len(inputs), 1))
     exp = expansion or {}
@@ -22,13 +29,39 @@ def build_param_rows(model, inputs: pd.DataFrame, base_p: np.ndarray | None = No
         vals = inputs[col].to_numpy(dtype=float)
         for t in targets:
             try:
-                rows[:, model.par_index(t)] = vals
+                j = model.par_index(t)
             except KeyError:
                 raise KeyError(
                     f"입력 컬럼 {col!r} -> 파라미터 {t!r} 를 모델에서 찾을 수 없습니다. "
                     "태그맵의 target 을 확인하세요."
                 ) from None
+            v = vals
+            if clip:
+                info = model.parameters[j]
+                lo, hi = info.lo, info.hi
+                out = np.isfinite(v) & ((v < lo) | (v > hi))
+                if out.any():
+                    v = np.clip(v, lo, hi)
+                    if clip_report is not None and t == targets[0]:
+                        clip_report[col] = clip_report.get(col, 0) + int(out.sum())
+            rows[:, j] = v
     return rows
+
+
+def solve_with_fallback(model, p: np.ndarray, x_warm: np.ndarray):
+    """이전 시점의 해에서 풀고, 안 되면 모델 기본 출발점에서 한 번 더 푼다.
+
+    따뜻한 출발점이 독이 될 때가 있다. 순환펌프가 선 시점(액가스비 ≈ 0, 제거효율 0)의
+    해에서 펌프가 다시 돈 시점을 풀면 뉴턴법이 발산한다. 실패하면 출발점이 갱신되지 않으므로
+    그 뒤 모든 시점이 같은 나쁜 출발점에서 시작해 **연쇄적으로** 실패한다 — 현장형 데이터
+    한 벌(시드 5150)에서 검증 구간의 65% 가 이렇게 빠졌고, 빠진 행은 채점에서도 조용히
+    제외되어 성능이 좋아 보였다. 같은 행을 기본 출발점에서 풀면 바로 수렴한다.
+    """
+    r = solve_steady(model, p, x0=x_warm)
+    if r.success:
+        return r
+    r2 = solve_steady(model, p, x0=model.x0())
+    return r2 if r2.success else r
 
 
 def resolve_targets(model, names: list[str]) -> tuple[list[tuple[str, int]], list[str]]:
@@ -72,7 +105,7 @@ def simulate(model, p_rows: np.ndarray, targets: list[str], x0: np.ndarray | Non
     x = model.x0() if x0 is None else np.asarray(x0, dtype=float)
     total = 0
     for i, p in enumerate(p_rows):
-        r = solve_steady(model, p, x0=x)
+        r = solve_with_fallback(model, p, x)
         total += r.n_newton
         if r.success:
             x = r.x

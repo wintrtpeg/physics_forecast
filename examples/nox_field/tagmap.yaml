@@ -1,0 +1,71 @@
+# 현장형 더미 데이터(field_raw.csv) <-> nox_stack 물리모델 매핑
+#
+# 물리모델은 nox_stack 과 같다. 계통이 같으면 모델도 같다 - 데이터만 다르다.
+# nox_stack 태그맵과 다른 점은 순환수량(SCR.L)과 설치대수(n_tools)가 계측으로
+# 들어온다는 것. 증설과 순환수 증량이 학습 구간 밖에서 일어나므로 이 둘이 외삽의 핵심이다.
+
+timestamp:
+  column: 일시
+
+resample: 5min
+
+inputs:
+  - tag: F2_FAB_DRY_UTIL
+    target: SRC_DRY.util
+    unit: "%"
+    desc: 건식식각 가동률 (MES, 1시간 갱신)
+  - tag: F2_FAB_CVD_UTIL
+    target: SRC_CVD.util
+    unit: "%"
+  - tag: F2_FAB_WET_UTIL
+    target: SRC_WET.util
+    unit: "%"
+  - tag: F2_FAB_IMP_UTIL
+    target: SRC_IMP.util
+    unit: "%"
+  - tag: F2_FAB_DRY_EQP_CNT
+    target: SRC_DRY.n_tools
+    unit: "1"
+    desc: 건식식각 설치대수 (MES)
+  - tag: F2_UT_AMB_TEMP
+    target:
+      - STK.T_amb
+      - DCT_MAIN.T_amb
+      - DCT_DRY.T_amb
+      - DCT_CVD.T_amb
+      - DCT_WET.T_amb
+      - DCT_IMP.T_amb
+    unit: degC
+  - tag: F2_UT_SCR01_FAN_HZ
+    target: FAN.n_ratio
+    unit: "1"
+    scale: 0.0166666667      # 60Hz = 정격 1.0
+  - tag: F2_UT_SCR01_CIRC_FLOW
+    target: SCR.L
+    unit: m3/h
+
+observations:
+  - tag: F2_UT_STK01_NOX_DRY
+    target: STK.C_dry
+    unit: mg/Nm3
+    sigma: 3.0
+  - tag: F2_UT_STK01_FLOW
+    target: STK.Q_n
+    unit: Nm3/h
+    sigma: 250.0
+  - tag: F2_UT_STK01_TEMP
+    target: STK.T_stack
+    unit: degC
+    sigma: 0.5
+  - tag: F2_UT_SCR01_FAN_SP
+    target: FAN.dp_mmAq
+    unit: mmAq
+    sigma: 5.0
+  - tag: F2_UT_SCR01_DP
+    target: SCR.dp_mmAq
+    unit: mmAq
+    sigma: 3.0
+
+meta:
+  line: F2
+  system: SCR-01 (현장형 더미 데이터)

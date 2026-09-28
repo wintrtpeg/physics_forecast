@@ -1,0 +1,83 @@
+# 칠러 (카르노 효율형) — 재사용 가능한 선언형 컴포넌트 (examples/chiller_plant 에서 씀)
+# 모델에서: {type: equation, spec: lib:chiller_carnot, values: {파라미터: 값}}
+
+title: 칠러 (카르노 효율형)
+category: 열·냉동
+description: 원심식 칠러. COP 는 카르노 한계 x 효율로 둔다 (외삽이 성립한다).
+ports:
+  evap:
+    kind: thermal
+    role: in
+    T_start: 280.15
+    Q_start: 3.5e6
+  cond:
+    kind: thermal
+    role: out
+    T_start: 305.15
+    Q_start: 4.2e6
+  elec:
+    kind: power
+    role: out
+    P_start: 6.5e5
+params:
+  eta_carnot:
+    value: 0.58
+    unit: '1'
+    desc: 카르노 대비 효율
+    lo: 0.2
+    hi: 0.85
+    tunable: true
+  dT_evap:
+    value: 2.0
+    unit: K
+    desc: 증발기 접근온도차
+    lo: 0.2
+    hi: 8
+    tunable: true
+  dT_cond:
+    value: 3.0
+    unit: K
+    desc: 응축기 접근온도차
+    lo: 0.2
+    hi: 8
+    tunable: true
+vars:
+  W:
+    unit: W
+    start: 6.5e5
+    lo: 1.0
+    hi: 5.0e7
+    desc: 압축기 축동력
+  COP:
+    unit: '1'
+    start: 5.4
+    lo: 0.3
+    hi: 25.0
+    desc: 성적계수
+equations:
+  energy: evap.Q + W + cond.Q = 0
+  power: W * COP = evap.Q
+  cop: COP * ((cond.T + dT_cond) - (evap.T - dT_evap)) = eta_carnot * (evap.T - dT_evap)
+  elec: elec.P + W = 0
+outputs:
+  COP:
+    expr: COP
+    unit: '1'
+  power:
+    expr: W
+    unit: kW
+  Q_evap:
+    expr: evap.Q
+    unit: kW
+  Q_cond:
+    expr: -cond.Q
+    unit: kW
+  T_evap_ref:
+    expr: evap.T - dT_evap
+    unit: degC
+  T_cond_ref:
+    expr: cond.T + dT_cond
+    unit: degC
+  lift:
+    expr: (cond.T + dT_cond) - (evap.T - dT_evap)
+    unit: K

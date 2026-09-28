@@ -1,0 +1,31 @@
+# 냉방부하 (경계) — 재사용 가능한 선언형 컴포넌트 (examples/chiller_plant 에서 씀)
+# 모델에서: {type: equation, spec: lib:cooling_load, values: {파라미터: 값}}
+
+title: 냉방부하 (경계)
+category: 열·냉동
+description: 팹 냉방부하. 냉수 공급온도에서 열을 계통에 밀어 넣는다.
+ports:
+  out:
+    kind: thermal
+    role: out
+    T_start: 280.15
+    Q_start: 3.5e6
+params:
+  Q_load:
+    value: 3500.0
+    unit: kW
+    desc: 냉방부하
+  T_chws:
+    value: 7.0
+    unit: degC
+    desc: 냉수 공급온도 설정
+equations:
+  heat: out.Q + Q_load = 0
+  temperature: out.T = T_chws
+outputs:
+  Q_load:
+    expr: Q_load
+    unit: kW
+  RT:
+    expr: Q_load / 3516.85[W]
+    unit: '1'

@@ -1,0 +1,19 @@
+# 외기 열싱크 (경계) — 재사용 가능한 선언형 컴포넌트 (examples/chiller_plant 에서 씀)
+# 모델에서: {type: equation, spec: lib:thermal_ambient, values: {파라미터: 값}}
+
+title: 외기 열싱크 (경계)
+category: 열·냉동
+description: 외기. 습구온도가 계통의 최종 열싱크 온도다.
+ports:
+  a:
+    kind: thermal
+    role: in
+    T_start: 300.15
+    Q_start: 4.2e6
+params:
+  T_wb:
+    value: 27.0
+    unit: degC
+    desc: 외기 습구온도
+equations:
+  temperature: a.T = T_wb

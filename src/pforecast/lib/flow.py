@@ -8,12 +8,19 @@ from __future__ import annotations
 
 from ..core import symbolic as S
 from ..core.component import Component, ParamSpec, PortSpec, Scope, VarSpec
+from .closures import ClosureMixin, SlotLaw, pressure_slot
+from .explain import CLOSURE, CONSERVATION, STATE, Law
 from .gas import FLUE_GAS, G_ACCEL, GasMedium, density, enthalpy, gas_port, mixture_cp
 
 # 자주 쓰는 차원 리터럴
 _D_K = (0, 0, 0, 1, 0, 0, 0)
 _D_CP = (2, 0, -2, -1, 0, 0, 0)
 _MIN_MDOT = 1e-4  # kg/s, 0 유량에서 에너지식이 특이해지는 것을 막는 하한
+
+#: 여러 컴포넌트가 같이 쓰는 식 (사람이 읽는 형태, ``explain.py`` 참고)
+LAW_DENSITY = Law(STATE, "이상기체 밀도", "ρ = p · M_{mix} / (R · T)")
+LAW_SPECIES = Law(CONSERVATION, "화학종 전달 (반응 없음)", "w_{i,out} = w_{i,in}   (i = NOx, H₂O, O₂)")
+LAW_MASS = Law(CONSERVATION, "질량 보존", "ṁ_{out} = ṁ_{in}")
 
 
 class GasComponent(Component):
@@ -62,7 +69,7 @@ class GasComponent(Component):
         return {}
 
 
-class Duct(GasComponent):
+class Duct(ClosureMixin, GasComponent):
     """덕트 구간: 마찰 압력손실 + 주위로의 열손실.
 
     dp = K * mdot*|mdot| / rho  (K [1/m^4] 는 f*L/(2*D*A^2) 를 하나로 묶은 값)
@@ -70,7 +77,6 @@ class Duct(GasComponent):
     """
 
     PARAMS = {
-        "K": ParamSpec(0.5, "1/m4", "덕트 저항계수 f*L/(2*D*A^2)", lo=0.0, hi=1e5, tunable=True),
         "UA": ParamSpec(0.0, "W/K", "덕트 외벽 총괄 열전달", lo=0.0, hi=1e6, tunable=True),
         "T_amb": ParamSpec(25.0, "degC", "주위 온도"),
     }
@@ -78,6 +84,18 @@ class Duct(GasComponent):
         "dp": VarSpec("Pa", start=50.0, desc="압력손실"),
         "rho": VarSpec("kg/m3", start=1.15, lo=0.05, hi=10.0, desc="밀도"),
     }
+    CLOSURES = (pressure_slot("friction", "마찰 압력손실",
+                              ParamSpec(0.5, "1/m4", "덕트 저항계수 f*L/(2*D*A^2)", lo=0.0, hi=1e5,
+                                        tunable=True)),)
+    LAWS = (
+        LAW_MASS,
+        LAW_DENSITY,
+        Law(CONSERVATION, "운동량 (압력 강하)", "p_{in} − p_{out} = Δp"),
+        SlotLaw("friction"),
+        Law(CONSERVATION, "에너지 보존", "ṁ · c_{p} · (T_{out} − T_{in}) = −Q_{loss}"),
+        Law(CLOSURE, "외벽 열손실", "Q_{loss} = `UA` · ((T_{in} + T_{out})/2 − `T_amb`)"),
+        LAW_SPECIES,
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"a": gas_port(self.medium, "in"), "b": gas_port(self.medium, "out")}
@@ -91,7 +109,7 @@ class Duct(GasComponent):
         return [
             a.mdot + b.mdot,
             s.rho - density(a, self.medium),
-            s.dp - s.K * S.signed_pow(a.mdot, 2.0) / s.rho,
+            s.dp - self.closure_expr("friction", s, m=a.mdot, rho=s.rho),
             a.p - b.p - s.dp,
             b.T * (C + half_UA) - ((C - half_UA) * a.T + s.UA * s.T_amb),
             *self._species_transport(a, b),
@@ -108,7 +126,7 @@ class Duct(GasComponent):
         from .gas import density_num
         w = {sp: state.get(f"w_{sp}", 0.0) for sp in self.medium.species}
         rho = density_num(101325.0, state["T"], w, self.medium)
-        return {"rho": rho, "dp": self.param_value("K") * state["mdot"] ** 2 / rho}
+        return {"rho": rho, "dp": self.closure_value("friction", m=state["mdot"], rho=rho)}
 
 
 class Fan(GasComponent):
@@ -132,6 +150,17 @@ class Fan(GasComponent):
         "Q": VarSpec("m3/s", start=10.0, lo=1e-4, hi=1e4, desc="흡입 체적유량"),
         "rho": VarSpec("kg/m3", start=1.15, lo=0.05, hi=10.0),
     }
+    LAWS = (
+        LAW_MASS,
+        LAW_DENSITY,
+        Law(STATE, "체적유량", "Q = ṁ / ρ"),
+        Law(CLOSURE, "성능곡선 + 상사법칙",
+            "p_{out} − p_{in} = Δp,   Δp = `n_ratio`^{2} · (`c0` + `c1` · Q/`n_ratio` "
+            "+ `c2` · (Q/`n_ratio`)^{2}) · ρ / `rho_ref`"),
+        Law(CONSERVATION, "에너지 보존 (압축 온도상승)", "ṁ · c_{p} · (T_{out} − T_{in}) = W_{shaft}"),
+        Law(CLOSURE, "송풍기 효율", "W_{shaft} = Δp · Q / `eta`"),
+        LAW_SPECIES,
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         return {"a": gas_port(self.medium, "in"), "b": gas_port(self.medium, "out")}
@@ -182,6 +211,12 @@ class Mixer(GasComponent):
         super().__init__(name, medium=medium, **params)
 
     PARAMS: dict[str, ParamSpec] = {}
+    LAWS = (
+        Law(CLOSURE, "등압 합류 (헤더 손실은 상류 덕트가 가짐)", "p_{in,k} = p_{out}"),
+        Law(CONSERVATION, "질량 보존", "Σ_{k} ṁ_{in,k} = ṁ_{out}"),
+        Law(CONSERVATION, "에너지 보존", "Σ_{k} ṁ_{in,k} · h_{in,k} = ṁ_{out} · h_{out}"),
+        Law(CONSERVATION, "화학종 보존", "Σ_{k} ṁ_{in,k} · w_{i,in,k} = ṁ_{out} · w_{i,out}"),
+    )
 
     def port_specs(self) -> dict[str, PortSpec]:
         specs = {f"in{i+1}": gas_port(self.medium, "in") for i in range(self.n_inlets)}

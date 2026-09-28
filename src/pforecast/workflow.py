@@ -15,9 +15,12 @@ import pandas as pd
 import yaml
 
 from .calib import CalibrationSpec, PolyRidgeBaseline, build_param_rows, calibrate, simulate
+from .calib.design import select_rows
+from .calib.diagnostics import residual_changepoints
 from .calib.estimator import _metrics
 from .core.units import from_si
-from .data import TagMap, read_csv
+from .data import TagMap, read_csv_report
+from .data.split import check_split
 from .params import apply_params, save_params
 from .scenario import load_model
 
@@ -40,6 +43,12 @@ class WorkflowConfig:
     params_in: str | None = None
     params_out: str | None = None
     report_out: str | None = None
+    clean: bool = True                 # 값 이상(교정 창·고착·스파이크)을 결측으로
+    loss: str = "linear"               # 보정 손실: linear | soft_l1 | huber
+    f_scale: float = 3.0
+    #: 보정 행 선택: space_filling (1시간 평균 + 드문 운전상태 포함) | stride (시간 균등)
+    sampling: str = "space_filling"
+    diagnose: bool = True              # 잔차 변화점 진단
 
     @classmethod
     def load(cls, path: str | Path) -> "WorkflowConfig":
@@ -76,6 +85,11 @@ class WorkflowConfig:
             params_in=rel(d.get("params_in")),
             params_out=rel(d.get("params_out")),
             report_out=rel(d.get("report")),
+            clean=bool(data.get("clean", True)),
+            loss=str(cal.get("loss", "linear")),
+            f_scale=float(cal.get("f_scale", 3.0)),
+            sampling=str(cal.get("sampling", "space_filling")),
+            diagnose=bool(d.get("diagnose", True)),
         )
 
 
@@ -94,19 +108,42 @@ class WorkflowResult:
     baseline_test: np.ndarray | None = None
     baseline_train: np.ndarray | None = None
     comparison: pd.DataFrame | None = None
+    data_report: object = None                 # DataReport (파일 정리 + 값 정제 내역)
+    changepoints: list = field(default_factory=list)   # 잔차 변화점
+    clipped: dict = field(default_factory=dict)        # 물리 범위 밖이라 자른 입력
+    split: object = None                       # SplitCheck — 미래인가, 외삽인가
+    #: 추가 ML 기준모델 {이름: (학습 예측, 검증 예측)} — 같은 입력·같은 학습 구간
+    extra_baselines: dict = field(default_factory=dict)
+    #: 물리모델이 수렴하지 못한 검증 행 수 (비교표에서 빠지므로 반드시 따로 보고한다)
+    physics_failed: int = 0
 
 
-def load_dataset(cfg: WorkflowConfig):
+def _split_masks(cfg: WorkflowConfig, frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    tr = (frame.index.isin(frame.query(cfg.train_query).index) if cfg.train_query
+          else np.ones(len(frame), dtype=bool))
+    te = (frame.index.isin(frame.query(cfg.test_query).index) if cfg.test_query
+          else np.ones(len(frame), dtype=bool))
+    te = te & ~tr
+    return {"학습": tr, "검증": te, "기타": ~(tr | te)}
+
+
+def load_dataset(cfg: WorkflowConfig, return_report: bool = False):
     tm = TagMap.load(cfg.tagmap)
-    inputs, obs = read_csv(cfg.csv, tm)
-    df = inputs.join(obs, how="inner").dropna()
+    # 분할을 정제 전에 정하고, 값 이상 진단은 분할마다 따로 한다 (누수 방지)
+    inputs, obs, report = read_csv_report(cfg.csv, tm, clean=cfg.clean,
+                                          split=lambda f: _split_masks(cfg, f))
+    df = inputs.join(obs, how="inner")
+    # 입력은 전부 있어야 모델을 풀 수 있다. 관측은 하나라도 있으면 남긴다.
+    df = df[df[list(inputs.columns)].notna().all(axis=1) & df[list(obs.columns)].notna().any(axis=1)]
     train = df.query(cfg.train_query) if cfg.train_query else df
     test = df.query(cfg.test_query) if cfg.test_query else df
-    return tm, df, train, test, list(inputs.columns), list(obs.columns)
+    out = (tm, df, train, test, list(inputs.columns), list(obs.columns))
+    return out + (report,) if return_report else out
 
 
-def _predict(model, df, inputs_cols, obs_cols, expansion):
-    rows = build_param_rows(model, df[inputs_cols], base_p=model.p0(), expansion=expansion)
+def _predict(model, df, inputs_cols, obs_cols, expansion, clip_report=None):
+    rows = build_param_rows(model, df[inputs_cols], base_p=model.p0(), expansion=expansion,
+                            clip_report=clip_report)
     return simulate(model, rows, obs_cols, index=df.index)
 
 
@@ -118,31 +155,64 @@ def run_workflow(cfg: WorkflowConfig, verbose: bool = True) -> WorkflowResult:
     if cfg.params_in and Path(cfg.params_in).exists():
         apply_params(model, cfg.params_in)
 
-    tm, df, train, test, inputs_cols, obs_cols = load_dataset(cfg)
+    tm, df, train, test, inputs_cols, obs_cols, report = load_dataset(cfg, return_report=True)
     obs_cols = [c for c in (cfg.observations or obs_cols) if c in df.columns]
     expansion = tm.expansion()
 
+    split = check_split(train, test, inputs_cols)
     if verbose:
-        print(f"데이터 {len(df)}행 | 학습 {len(train)}행 | 검증 {len(test)}행")
+        print(f"데이터 {len(df)}행 | 학습 {len(train)}행 | 검증 {len(test)}행", flush=True)
+        for line in split.lines():
+            print("  ▶ " + line)
+        for w in split.warnings():
+            print("  !! " + w.replace("**", ""))
+        for line in report.lines():
+            print("  · " + line.replace("**", ""))
 
     res = WorkflowResult(model=model, tagmap=tm, train=train, test=test,
-                         inputs_cols=inputs_cols, obs_cols=obs_cols)
+                         inputs_cols=inputs_cols, obs_cols=obs_cols, data_report=report,
+                         split=split)
 
     if cfg.params:
         spec = CalibrationSpec(params=cfg.params, observations=obs_cols,
                                sigmas=tm.sigmas(), max_rows=cfg.max_rows,
-                               prior_weight=cfg.prior_weight)
+                               prior_weight=cfg.prior_weight, loss=cfg.loss,
+                               f_scale=cfg.f_scale)
         if verbose:
             print(f"보정 중: {len(cfg.params)}개 파라미터, 최대 {cfg.max_rows}행 ...")
-        res.calibration = calibrate(model, train[inputs_cols], train[obs_cols], spec,
+        rows = select_rows(train, cfg.max_rows, inputs_cols, obs_cols, method=cfg.sampling)
+        spec.max_rows = max(len(rows), 1)
+        res.calibration = calibrate(model, rows[inputs_cols], rows[obs_cols], spec,
                                     expansion=expansion, verbose=False)
         if cfg.params_out:
             save_params(model, cfg.params_out, cfg.params,
                         meta={"config": cfg.name, "train_rows": len(train),
                               "train_query": cfg.train_query})
 
-    res.physics_train = _predict(model, train, inputs_cols, obs_cols, expansion).values
-    res.physics_test = _predict(model, test, inputs_cols, obs_cols, expansion).values
+    if verbose:
+        print(f"물리모델 예측 중: 학습 {len(train)}행 + 검증 {len(test)}행 ...", flush=True)
+    res.physics_train = _predict(model, train, inputs_cols, obs_cols, expansion,
+                                 res.clipped).values
+    res.physics_test = _predict(model, test, inputs_cols, obs_cols, expansion,
+                                res.clipped).values
+    res.physics_failed = int(res.physics_test.isna().all(axis=1).sum())
+    if verbose and res.physics_failed:
+        print(f"  !! 물리모델이 검증 {len(test)}행 중 {res.physics_failed}행에서 수렴하지 못했습니다 "
+              f"({res.physics_failed / max(len(test), 1) * 100:.1f}%). 비교표는 푼 행만으로 계산됩니다.")
+
+    # 잔차에 남은 계단 = 모델이 모르는 변화 (센서 교체, 레시피, 오염/세정 ...)
+    if cfg.diagnose:
+        both = pd.concat([res.physics_train, res.physics_test])
+        both = both[~both.index.duplicated()].sort_index()
+        meas = df.loc[both.index, obs_cols]
+        units = {e.primary: e.unit for e in tm.observations}
+        resid = pd.DataFrame({c: [from_si(m, units.get(c, "1")) - from_si(q, units.get(c, "1"))
+                                  for m, q in zip(meas[c].to_numpy(), both[c].to_numpy())]
+                              for c in obs_cols}, index=both.index)
+        ins = df.loc[both.index, inputs_cols]
+        # 계측 불확도의 절반보다 작은 계단은 실무적으로 의미가 없다
+        floor = {e.primary: 0.5 * e.sigma for e in tm.observations if e.sigma}
+        res.changepoints = residual_changepoints(resid, ins, units, min_shift=floor)
 
     # 같은 학습 데이터로 학습한 데이터 기반 기준모델
     if cfg.baseline_target and cfg.baseline_features:
@@ -152,6 +222,19 @@ def run_workflow(cfg: WorkflowConfig, verbose: bool = True) -> WorkflowResult:
         res.baseline = bl
         res.baseline_train = bl.predict(train[feats].to_numpy())
         res.baseline_test = bl.predict(test[feats].to_numpy())
+        # 현업에서 가장 흔한 쪽(트리 앙상블)도 같이 둔다. 학습 범위 밖에서 예측이 평평해진다.
+        try:
+            from sklearn.ensemble import HistGradientBoostingRegressor
+            ok = np.all(np.isfinite(train[feats].to_numpy()), axis=1) & \
+                np.isfinite(train[cfg.baseline_target].to_numpy())
+            gb = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.08,
+                                               min_samples_leaf=20, l2_regularization=1.0,
+                                               random_state=0)
+            gb.fit(train[feats].to_numpy()[ok], train[cfg.baseline_target].to_numpy()[ok])
+            res.extra_baselines["ML 부스팅"] = (gb.predict(train[feats].to_numpy()),
+                                               gb.predict(test[feats].to_numpy()))
+        except ImportError:
+            pass
 
     res.comparison = _comparison_table(cfg, res)
     return res
@@ -171,9 +254,20 @@ def _comparison_table(cfg: WorkflowConfig, res: WorkflowResult) -> pd.DataFrame:
                      f"RMSE [{unit}]": m["rmse"], f"MAE [{unit}]": m["mae"],
                      f"편향 [{unit}]": m["bias"], "MAPE [%]": m["mape"], "R2": m["r2"]})
 
-    add("물리모델", "학습(보정)", res.physics_train[tgt], res.train[tgt])
-    add("물리모델", "검증(외삽)", res.physics_test[tgt], res.test[tgt])
+    out = res.split.outside if res.split is not None and res.split.outside is not None \
+        else np.zeros(len(res.test), dtype=bool)
+    preds = [("물리모델", res.physics_train[tgt].to_numpy(), res.physics_test[tgt].to_numpy())]
     if res.baseline is not None:
-        add("ML 기준모델", "학습(보정)", res.baseline_train, res.train[tgt])
-        add("ML 기준모델", "검증(외삽)", res.baseline_test, res.test[tgt])
+        preds.append(("ML 다항(2차)", res.baseline_train, res.baseline_test))
+    for name, (p_tr, p_te) in res.extra_baselines.items():
+        preds.append((name, p_tr, p_te))
+    meas_te = res.test[tgt].to_numpy()
+    for name, p_tr, p_te in preds:
+        add(name, "학습(보정)", p_tr, res.train[tgt].to_numpy())
+        add(name, "검증 전체", p_te, meas_te)
+        # 핵심 비교: 학습 운전영역 밖(외삽) 행만. 안쪽 행은 ML 도 근거가 있다.
+        if out.any():
+            add(name, "검증 · 외삽 행", np.where(out, p_te, np.nan), meas_te)
+        if (~out).any() and out.any():
+            add(name, "검증 · 내삽 행", np.where(~out, p_te, np.nan), meas_te)
     return pd.DataFrame(rows)

@@ -55,10 +55,19 @@ def load_yaml_model(path: str | Path) -> System:
 
     파라미터 값은 컴포넌트가 선언한 단위로 해석된다.
     """
-    from ..lib import REGISTRY
-
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    system = System(data.get("name", Path(path).stem))
+    return system_from_dict(data, base_dir=Path(path).parent, default_name=Path(path).stem)
+
+
+def system_from_dict(data: dict, base_dir: str | Path | None = None,
+                     default_name: str = "model") -> System:
+    """YAML 과 같은 모양의 dict 에서 시스템을 만든다 (모델 만들기 화면이 파일 없이 검사할 때).
+
+    ``type: equation`` 의 ``spec`` 은 ``lib:이름`` (패키지 라이브러리) 이거나 ``base_dir`` 기준 경로다.
+    """
+    from ..lib import REGISTRY, EquationComponent
+
+    system = System(data.get("name") or default_name)
     comps: dict[str, Any] = data.get("components") or {}
     for cname, cfg in comps.items():
         cfg = dict(cfg or {})
@@ -68,7 +77,18 @@ def load_yaml_model(path: str | Path) -> System:
         cls = REGISTRY.get(ctype)
         if cls is None:
             raise ModelError(f"알 수 없는 컴포넌트 타입 {ctype!r}. 가능: {sorted(REGISTRY)}")
-        system.add(cls(cname, **cfg))
+        if cls is EquationComponent and base_dir is not None:
+            cfg.setdefault("base_dir", base_dir)
+        try:
+            system.add(cls(cname, **cfg))
+        except (KeyError, ValueError, TypeError, FileNotFoundError) as exc:
+            raise ModelError(f"컴포넌트 {cname}({ctype}) 를 만들 수 없습니다: {exc}") from exc
+    # 앱이 쓰는 선언 (없으면 자동 추출로 떨어진다)
+    system.drivers = data.get("drivers") or []          # type: ignore[attr-defined]
+    system.limits = data.get("limits") or {}            # type: ignore[attr-defined]
+    # 간편 예측 화면이 쓰는 선언: 현장에서 재는 값, 보정 대상 파라미터
+    system.observables = data.get("observables") or {}  # type: ignore[attr-defined]
+    system.calibrate = data.get("calibrate") or []      # type: ignore[attr-defined]
     for conn in data.get("connections") or []:
         if isinstance(conn, (list, tuple)) and len(conn) == 2:
             system.connect(conn[0], conn[1])
@@ -80,13 +100,22 @@ def load_yaml_model(path: str | Path) -> System:
 
 
 def load_model(spec: dict | str | Path, **kwargs) -> System:
-    """시나리오 파일의 ``model:`` 항목을 해석한다."""
+    """시나리오 파일의 ``model:`` 항목을 해석한다.
+
+    ``closures: {SCR.eta: langmuir}`` 가 있으면 구성방정식 후보를 바꿔 끼운다
+    (앱의 후보 비교에서 사용자가 고른 것).
+    """
     if isinstance(spec, (str, Path)):
         p = Path(spec)
         return load_yaml_model(p) if p.suffix in (".yaml", ".yml") else load_python_model(p, **kwargs)
     if "yaml" in spec:
-        return load_yaml_model(spec["yaml"])
-    if "python" in spec:
-        return load_python_model(spec["python"], spec.get("builder", "build"),
-                                 **(spec.get("args") or {}))
-    raise ModelError("model 항목에는 python: 또는 yaml: 이 필요합니다")
+        system = load_yaml_model(spec["yaml"])
+    elif "python" in spec:
+        system = load_python_model(spec["python"], spec.get("builder", "build"),
+                                   **(spec.get("args") or {}))
+    else:
+        raise ModelError("model 항목에는 python: 또는 yaml: 이 필요합니다")
+    if spec.get("closures"):
+        from ..lib.closures import apply_closures
+        apply_closures(system, spec["closures"])
+    return system

@@ -118,6 +118,44 @@ VarSpec("1", start=0.4, lo=0.0, hi=0.9999)   # 효율은 1 을 넘을 수 없다
 미지수는 SI 단위입니다. 리포트에 mmAq, CMM, degC 로 나가려면 여기 등록합니다.
 방정식 개수에는 영향이 없습니다.
 
+### 8. 후보가 여럿인 구성방정식은 `CLOSURES` 슬롯으로
+
+제거효율·압력손실처럼 형태가 여럿인 경험식은 `ClosureMixin` 을 섞고 슬롯을 선언합니다.
+`equations()` 는 `self.closure_expr("eta", s, LG=s.LG)` 로 지금 고른 식을 꺼냅니다. 후보
+목록과 규칙은 [`closures.md`](closures.md). 슬롯이 있으면 앱이 데이터로 후보를 비교해
+추천하고 사용자가 고를 수 있습니다.
+
+```python
+class GasCooler(ClosureMixin, GasComponent):
+    CLOSURES = (pressure_slot("dp", "압력손실", ParamSpec(20.0, "1/m4", "저항계수", lo=0.0, tunable=True)),)
+    LAWS = (LAW_MASS, LAW_DENSITY, Law(CONSERVATION, "운동량", "p_{in} − p_{out} = Δp"), SlotLaw("dp"), ...)
+```
+
+### 9. `LAWS` 로 사람이 읽는 식을 적는다
+
+앱 결과 화면의 **모델 설명**은 잔차식이 아니라 이 목록을 보여줍니다. `equations()` 와
+같은 내용을 사람이 읽는 형태로, 종류(보존법칙·상태·정의·구성방정식·경계조건)와 함께
+적습니다. 파라미터는 백틱으로 감쌉니다 — 화면이 보정한 파라미터를 강조합니다.
+
+```python
+from pforecast.lib.explain import CLOSURE, CONSERVATION, STATE, Law
+from pforecast.lib.flow import LAW_DENSITY, LAW_MASS, LAW_SPECIES
+
+class GasCooler(GasComponent):
+    LAWS = (
+        LAW_MASS, LAW_DENSITY,
+        Law(CLOSURE, "압력손실", "p_{in} − p_{out} = Δp,   Δp = `K` · ṁ|ṁ| / ρ"),
+        Law(CLOSURE, "열전달 (NTU 유효도)", "Q = ṁ c_{p} · (1 − e^{−`UA`/(ṁ c_{p})}) · (T_{in} − `T_cool`)"),
+        Law(CONSERVATION, "에너지 보존", "ṁ c_{p} · (T_{in} − T_{out}) = Q"),
+        LAW_SPECIES,
+    )
+```
+
+`tests/test_explain.py` 가 두 가지를 검사합니다: 식에 적은 파라미터가 실제로 있는지,
+`tunable=True` 파라미터가 **구성방정식에만** 나오는지. 보정 계수가 들어간 에너지식은
+보존식과 구성식으로 나눠 적습니다 (덕트의 `UA`, 팬의 `eta` 참고). YAML 선언형
+컴포넌트는 적지 않아도 선언한 식이 그대로 나옵니다.
+
 ---
 
 ## 포트를 새로 정의하기 (다른 유체 계통)

@@ -8,6 +8,18 @@
 
 name: nox_stack_yaml
 
+# 앱 시나리오 화면의 운전 손잡이. 파이썬 모델의 DRIVERS 와 같은 역할이다.
+drivers:
+  - {key: util,    label: 가동율,        unit: "%",      lo: 20,  hi: 130}
+  - {key: n_tools, label: 장비 대수,      mode: scale,    lo: 0.5, hi: 2.0}
+  - {key: T_amb,   label: 외기온도,       unit: degC,     lo: -10, hi: 40}
+  - {key: n_ratio, label: 송풍기 회전수비, unit: "1",      lo: 0.7, hi: 1.15}
+  - {key: L,       label: 스크러버 순환수, unit: m3/min,   lo: 0.1, hi: 1.5}
+
+limits:
+  STK.C_dry:          {max: 100.0, label: 사내 관리기준}
+  SRC_DRY.q_per_tool: {min: 3.0,   label: 후드 포집 한계}
+
 components:
   SRC_DRY: {type: ToolGroupSource, n_tools: 24, util: 0.80, q_tool: 220, dp_design: 150,
             ef_idle: 0.55, ef_process: 7.00, T_exh: 52.0, rh_exh: 0.40}

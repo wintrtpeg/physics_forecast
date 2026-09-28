@@ -10,6 +10,8 @@ Historian 태그 이름은 ``FAB2_UT_SCR01_DRY_UTIL`` 처럼 생겼고, 모델�
 
 from __future__ import annotations
 
+import numpy as np
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -118,5 +120,20 @@ class TagMap:
         """대표 이름 -> 실제로 값을 써 넣을 파라미터 목록."""
         return {e.primary: e.targets for e in self.inputs}
 
-    def sigmas(self) -> dict[str, float]:
-        return {e.primary: (e.sigma_si if e.sigma_si is not None else 1.0) for e in self.observations}
+    def sigmas(self, frame=None, rel: float = 0.02) -> dict[str, float]:
+        """관측별 계측 불확도 (SI).
+
+        불확도를 적지 않은 관측은 예전처럼 1.0(SI) 이다. ``frame`` 을 주면 대신 **그 데이터
+        값 크기의 ``rel`` 배**를 쓴다 — mg/m3 관측과 Pa 관측을 같은 1.0 으로 나누면 보정이
+        큰 숫자 쪽만 맞춘다. 학습 구간 데이터만 넘길 것 (검증 값으로 가중치를 정하면 누수).
+        """
+        out = {}
+        for e in self.observations:
+            if e.sigma_si is not None:
+                out[e.primary] = e.sigma_si
+            elif frame is not None and e.primary in frame:
+                med = float(np.nanmedian(np.abs(frame[e.primary].to_numpy(dtype=float))))
+                out[e.primary] = rel * med if np.isfinite(med) and med > 0 else 1.0
+            else:
+                out[e.primary] = 1.0
+        return out
