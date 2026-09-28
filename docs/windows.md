@@ -56,9 +56,10 @@ python scripts/make_offline_bundle.py --python 3.12
 * GPU 패키지(torch 등)는 넣지 않습니다. 필요 없습니다.
 * 이 스크립트는 파이썬 3.11 이상에서 실행합니다 (묶음 대상 버전은 `--python` 으로 따로 정함).
 
-이 저장소에서 실제로 만들어 본 묶음(`--latest`, 파이썬 3.11 · win_amd64)은 wheels 22개
-(numpy, scipy, pandas, PyYAML, matplotlib, scikit-learn 과 그 의존성, pip·setuptools·wheel),
-zip 90 MB 였습니다.
+이 저장소에서 기본 설정(파이썬 3.11 · win_amd64, 이 PC 버전 고정)으로 실제로 만든 묶음은
+wheels 22개(numpy 2.4.6, scipy 1.17.1, pandas 3.0.5, PyYAML, matplotlib, scikit-learn 1.9.1 과
+그 의존성, pip·setuptools·wheel) + 소스 132개 파일, zip 90 MB 였습니다. 현장 데이터·업로드·
+프로젝트 파일은 0개 들어갔습니다.
 
 ## 5. 폴더 구조 — 무엇이 어디에 생기나
 
