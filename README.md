@@ -4,7 +4,12 @@
 파라미터를 보정한 뒤, 학습 데이터에 없던 조건까지 예측하는 범용 툴입니다.
 VS Code + 로컬 PC 에서 돌아가며, GPU 나 무거운 프레임워크가 필요 없습니다.
 
-첫 적용 대상은 **배기 스크러버 계통 → 옥상 굴뚝 NOx 농도** 입니다.
+첫 적용 대상은 **배기 스크러버 계통 → 옥상 굴뚝 NOx 농도** 이고, 같은 엔진·같은 화면으로
+냉수 플랜트(칠러·냉각탑)도 돌아갑니다. 앱의 흐름과 화면에는 특정 계통의 용어가 없고,
+계통 지식은 모델(컴포넌트)에만 있습니다.
+
+**윈도우 PC 에서는 `run_pforecast.bat` 더블클릭**으로 설치와 실행이 한 번에 됩니다 — 인터넷이
+막힌 PC 용 오프라인 묶음도 만들 수 있습니다 ([`docs/windows.md`](docs/windows.md)).
 
 ---
 
@@ -55,7 +60,8 @@ pf demo                                # CLI 전 과정 (구조검사 → 풀이
 `pf serve` 는 **표준 라이브러리만으로** 뜹니다. FastAPI 도 Streamlit 도 CDN 도
 쓰지 않아 잠긴 사내 PC 에서 외부 요청 0건으로 동작합니다.
 
-첫 화면은 **간편 예측** 5단계입니다.
+첫 화면은 **시작** 입니다 — ‘데이터로 예측 모델 만들기’ · ‘계통 모델 만들기·고치기’ ·
+‘운전 조건 바꿔 보기’와 최근 프로젝트. 간편 예측은 6단계입니다.
 
 1. **데이터** — CSV 를 끌어다 놓기 (이 PC 의 `uploads/` 에만 저장)
 2. **변수** — 예측할 값 y 하나, 입력 x 여러 개 (미리 아는 값만 — 결과값은 누수)
@@ -64,10 +70,19 @@ pf demo                                # CLI 전 과정 (구조검사 → 풀이
 4. **모델·실행** — 물리모델 + ML(다항·부스팅) 또는 ML 만. 컬럼 ↔ 모델 변수 연결, 단위 검사.
    구성방정식(제거효율·발생량·압력손실)은 코드가 데이터로 후보를 추려 추천하고 사용자가 고릅니다
    ([`docs/closures.md`](docs/closures.md))
-5. **결과** — 외삽 행 기준 RMSE, 시계열·산점도·막대, 비교 표, 보정 파라미터, 예측 CSV
+5. **검증 결과** — 외삽 행 기준 RMSE, 시계열·산점도·막대, 비교 표, 보정 파라미터, 예측 CSV
+6. **미래 예측** — 계획(입력의 앞으로 값)을 넣어 예측. 최근 패턴을 조정해 계획을 만들거나
+   CSV 로 올립니다. 설비 상태 변동 폭, 학습 범위 밖 표시, 관리기준 초과 예상 시간
+   ([`docs/forecast.md`](docs/forecast.md))
+
+실행할 때마다 설정과 결과가 **프로젝트**(`projects/`)로 저장되어 다시 열거나 CLI 로 돌릴 수
+있습니다. 계통 모델이 없으면 **모델 만들기**에서 컴포넌트를 골라 연결합니다 — 코드 없이,
+고칠 때마다 방정식 개수·연결·설계점 풀이를 검사합니다 ([`docs/builder.md`](docs/builder.md)).
 
 현장형 더미 데이터(8개월)를 올려 ‘앞 60% 학습’ 그대로 돌리면 예측 기간 외삽 행 RMSE 가
-물리모델 3.25 / ML 다항 11.79 / ML 부스팅 19.39 mg/Nm3 였습니다 (약 3분).
+물리모델 3.25 / ML 다항 11.79 / ML 부스팅 19.39 mg/Nm3 였습니다 (약 3분). 같은 기간의 실제
+입력만 계획 CSV 로 넣어 미래 예측 경로로 돌리면 1시간 평균 RMSE 가 2.83 / 11.03 / 18.37 이고,
+실측의 85% 가 물리모델의 설비 상태 변동 폭 안에 들었습니다.
 자세한 화면 설명은 [`docs/app.md`](docs/app.md).
 
 개별 명령:
@@ -82,6 +97,8 @@ pf run       examples/nox_stack/scenarios.yaml -o out/scenario.html   # what-if
 pf select    examples/nox_stack/selection.yaml    # 구성방정식 후보 비교 (YAML 후보)
 pf closures  examples/nox_field/calibration.yaml  # 구성방정식 후보 추천 (학습 구간만, 고르는 건 사람)
 pf analyze   examples/nox_stack/analysis.yaml     # 데이터 주도 분석 + XAI 대시보드
+pf project   list                                 # 앱에서 저장한 프로젝트
+pf forecast  <프로젝트> --plan plans/계획.csv      # 미래 예측 (계획 없이 --adjust 로 만들 수도)
 pf equations examples/nox_stack/system.yaml --dims # 조립된 방정식과 차원 확인
 
 # 현장형(지저분한) 더미 데이터로 스트레스 테스트
@@ -277,6 +294,11 @@ COP 를 카르노 한계 × 효율로 두어 **외삽이 성립**합니다. 실�
 답할 수 없습니다.
 
 포트 종류는 `gas` / `liquid` / `thermal` / `power` 가 기본 제공되고 추가할 수 있습니다.
+
+칠러·냉각탑·냉방부하·외기·배전반은 **재사용 라이브러리 컴포넌트**(`src/pforecast/lib/components/*.yaml`)
+이고, 모델은 `spec: "lib:cooling_tower"` 처럼 참조합니다. 참조로 바꾼 뒤에도 설계점 해가 이전과
+같았습니다. 라이브러리와 작업 폴더의 `components/*.yaml` 은 **모델 만들기** 화면의 목록에 그대로
+뜹니다 ([`docs/builder.md`](docs/builder.md)).
 
 ## 데이터만 있을 때 — `pf analyze`
 
@@ -486,5 +508,8 @@ src/pforecast/
 * [`docs/generalization.md`](docs/generalization.md) — 방정식 직접 선언, 후보 비교, LLM 의 자리
 * [`docs/data_driven.md`](docs/data_driven.md) — 타깃만 지정해서 어디까지 자동인가 (XAI)
 * [`docs/app.md`](docs/app.md) — 로컬 웹 앱 사용법과 API
+* [`docs/forecast.md`](docs/forecast.md) — 미래 예측 (계획, 설비 상태 변동 폭, 학습 범위 밖)
+* [`docs/builder.md`](docs/builder.md) — 모델 만들기 (코드 없이 계통 조립, 컴포넌트 라이브러리)
+* [`docs/windows.md`](docs/windows.md) — 윈도우 설치·실행, 오프라인 묶음
 * [`docs/field_test.md`](docs/field_test.md) — 현장형 더미 데이터 스트레스 테스트와 채점표
 * [`docs/improvement_log.md`](docs/improvement_log.md) — 물리모델 개선 이력 (채택·기각 전부)과 `pf improve`

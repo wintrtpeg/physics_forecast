@@ -15,10 +15,10 @@ python -m pforecast.cli check examples/nox_stack/model.py
 
 ```
 L6 app/            <- 로컬 웹 앱 (표준 라이브러리만. 프레임워크·CDN 금지)
-L5 cli.py / workflow.py
+L5 cli.py / workflow.py / easy.py / forecast.py / closure_advice.py / builder.py / project.py
 L4 scenario/ report/ selection.py analyze/
 L3 data/ calib/
-L2 lib/            <- 도메인(배기/열/유체) 지식은 여기까지만
+L2 lib/            <- 도메인(배기/열/유체) 지식은 여기까지만 (lib/components/*.yaml 포함)
 L1 core/system.py core/structural.py core/solvers.py
 L0 core/symbolic.py core/units.py core/component.py core/parser.py
 ```
@@ -164,6 +164,30 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
   크로스헤어가 x=0 에 늘 보였다.
 * YAML 1.1 은 `3.5e6` 을 **문자열**로 읽는다 (`3.5e+6` 이라야 실수). 선언형 컴포넌트는
   `_maybe_float` 로 방어한다.
+
+## 범용 흐름 — 시작·프로젝트·미래 예측·모델 만들기
+
+* 화면(app/static)에 **특정 계통의 용어를 넣지 않는다** (예시 문구 포함). 계통 지식은 모델
+  파일(컴포넌트)에만. 흐름은 어느 계통이든 데이터 → 변수 → 기간 → 모델·연결 → 검증 → 미래 예측.
+* 검증(`run_easy`)과 미래 예측(`forecast_easy`)은 **같은 보정 코드**(`easy._fit_physics`)를 쓴다.
+  한쪽만 고치면 검증한 모델과 예측하는 모델이 달라진다.
+* 미래 예측의 학습 과거는 **기본 전체**. 계획에는 y 가 없다 — 계획 변환은 태그맵의 **입력 항목만**
+  적용한다 (`load_frames` 를 쓰면 관측 태그가 없다는 경고가 찍힌다). 계획의 빈 값은 채우지 않는다.
+* 미래 구간은 채점하지 않는다. 대신 상태 변동 폭(`state_paths`) · 학습 범위 밖 · 초과 시간.
+  경로 검증은 “실제 입력만 계획으로 넣고 따로 둔 실측과 비교”로 한다 (`docs/forecast.md`).
+* `plans/` 의 CSV 는 학습 데이터 목록(`Workspace.datasets`)에 넣지 않는다.
+* 프로젝트 파일은 **화면이 서버에 보내는 본문 그대로**(`run`) + 화면 상태(`ui`). 앱·CLI 가 같은
+  파일을 읽는다. `projects/ plans/ models/` 는 커밋 차단 (태그·설계값).
+* 모델을 바꾸는 곳은 전부 `ezUseModel()` 을 거친다 (4단계 선택, 모델 만들기의 ‘이 모델로 예측하기’,
+  프로젝트 열기). 연결·파라미터·구성방정식 선택을 비운다.
+* 모델 만들기는 예제(`examples/`)를 덮어쓰지 않는다 — 사본으로 `models/` 에. 저장은 작업 폴더
+  안 `.yaml` 만.
+* JS 를 고치면 브라우저 점검 전에 `node --check` 를 돌린다 (괄호 하나로 시작 화면이 통째로 안 떴다).
+* 윈도우 `.bat` 은 **CRLF** (`.gitattributes`), 맨 앞에 `chcp 65001`. `%~dp0` 는 `\` 로 끝나서
+  `"%~dp0"` 가 인자 파싱에서 따옴표를 삼킨다 — `"%~dp0."` 로 넘긴다.
+* 오프라인 묶음(`scripts/make_offline_bundle.py`)은 **이 PC 에 깔린 버전으로 고정**해서 받는다
+  (테스트를 통과한 조합). 소스는 git 추적 파일만 — 현장 데이터가 섞이지 않게.
+* `run_pforecast.bat` 은 윈도우에서 직접 실행해 본 적이 없다. 윈도우에서 확인하면 이 줄을 고칠 것.
 
 ## 현장 데이터 수집 (data/ingest.py, data/quality.py)
 

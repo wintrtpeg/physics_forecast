@@ -131,6 +131,35 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+#: 패키지에 들어 있는 재사용 컴포넌트 (``spec: lib:이름``)
+LIBRARY_DIR = Path(__file__).parent / "components"
+
+
+def resolve_component_ref(ref: str | Path, base_dir: str | Path | None = None) -> Path:
+    """``lib:이름`` 은 패키지 라이브러리, 그 밖의 상대 경로는 ``base_dir`` (모델 파일 폴더) 기준."""
+    text = str(ref)
+    if text.startswith("lib:"):
+        path = LIBRARY_DIR / f"{text[4:]}.yaml"
+        if not path.exists():
+            names = sorted(p.stem for p in LIBRARY_DIR.glob("*.yaml"))
+            raise FileNotFoundError(f"라이브러리 컴포넌트 {text!r} 가 없습니다. 가능: {names}")
+        return path
+    path = Path(text)
+    if base_dir and not path.is_absolute():
+        path = Path(base_dir) / path
+    return path
+
+
+def library_components() -> list[dict]:
+    """패키지 라이브러리의 컴포넌트 목록 (모델 만들기 화면의 팔레트)."""
+    out = []
+    for p in sorted(LIBRARY_DIR.glob("*.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        out.append({"ref": f"lib:{p.stem}", "title": d.get("title", p.stem),
+                    "category": d.get("category", "기타"), "description": d.get("description", "")})
+    return out
+
+
 def load_component_spec(spec: str | Path | dict, base_dir: str | Path | None = None) -> dict:
     """``extends`` 를 따라가며 컴포넌트 사양을 합친다.
 
@@ -138,9 +167,7 @@ def load_component_spec(spec: str | Path | dict, base_dir: str | Path | None = N
     교체**할 수 있다. 구성방정식 후보 비교의 토대다.
     """
     if isinstance(spec, (str, Path)):
-        path = Path(spec)
-        if base_dir and not path.is_absolute():
-            path = Path(base_dir) / path
+        path = resolve_component_ref(spec, base_dir)
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         return load_component_spec(data, path.parent)
     data = dict(spec)
@@ -165,6 +192,8 @@ class EquationComponent(GasComponent):
         data.pop("type", None)
         self._lineage = data.pop("_lineage", [])
         self.description = data.pop("description", "")
+        self.title = data.pop("title", "")
+        self.category = data.pop("category", "")
 
         med = medium or MEDIA.get(str(data.pop("medium", "flue_gas")), FLUE_GAS)
 

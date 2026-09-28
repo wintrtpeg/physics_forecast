@@ -72,6 +72,8 @@ def laws_of(comp) -> list[Law]:
 
 def title_of(comp) -> str:
     """컴포넌트 종류의 한 줄 이름 (클래스 docstring 첫 줄 또는 YAML description)."""
+    if getattr(comp, "title", ""):
+        return comp.title
     text = getattr(comp, "description", "") or type(comp).__doc__ or type(comp).__name__
     first = text.strip().split("\n")[0]
     return first.split(". ")[0].split(":")[0].split(" (")[0].rstrip(". ")

@@ -25,3 +25,12 @@ examples/**/data/*
 examples/**/out/
 out/
 reports/
+
+# 앱에서 만든 작업물 — 태그 이름·설계값·계획이 들어가므로 커밋하지 않는다
+projects/
+plans/
+/models/
+# 윈도우 오프라인 설치 묶음
+wheels/
+offline/
+dist/

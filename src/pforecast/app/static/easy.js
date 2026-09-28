@@ -13,6 +13,8 @@ const EZ = {
   params: [], band: false, limit: '',
   closures: {}, advice: null, adviceKey: null, adviceRun: null,
   job: null, result: null, hidden: {},
+  fc: null,                      // 미래 예측 상태 (forecast.js)
+  project: null,                 // { name, path, savedAt } — 저장한 프로젝트
 };
 
 // ── 날짜 ────────────────────────────────────────────────────────────────
@@ -38,6 +40,15 @@ const colorOf = (kind, P) => ({ physics: P.physics, poly: P.poly, boost: P.boost
 function unlock(upto) {
   const order = ['ez-data', 'ez-vars', 'ez-period', 'ez-model', 'ez-result'];
   order.forEach((s, i) => enableTab(s, i <= order.indexOf(upto)));
+  // 미래 예측은 모델·연결까지 정하면 열린다 (검증 결과를 먼저 보기를 권하지만 막지는 않는다)
+  enableTab('ez-forecast', order.indexOf(upto) >= order.indexOf('ez-model'));
+}
+
+// 모델을 바꾸면 연결·파라미터·구성방정식 선택을 전부 비운다 (다른 계통의 변수 이름이 따라붙지 않게)
+function ezUseModel(path) {
+  Object.assign(EZ, { model: path || null, catalog: null, params: [], fmap: {}, tmap: null, extra: {},
+                      closures: {}, advice: null, adviceKey: null, modelsList: null });
+  if (path) EZ.mode = 'physics';
 }
 
 // ── 1. 데이터 ───────────────────────────────────────────────────────────
@@ -97,7 +108,8 @@ async function ezSelectCsv(path) {
     Object.assign(EZ, { profile: prof, presets: pre.presets || [], preset: (pre.presets || [])[0] || null,
       target: null, features: [], units: {}, train: [null, null], test: [null, null], check: null,
       timeline: null, fmap: {}, tmap: null, extra: {}, params: [], model: null, catalog: null,
-      result: null, spark: {}, limit: '', hidden: {}, filter: '', closures: {}, advice: null, adviceKey: null });
+      result: null, spark: {}, limit: '', hidden: {}, filter: '', closures: {}, advice: null, adviceKey: null,
+      fc: null, modelsList: null });
     prof.columns.forEach(c => (EZ.units[c.name] = c.unit || ''));
     // 같은 태그를 쓰는 설정이 있으면 타깃·입력·단위를 미리 채운다
     const p = EZ.preset;
@@ -554,8 +566,8 @@ async function ezRenderPhysics(pane) {
   const models = EZ.modelsList || [];
   const sel = h('select', { onchange: async e => {
     // 다른 계통의 변수 이름이 따라붙지 않게 연결을 전부 비운다
-    Object.assign(EZ, { model: e.target.value, catalog: null, params: [], fmap: {}, tmap: null, extra: {},
-                        closures: {}, advice: null, adviceKey: null });
+    const list = EZ.modelsList;
+    ezUseModel(e.target.value); EZ.modelsList = list;
     await ezRenderPhysics(pane);
   } },
     h('option', { value: '' }, '— 모델을 고르세요 —'),
@@ -693,6 +705,15 @@ function ezDrawClosures(card) {
   const rows = order.map(k => cat.find(c => c.key === k)).filter(Boolean);
   const main = rows.filter(c => !bySlot[c.key] || bySlot[c.key].status !== '영향 작음');
   const minor = rows.filter(c => bySlot[c.key] && bySlot[c.key].status === '영향 작음');
+  if (!adv) {
+    // 비교 전에는 접어 둔다 — 계통이 크면 슬롯이 수십 개라 화면이 끝없이 길어진다
+    const changed = rows.filter(c => EZ.closures[c.key] && EZ.closures[c.key] !== c.default).length;
+    card.append(h('details', { class: 'fold', style: 'margin-top:4px', open: changed > 0 || rows.length <= 2 },
+      h('summary', {}, h('b', {}, `구성방정식 ${rows.length}개 — ${changed ? `${changed}개를 바꿨습니다` : '모두 기본값'}`),
+        h('span', { class: 'sub' }, ' 펼쳐서 직접 고르거나, 위 버튼으로 데이터 비교 후 고르세요')),
+      rows.map(c => ezSlotView(c, null))));
+    return;
+  }
   main.forEach(c => card.append(ezSlotView(c, bySlot[c.key])));
   if (minor.length) card.append(h('details', { class: 'fold', style: 'margin-top:10px' },
     h('summary', {}, h('b', {}, `예측값에 영향이 작아 비교하지 않은 식 ${minor.length}개`),
@@ -857,6 +878,7 @@ async function ezRun() {
     }
     EZ.running = null; clearInterval(tick); ezDrawProgress();
     unlock('ez-result'); ezGo('ez-result');
+    if (typeof projAutoSave === 'function') projAutoSave();
   } catch (e) {
     EZ.running = null; clearInterval(tick);
     EZ.runError = e.message; ezDrawProgress();
@@ -976,7 +998,9 @@ function ezRenderResult() {
     r.files.predictions ? h('a', { class: 'btn', href: '/' + r.files.predictions, download: r.files.predictions.split('/').pop() }, '⭳ 예측 결과 CSV') : null,
     r.files.config ? h('a', { class: 'btn ghost', href: '/' + r.files.config, target: '_blank', title: 'pf calibrate / pf improve 로 다시 돌릴 수 있는 설정' }, '설정 파일(YAML)') : null,
     h('button', { class: 'btn ghost', onclick: () => ezGo('ez-period') }, '← 기간 바꿔 다시'),
-    h('button', { class: 'btn ghost', onclick: () => ezGo('ez-model') }, '← 모델 바꿔 다시')));
+    h('button', { class: 'btn ghost', onclick: () => ezGo('ez-model') }, '← 모델 바꿔 다시'),
+    h('div', { class: 'grow' }),
+    h('button', { class: 'btn lg', onclick: () => ezGo('ez-forecast') }, '다음: 미래 예측 →')));
 }
 
 // ── 모델 설명 ───────────────────────────────────────────────────────────
@@ -1207,7 +1231,9 @@ function ezGo(screen) {
   else if (screen === 'ez-period') ezRenderPeriod();
   else if (screen === 'ez-model') ezRenderModel();
   else if (screen === 'ez-result' && EZ.result) ezRenderResult();
+  else if (screen === 'ez-forecast' && typeof fcRender === 'function') fcRender();
   go(screen);
+  if (typeof projChip === 'function') projChip();
 }
 
 // ── 부팅 ────────────────────────────────────────────────────────────────

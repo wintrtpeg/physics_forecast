@@ -78,7 +78,7 @@ def test_declared_components_show_their_equations():
     laws = laws_of(chiller)
     assert {law.kind for law in laws} == {DECLARED}
     assert "eta_carnot" in {p for law in laws for p in law.params}
-    assert title_of(chiller) == "원심식 칠러"
+    assert title_of(chiller) == "칠러 (카르노 효율형)"          # 라이브러리 컴포넌트의 title
 
 
 def test_titles_are_short_names():

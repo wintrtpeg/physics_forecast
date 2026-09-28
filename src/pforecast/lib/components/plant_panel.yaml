@@ -1,0 +1,59 @@
+# 플랜트 배전반 (전력 집계 + 열 통과) — 재사용 가능한 선언형 컴포넌트 (examples/chiller_plant 에서 씀)
+# 모델에서: {type: equation, spec: lib:plant_panel, values: {파라미터: 값}}
+
+title: 플랜트 배전반 (전력 집계 + 열 통과)
+category: 열·냉동
+description: '플랜트 배전반. 소비처의 전력 포트를 모아 총 전력과 에너지 원단위를 낸다. 컴포넌트가 서로의 변수를 직접 참조하지 않고 포트로만 만나는 것이 요점이다.
+
+  '
+ports:
+  a:
+    kind: thermal
+    role: in
+    T_start: 300.15
+    Q_start: 4.2e6
+  b:
+    kind: thermal
+    role: out
+    T_start: 300.15
+    Q_start: 4.2e6
+  chiller:
+    kind: power
+    role: in
+    P_start: 6.5e5
+  tower:
+    kind: power
+    role: in
+    P_start: 1.0e5
+params:
+  pump_chw:
+    value: 40.0
+    unit: kW
+    desc: 냉수 펌프 동력
+vars:
+  W_total:
+    unit: W
+    start: 8.0e5
+    lo: 1.0
+    hi: 1.0e8
+    desc: 플랜트 총 전력
+equations:
+  heat: a.Q + b.Q = 0
+  temp: b.T = a.T
+  total: W_total = chiller.P + tower.P + pump_chw
+outputs:
+  W_total:
+    expr: W_total
+    unit: kW
+  Q_cooling:
+    expr: a.Q - chiller.P
+    unit: kW
+  RT:
+    expr: (a.Q - chiller.P) / 3516.85[W]
+    unit: '1'
+  kW_per_RT:
+    expr: W_total / ((a.Q - chiller.P) / 3516.85[W])
+    unit: kW
+  pump_chw:
+    expr: pump_chw
+    unit: kW

@@ -55,10 +55,19 @@ def load_yaml_model(path: str | Path) -> System:
 
     파라미터 값은 컴포넌트가 선언한 단위로 해석된다.
     """
-    from ..lib import REGISTRY
-
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    system = System(data.get("name", Path(path).stem))
+    return system_from_dict(data, base_dir=Path(path).parent, default_name=Path(path).stem)
+
+
+def system_from_dict(data: dict, base_dir: str | Path | None = None,
+                     default_name: str = "model") -> System:
+    """YAML 과 같은 모양의 dict 에서 시스템을 만든다 (모델 만들기 화면이 파일 없이 검사할 때).
+
+    ``type: equation`` 의 ``spec`` 은 ``lib:이름`` (패키지 라이브러리) 이거나 ``base_dir`` 기준 경로다.
+    """
+    from ..lib import REGISTRY, EquationComponent
+
+    system = System(data.get("name") or default_name)
     comps: dict[str, Any] = data.get("components") or {}
     for cname, cfg in comps.items():
         cfg = dict(cfg or {})
@@ -68,7 +77,12 @@ def load_yaml_model(path: str | Path) -> System:
         cls = REGISTRY.get(ctype)
         if cls is None:
             raise ModelError(f"알 수 없는 컴포넌트 타입 {ctype!r}. 가능: {sorted(REGISTRY)}")
-        system.add(cls(cname, **cfg))
+        if cls is EquationComponent and base_dir is not None:
+            cfg.setdefault("base_dir", base_dir)
+        try:
+            system.add(cls(cname, **cfg))
+        except (KeyError, ValueError, TypeError, FileNotFoundError) as exc:
+            raise ModelError(f"컴포넌트 {cname}({ctype}) 를 만들 수 없습니다: {exc}") from exc
     # 앱이 쓰는 선언 (없으면 자동 추출로 떨어진다)
     system.drivers = data.get("drivers") or []          # type: ignore[attr-defined]
     system.limits = data.get("limits") or {}            # type: ignore[attr-defined]

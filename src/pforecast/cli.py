@@ -205,6 +205,98 @@ def cmd_select(args) -> int:
     return 0
 
 
+def _project(args):
+    """이름 또는 경로로 프로젝트를 찾아 (문서, 작업 폴더, 설정) 을 돌려준다."""
+    from .easy import config_from_body
+    from .project import load_project, project_path
+    root = Path(args.root).resolve()
+    p = Path(args.project)
+    path = p if p.suffix in (".yaml", ".yml") and p.exists() else project_path(root, args.project)
+    doc = load_project(path)
+    run = doc.get("run") or {}
+    if not run.get("csv") or not run.get("target"):
+        raise ValueError(f"{path.name}: 데이터·예측할 값이 정해지지 않은 프로젝트입니다 (앱에서 1~4단계를 먼저).")
+    cfg = config_from_body(run, lambda r: (root / r).resolve())
+    return doc, root, cfg, path
+
+
+def cmd_project(args) -> int:
+    from .project import list_projects
+    if args.action == "list":
+        items = list_projects(args.root)
+        if not items:
+            print("저장된 프로젝트가 없습니다 (앱에서 실행하면 projects/ 에 자동 저장).")
+        for it in items:
+            print(f"  {it['name']:30s} {str(it.get('saved_at', ''))[:16]:16s} {it.get('csv') or ''} → {it.get('target') or ''}"
+                  + (f"  [오류: {it['error']}]" if it.get("error") else ""))
+        return 0
+    from .easy import run_easy
+    doc, root, cfg, _ = _project(args)
+    if not cfg.train[0] or not cfg.test[0]:
+        raise ValueError("학습·검증 기간이 없는 프로젝트입니다 (앱 3단계).")
+    print(f"[{doc['name']}] 검증: 학습 {cfg.train[0]}~{cfg.train[1]} / 예측 {cfg.test[0]}~{cfg.test[1]}")
+    res = run_easy(cfg, root, progress=lambda m: print("  · " + m, flush=True))
+    key = "outside" if res["split"]["is_extrapolation"] else "test"
+    for m in res["models"]:
+        mt = m["metrics"].get(key) or m["metrics"]["test"]
+        print(f"  {m['name']:14s} RMSE {mt['rmse']:.4g}  MAE {mt['mae']:.4g}  ({'학습 범위 밖 행' if key == 'outside' else '전체'})")
+    for h in res["headline"]:
+        print("  - " + h.replace("**", ""))
+    print(f"\n결과: {res['files']['predictions']}")
+    return 0
+
+
+def _parse_adjust(items: list[str] | None) -> list[dict]:
+    """``컬럼=scale:1.1`` / ``컬럼=add:2`` / ``컬럼=set:12``."""
+    out = []
+    for it in items or []:
+        col, _, rhs = it.partition("=")
+        mode, _, val = rhs.partition(":")
+        if not col or mode not in ("scale", "add", "set") or not val:
+            raise ValueError(f"--adjust 형식: 컬럼=scale:1.1 | 컬럼=add:2 | 컬럼=set:12 (받은 값: {it!r})")
+        out.append({"column": col, "mode": mode, "value": float(val)})
+    return out
+
+
+def cmd_forecast(args) -> int:
+    """저장한 프로젝트의 모델·연결로 과거를 학습하고 계획(미래 입력)을 예측한다."""
+    from .forecast import check_plan, forecast_easy, make_plan, read_plan, save_plan, _history_table
+    doc, root, cfg, _ = _project(args)
+    if args.plan:
+        plan_path = Path(args.plan)
+    else:
+        plan = make_plan(cfg.csv, cfg.time_column, cfg.features, base_days=args.base_days,
+                         horizon_days=args.days, step=args.step, adjust=_parse_adjust(args.adjust))
+        plan_path = save_plan(plan, root / "plans" / f"{doc['name']}_계획_{plan.index.min():%Y%m%d}.csv")
+        print(f"계획을 만들었습니다: {plan_path}  (엑셀에서 고쳐 --plan 으로 다시 줄 수 있음)")
+    plan_df, _log = read_plan(plan_path)
+    chk = check_plan(plan_df, cfg.features, _history_table(cfg.csv, cfg.time_column, cfg.features))
+    for e in chk["errors"]:
+        print("  !! " + e)
+    for w in chk["warnings"]:
+        print("  !  " + w)
+    if not chk["ok"]:
+        return 2
+    hist = tuple(cfg.train) if args.history == "train" and cfg.train[0] else None
+    res = forecast_easy(cfg, plan_path, root, history=hist, band=not args.no_band,
+                        progress=lambda m: print("  · " + m, flush=True))
+    u = res["target"]["unit"]
+    print(f"\n[{doc['name']}] 학습 {res['history']['start'][:10]}~{res['history']['end'][:10]} → "
+          f"예측 {res['plan']['start'][:16]}~{res['plan']['end'][:16]} ({res['plan']['n_rows']}행, 학습 범위 밖 {res['outside_pct']:.0f}%)")
+    for s in res["summary"]:
+        ex = f"  관리기준 초과 {s['exceed_hours']}/{s['hours']}시간" if "exceed_hours" in s else ""
+        print(f"  {s['name']:14s} 평균 {s['mean']:.4g} {u}  95% {s['p95']:.4g}  최대 {s['max']:.4g}{ex}")
+    if res["band"]:
+        b = res["band"]
+        print(f"  설비 상태 변동 폭 (평균): {b['mean_lo']:.4g} ~ {b['mean_hi']:.4g} {u}"
+              + (f"  초과 가능 {b['exceed_possible_hours']}시간 / 확실 {b['exceed_certain_hours']}시간"
+                 if "exceed_possible_hours" in b else ""))
+    for n in res["notes"]:
+        print("  - " + n)
+    print(f"\n결과: {res['files']['forecast']}")
+    return 0
+
+
 def cmd_serve(args) -> int:
     from .app import serve
     serve(args.root, args.host, args.port, not args.no_browser)
@@ -398,6 +490,24 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", help="케이스 결과 CSV 경로")
     c.add_argument("--params", help="보정 파라미터 YAML")
     c.set_defaults(func=cmd_run)
+
+    c = sub.add_parser("project", help="앱에서 저장한 프로젝트 목록 / 같은 설정으로 다시 검증")
+    c.add_argument("action", choices=["list", "run"])
+    c.add_argument("project", nargs="?", help="프로젝트 이름 또는 projects/*.yaml 경로 (run)")
+    c.add_argument("--root", default=".", help="작업 폴더")
+    c.set_defaults(func=cmd_project)
+
+    c = sub.add_parser("forecast", help="프로젝트의 모델로 미래 예측 (계획 CSV 또는 최근 패턴으로 만든 계획)")
+    c.add_argument("project", help="프로젝트 이름 또는 projects/*.yaml 경로")
+    c.add_argument("--plan", help="계획 CSV (학습 CSV 와 같은 입력 컬럼). 없으면 최근 패턴으로 만든다")
+    c.add_argument("--days", type=float, default=14, help="만들 계획의 길이 (일)")
+    c.add_argument("--base-days", type=float, default=7, help="반복할 최근 패턴 길이 (일)")
+    c.add_argument("--step", default="1h", help="계획 간격 (5min, 1h, 1D ...)")
+    c.add_argument("--adjust", action="append", help="입력 조정: 컬럼=scale:1.1 | 컬럼=add:2 | 컬럼=set:12")
+    c.add_argument("--history", choices=["all", "train"], default="all", help="학습에 쓸 과거 (기본: 전체)")
+    c.add_argument("--no-band", action="store_true", help="설비 상태 변동 폭 생략 (빠름)")
+    c.add_argument("--root", default=".", help="작업 폴더")
+    c.set_defaults(func=cmd_forecast)
 
     c = sub.add_parser("serve", help="로컬 웹 앱 실행 (데이터 → 분석 → 물리모델 → 시나리오)")
     c.add_argument("--root", default=".", help="작업 폴더 (CSV/모델을 찾을 위치)")

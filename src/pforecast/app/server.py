@@ -118,11 +118,28 @@ class Workspace:
         except ValueError:
             return str(p.resolve())
 
+    #: 작업 폴더를 훑을 때 들어가지 않는 폴더. 저장소 안에 만든 가상환경(.venv, venv)은
+    #: 파일이 수만 개라 목록이 느려지고 남의 YAML 이 모델로 잡힌다.
+    SKIP_DIRS = {".git", "__pycache__", "out", "node_modules", "venv", "env", "site-packages",
+                 "build", "dist", "wheels", "offline"}
+
+    def _walk(self, pattern: str):
+        import os
+        import fnmatch
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = sorted(d for d in dirnames
+                                 if d not in self.SKIP_DIRS and not d.startswith((".", "_")))
+            for f in sorted(filenames):
+                if fnmatch.fnmatch(f, pattern):
+                    yield Path(dirpath) / f
+
+    #: 계획 CSV 는 학습 데이터가 아니다 — 데이터 목록에서 빼고 계획 목록에만 보인다
+    PLAN_DIRS = {"plans"}
+
     def datasets(self) -> list[dict]:
         out = []
-        for p in sorted(self.root.rglob("*.csv")):
-            if any(part in {".git", "__pycache__", "out"} or part.startswith(("_", "."))
-                   for part in p.relative_to(self.root).parts):
+        for p in self._walk("*.csv"):
+            if self.PLAN_DIRS & set(p.relative_to(self.root).parts[:-1]):
                 continue
             try:
                 size = p.stat().st_size
@@ -133,18 +150,14 @@ class Workspace:
 
     def model_files(self) -> list[dict]:
         out = []
-        for p in sorted(self.root.rglob("*.yaml")):
-            if any(part in {".git", "__pycache__", "out"} for part in p.parts):
-                continue
+        for p in self._walk("*.yaml"):
             try:
                 text = p.read_text(encoding="utf-8")
             except OSError:
                 continue
             if "\ncomponents:" in text or text.startswith("components:"):
                 out.append({"path": self._rel(p), "name": p.stem, "kind": "yaml"})
-        for p in sorted(self.root.rglob("model.py")):
-            if any(part in {".git", "__pycache__"} for part in p.parts):
-                continue
+        for p in self._walk("model.py"):
             out.append({"path": self._rel(p), "name": p.parent.name, "kind": "python"})
         return out
 
@@ -489,6 +502,121 @@ class Api:
         self.ws.forget(body["model"])
         return self.model_meta(body)
 
+    # -- 모델 만들기 --
+    def builder_palette(self, _body) -> dict:
+        from ..builder import palette
+        return {"palette": palette(self.ws.root)}
+
+    def builder_load(self, body) -> dict:
+        from ..builder import load_model_dict
+        path = self.ws.resolve(body["path"])
+        return {"model": load_model_dict(path), "path": self.ws._rel(path)}
+
+    def builder_check(self, body) -> dict:
+        """화면의 모델(dict) 또는 YAML 글을 검사한다. 파일은 쓰지 않는다."""
+        import yaml as _yaml
+
+        from ..builder import check_model, dump_model
+        if "yaml" in body:
+            try:
+                model = _yaml.safe_load(body["yaml"]) or {}
+            except _yaml.YAMLError as exc:
+                return {"ok": False, "stage": "yaml", "errors": [f"YAML 문법 오류: {exc}"], "warnings": []}
+            if not isinstance(model, dict):
+                return {"ok": False, "stage": "yaml", "errors": ["YAML 최상위는 name/components/connections "
+                                                                  "를 가진 사전이어야 합니다."], "warnings": []}
+        else:
+            model = body.get("model") or {}
+        base = self.ws.resolve(body["path"]).parent if body.get("path") else self.ws.root / "models"
+        res = check_model(model, base_dir=base, solve=bool(body.get("solve", True)))
+        return {**res, "model": model, "yaml": dump_model(model)}
+
+    def builder_save(self, body) -> dict:
+        from ..builder import save_model
+        rel = body.get("path") or f"models/{_safe_name(body['model'].get('name') or 'model')}.yaml"
+        path = self.ws.resolve(rel)
+        if path.suffix not in (".yaml", ".yml"):
+            raise ValueError("모델은 .yaml 로 저장합니다.")
+        saved = save_model(body["model"], path)
+        self.ws.forget(self.ws._rel(saved))
+        return {"path": self.ws._rel(saved)}
+
+    # -- 프로젝트 (설정 저장·열기) --
+    def project_list(self, _body) -> dict:
+        from ..project import list_projects
+        items = list_projects(self.ws.root)
+        for it in items:
+            it["path"] = self.ws._rel(it["path"])
+        return {"projects": items}
+
+    def project_save(self, body) -> dict:
+        from ..project import save_project
+        path = save_project(self.ws.root, body.get("name") or "project", body.get("run") or {},
+                            ui=body.get("ui"), forecast=body.get("forecast"),
+                            results=body.get("results"), forecast_results=body.get("forecast_results"))
+        return {"path": self.ws._rel(path)}
+
+    def project_load(self, body) -> dict:
+        from ..project import load_project
+        doc = load_project(self.ws.resolve(body["path"]))
+        # 옮겨 온 프로젝트는 데이터·모델 경로가 없을 수 있다 — 열되 알려준다
+        run = doc.get("run") or {}
+        missing = [run[k] for k in ("csv", "model") if run.get(k) and not (self.ws.root / run[k]).exists()]
+        return {**doc, "path": body["path"], "missing": missing}
+
+    # -- 미래 예측 (계획 → 예측) --
+    def forecast_plans(self, _body) -> dict:
+        out = []
+        for folder in ("plans", "uploads"):
+            d = self.ws.root / folder
+            for p in sorted(d.glob("*.csv")) if d.is_dir() else []:
+                out.append({"path": self.ws._rel(p), "name": p.name, "folder": folder,
+                            "size_kb": round(p.stat().st_size / 1024, 1)})
+        return {"plans": out}
+
+    def _history(self, body):
+        from ..forecast import _history_table
+        return _history_table(self.ws.resolve(body["csv"]), body.get("time_column"), list(body.get("features") or []))
+
+    def forecast_make(self, body) -> dict:
+        """최근 N일 패턴을 반복하고 조정한 계획을 plans/ 에 저장한다 (엑셀에서 고쳐 다시 올릴 수 있음)."""
+        from ..forecast import check_plan, make_plan, save_plan
+        feats = list(body.get("features") or [])
+        plan = make_plan(self.ws.resolve(body["csv"]), body.get("time_column"), feats,
+                         base_days=float(body.get("base_days", 7)), horizon_days=float(body.get("horizon_days", 14)),
+                         step=str(body.get("step") or "1h"), adjust=body.get("adjust") or [])
+        name = _safe_name(body.get("plan_name") or f"{Path(body['csv']).stem}_계획_{plan.index.min():%Y%m%d}")
+        path = save_plan(plan, self.ws.root / "plans" / f"{name}.csv")
+        chk = check_plan(plan, feats, self._history(body))
+        return {"path": self.ws._rel(path), "check": chk, "preview": _plan_preview(plan, feats)}
+
+    def forecast_check(self, body) -> dict:
+        from ..forecast import check_plan, read_plan
+        plan, log = read_plan(self.ws.resolve(body["plan"]))
+        feats = list(body.get("features") or [])
+        chk = check_plan(plan, feats, self._history(body))
+        return {"path": body["plan"], "check": chk, "log": log, "preview": _plan_preview(plan, feats)}
+
+    def forecast_run(self, body) -> dict:
+        from ..easy import config_from_body, mapping_issues
+        from ..forecast import forecast_easy
+        cfg = config_from_body(body, self.ws.resolve)
+        if cfg.model:
+            issues = mapping_issues(self.ws.model(body["model"]), cfg)
+            if issues:
+                raise ValueError("컬럼 연결을 고치세요: " + " / ".join(
+                    f"{i['column']} → {i['target']}: {i['message']}" for i in issues))
+        plan = self.ws.resolve(body["plan"])
+        hist = body.get("history")
+        hist = tuple(hist) if hist and all(hist) else None
+        root, band = self.ws.root, bool(body.get("band", True))
+
+        def work(job: Job):
+            return forecast_easy(cfg, plan, root, history=hist, band=band,
+                                 progress=lambda m: setattr(job, "message", m))
+
+        return {"job": self.jobs.start("forecast", work).payload()}
+
     # -- 간편 예측 (업로드 → 변수 → 기간 → 모델 → 결과) --
     def upload(self, name: str, data: bytes) -> dict:
         """CSV 를 작업 폴더의 ``uploads/`` 에 저장한다. 이 PC 밖으로는 아무것도 나가지 않는다."""
@@ -589,6 +717,20 @@ class Api:
         return {"job": self.jobs.start("easy", work).payload()}
 
 
+def _plan_preview(plan, feats: list[str], n: int = 400) -> dict:
+    """계획 미리보기 (입력마다 시계열, 최대 n 점)."""
+    cols = [c for c in feats if c in plan.columns]
+    k = max(1, len(plan) // n)
+    sub = plan[cols].iloc[::k]
+    return {"t": [str(t) for t in sub.index],
+            "columns": {c: [_num(v) for v in sub[c].to_numpy()] for c in cols}}
+
+
+def _safe_name(name: str) -> str:
+    """파일 이름으로 쓸 수 있게 (한글·영문·숫자·_- 만)."""
+    return re.sub(r"[^0-9A-Za-z가-힣_\-]+", "_", str(name)).strip("_") or "model"
+
+
 def _num(v) -> float | None:
     try:
         f = float(v)
@@ -674,6 +816,17 @@ _ROUTES: dict[str, str] = {
     "/api/easy/check": "easy_check",
     "/api/easy/run": "easy_run",
     "/api/easy/closures": "easy_closures",
+    "/api/builder/palette": "builder_palette",
+    "/api/builder/load": "builder_load",
+    "/api/builder/check": "builder_check",
+    "/api/builder/save": "builder_save",
+    "/api/project/list": "project_list",
+    "/api/project/save": "project_save",
+    "/api/project/load": "project_load",
+    "/api/forecast/plans": "forecast_plans",
+    "/api/forecast/make": "forecast_make",
+    "/api/forecast/check": "forecast_check",
+    "/api/forecast/run": "forecast_run",
 }
 
 

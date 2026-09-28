@@ -652,10 +652,46 @@ def explain_physics(system, model, cfg: EasyConfig, fitted_table: list[dict],
     }
 
 
-def run_easy(cfg: EasyConfig, root: str | Path = ".",
-             progress: Callable[[str], None] | None = None) -> dict:
+def _fit_physics(cfg: EasyConfig, wcfg, tmap, train, model_inputs, model_obs, say, notes):
+    """모델 조립 → 구성방정식 선택 적용 → 보정. 검증(run_easy)과 미래 예측이 같이 쓴다."""
     from .calib import CalibrationSpec, calibrate
     from .calib.design import select_rows
+
+    say("물리모델 조립 중")
+    system = load_model(wcfg.model)
+    chosen = apply_closure_choices(system, cfg.closures)
+    model = system.compile()
+    model.build()
+    params = closure_params(system, cfg.params or suggest_params(model, cfg.target_map.targets[0]),
+                            cfg.closures)
+    params = [p for p in params if _has_param(model, p)]
+    if chosen:
+        notes.append("구성방정식 선택: " + " · ".join(chosen)
+                     + f". 보정 파라미터: {', '.join(params)}")
+    if not params:
+        raise ValueError("보정할 파라미터가 없습니다. 모델에 보정 대상을 고르세요.")
+    rows = select_rows(train, cfg.max_rows, model_inputs, model_obs)
+    spec = CalibrationSpec(params=params, observations=model_obs, sigmas=tmap.sigmas(train),
+                           max_rows=max(len(rows), 1), prior_weight=0.05)
+    say(f"물리 파라미터 {len(params)}개 보정 중 ({len(rows)}행, 드문 운전상태 포함) — 1~3분")
+    cal = calibrate(model, rows[model_inputs], rows[model_obs], spec,
+                    expansion=tmap.expansion(), verbose=False)
+    return system, model, cal, spec, params
+
+
+def _cal_payload(cal) -> dict:
+    t = cal.table()
+    return {
+        "rows": cal.n_rows, "excluded": cal.n_excluded,
+        "table": [{"parameter": r.parameter, "unit": r.unit, "initial": _f(r.initial),
+                   "fitted": _f(r.fitted), "change_pct": _f(r["change_%"]),
+                   "rel_stderr_pct": _f(r["rel_stderr_%"])} for _, r in t.iterrows()],
+        "warnings": cal.identifiability_warnings(),
+    }
+
+
+def run_easy(cfg: EasyConfig, root: str | Path = ".",
+             progress: Callable[[str], None] | None = None) -> dict:
     from .workflow import WorkflowConfig, _predict, load_dataset
 
     t0 = time.perf_counter()
@@ -722,39 +758,15 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
 
     # 2) 물리모델
     if physics:
-        say("물리모델 조립 중")
-        system = load_model(wcfg.model)
-        chosen = apply_closure_choices(system, cfg.closures)
-        model = system.compile()
-        model.build()
-        params = closure_params(system, cfg.params or suggest_params(model, cfg.target_map.targets[0]),
-                                cfg.closures)
-        params = [p for p in params if _has_param(model, p)]
-        if chosen:
-            notes.append("구성방정식 선택: " + " · ".join(chosen)
-                         + f". 보정 파라미터: {', '.join(params)}")
-        if not params:
-            raise ValueError("보정할 파라미터가 없습니다. 모델에 보정 대상을 고르세요.")
-        rows = select_rows(train, cfg.max_rows, model_inputs, model_obs)
-        spec = CalibrationSpec(params=params, observations=model_obs, sigmas=tmap.sigmas(train),
-                               max_rows=max(len(rows), 1), prior_weight=0.05)
-        say(f"물리 파라미터 {len(params)}개 보정 중 ({len(rows)}행, 드문 운전상태 포함) — 1~3분")
-        cal = calibrate(model, rows[model_inputs], rows[model_obs], spec,
-                        expansion=tmap.expansion(), verbose=False)
+        system, model, cal, spec, params = _fit_physics(cfg, wcfg, tmap, train, model_inputs, model_obs,
+                                                        say, notes)
         say(f"물리모델로 예측 중 (예측 {len(test):,}행)")
         p_te = _predict(model, test, model_inputs, [y_col], tmap.expansion()).values[y_col].to_numpy()
         p_tr = _predict(model, tr_sub, model_inputs, [y_col], tmap.expansion()).values[y_col].to_numpy()
         physics_failed = int(np.isnan(p_te).sum())
         preds["물리모델"] = (to_disp(p_tr), to_disp(p_te))
         kinds["물리모델"] = "physics"
-        t = cal.table()
-        cal_payload = {
-            "rows": cal.n_rows, "excluded": cal.n_excluded,
-            "table": [{"parameter": r.parameter, "unit": r.unit, "initial": _f(r.initial),
-                       "fitted": _f(r.fitted), "change_pct": _f(r["change_%"]),
-                       "rel_stderr_pct": _f(r["rel_stderr_%"])} for _, r in t.iterrows()],
-            "warnings": cal.identifiability_warnings(),
-        }
+        cal_payload = _cal_payload(cal)
         physics_explain = explain_physics(system, model, cfg, cal_payload["table"], rows=cal.n_rows,
                                           n_obs=len(model_obs))
         if cfg.band:
@@ -921,7 +933,8 @@ def config_from_body(body: dict, resolve: Callable[[str], Path]) -> EasyConfig:
     return EasyConfig(
         csv=str(resolve(body["csv"])), target=body["target"],
         features=list(body.get("features") or []),
-        train=tuple(body["train"]), test=tuple(body["test"]),
+        # 미래 예측은 기간 대신 '과거 전체 + 계획'을 쓴다 (forecast.forecast_easy)
+        train=tuple(body.get("train") or ("", "")), test=tuple(body.get("test") or ("", "")),
         embargo_days=float(body.get("embargo_days", 1.0)),
         time_column=body.get("time_column"), target_unit=body.get("target_unit") or "",
         model=str(resolve(body["model"])) if body.get("model") else None,

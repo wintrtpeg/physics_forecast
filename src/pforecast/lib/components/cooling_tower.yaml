@@ -1,0 +1,83 @@
+# 냉각탑 (접근온도차형) — 재사용 가능한 선언형 컴포넌트 (examples/chiller_plant 에서 씀)
+# 모델에서: {type: equation, spec: lib:cooling_tower, values: {파라미터: 값}}
+
+title: 냉각탑 (접근온도차형)
+category: 열·냉동
+description: 냉각탑. 접근온도차가 부하에 따라 커지는 것이 핵심 비선형이다.
+ports:
+  hot:
+    kind: thermal
+    role: in
+    T_start: 305.15
+    Q_start: 4.2e6
+  amb:
+    kind: thermal
+    role: out
+    T_start: 300.15
+    Q_start: 4.2e6
+  elec:
+    kind: power
+    role: out
+    P_start: 2.0e5
+params:
+  app_nom:
+    value: 5.0
+    unit: K
+    desc: 정격 접근온도차
+    lo: 1.0
+    hi: 15.0
+    tunable: true
+  app_exp:
+    value: 0.5
+    unit: '1'
+    desc: 부하 지수
+    lo: 0.1
+    hi: 1.5
+    tunable: true
+  Q_nom:
+    value: 4200.0
+    unit: kW
+    desc: 정격 방열량
+  fan_nom:
+    value: 40.0
+    unit: kW
+    desc: 정격 냉각탑 팬 동력
+  pump_cw:
+    value: 45.0
+    unit: kW
+    desc: 냉각수 펌프 동력
+vars:
+  approach:
+    unit: K
+    start: 5.0
+    lo: 0.2
+    hi: 30.0
+    desc: 접근온도차
+  P_aux:
+    unit: W
+    start: 2.0e5
+    lo: 1.0
+    hi: 1.0e7
+    desc: 팬+냉각수펌프 동력
+equations:
+  heat: hot.Q + amb.Q = 0
+  temp: hot.T = amb.T + approach
+  closure: approach = app_nom * (hot.Q / Q_nom) ^ app_exp
+  aux: P_aux = fan_nom * (hot.Q / Q_nom) ^ 1.5 + pump_cw
+  elec: elec.P + P_aux = 0
+outputs:
+  approach:
+    expr: approach
+    unit: K
+  T_cw:
+    expr: hot.T
+    unit: degC
+  Q_reject:
+    expr: hot.Q
+    unit: kW
+  fan_power:
+    expr: P_aux - pump_cw
+    unit: kW
+  aux_power:
+    expr: P_aux
+    unit: kW

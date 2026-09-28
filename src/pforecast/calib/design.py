@@ -491,6 +491,31 @@ def state_band(model, drift: list[ParamDrift], inputs: pd.DataFrame, target: str
     return out
 
 
+def state_paths(model, drift: list[ParamDrift], inputs: pd.DataFrame, target: str, unit: str,
+                expansion=None) -> list[tuple[str, np.ndarray]]:
+    """``state_band`` 과 같지만 평균이 아니라 **시점별 예측**을 토막 상태마다 돌려준다.
+
+    미래 계획을 넣고 예측할 때 시점마다 폭(최소~최대)을 그리려고 쓴다. 행 수만큼 토막 수배
+    풀어야 하므로 계획은 1시간 간격 정도로 넣는다.
+    """
+    from .runner import build_param_rows, simulate
+
+    if not drift or not drift[0].segments:
+        return []
+    labels = [lab for lab, _, _ in drift[0].segments]
+    P0 = build_param_rows(model, inputs, base_p=model.p0(), expansion=expansion)
+    out = []
+    for k, lab in enumerate(labels):
+        P = P0.copy()
+        for d in drift:
+            if len(d.segments) != len(labels):
+                continue
+            P[:, model.par_index(d.name)] = _to_si(d.segments[k][1], d.unit)
+        y = simulate(model, P, [target], index=inputs.index).values[target].to_numpy()
+        out.append((lab, np.array([from_si(v, unit) if np.isfinite(v) else np.nan for v in y])))
+    return out
+
+
 def _to_si(v: float, unit: str) -> float:
     from ..core.units import to_si
     return to_si(v, unit)
