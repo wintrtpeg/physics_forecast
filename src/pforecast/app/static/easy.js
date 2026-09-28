@@ -526,6 +526,10 @@ async function ezRenderModel() {
   const body = $('#ez-model-body'); body.innerHTML = '';
   if (!EZ.modelsList) { try { EZ.modelsList = (await api('/api/workspace')).models; } catch (_) { EZ.modelsList = []; } }
   if (EZ.model === null && EZ.preset && EZ.preset.model) EZ.model = EZ.preset.model;
+  // 모델 파일이 하나뿐이면 고를 것이 없다
+  if (EZ.model === null && EZ.modelsList.length === 1 && EZ.mode === 'physics') {
+    const list = EZ.modelsList; ezUseModel(list[0].path); EZ.modelsList = list;
+  }
   if (EZ.model === null && !EZ.modelsList.length) EZ.mode = 'ml';
 
   const card = (mode, title, desc, badge) => h('button', { class: 'choice' + (EZ.mode === mode ? ' on' : ''),
@@ -570,76 +574,34 @@ async function ezRenderPhysics(pane) {
     ezUseModel(e.target.value); EZ.modelsList = list;
     await ezRenderPhysics(pane);
   } },
-    h('option', { value: '' }, '— 모델을 고르세요 —'),
+    h('option', { value: '' }, '— 계통 모델을 고르세요 —'),
     models.map(m => h('option', { value: m.path, selected: m.path === EZ.model }, `${m.name}  (${m.path})`)));
   pane.append(h('div', { class: 'card' },
-    h('div', { class: 'card-head' }, h('h3', {}, '물리모델'),
-      h('span', { class: 'sub' }, EZ.preset && EZ.preset.model === EZ.model ? `저장된 설정 ‘${EZ.preset.name}’ 의 모델` : '작업 폴더의 모델 파일')),
+    h('div', { class: 'card-head' }, h('h3', {}, '① 계통 모델'),
+      h('span', { class: 'sub' }, EZ.preset && EZ.preset.model === EZ.model ? `저장된 설정 ‘${EZ.preset.name}’ 의 모델`
+        : '이 데이터가 나온 계통의 모델 파일. 없으면 ‘모델 만들기’에서 만들거나 ‘ML 만’으로 비교하세요')),
     sel));
   if (!EZ.model) return;
-  if (!EZ.catalog || EZ.catalog._model !== EZ.model) {
-    pane.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, '모델을 조립하는 중…'), h('div', { class: 'progress' }, h('i'))));
+  // 추천은 y·x·단위에 따라 달라진다 — 바뀌었으면 다시 받는다
+  const key = JSON.stringify([EZ.model, EZ.target, EZ.features, EZ.units]);
+  if (!EZ.catalog || EZ.catalog._model !== EZ.model || EZ.catalog._key !== key) {
+    pane.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, '모델을 조립하고 컬럼 연결을 추천하는 중…'), h('div', { class: 'progress' }, h('i'))));
     ezApplyPreset();
     const hint = EZ.tmap && EZ.tmap.targets && EZ.tmap.targets[0];
     try {
-      EZ.catalog = await api('/api/easy/catalog', { model: EZ.model, target: hint || null });
-      EZ.catalog._model = EZ.model;
+      EZ.catalog = await api('/api/easy/catalog', { model: EZ.model, target: hint || null, csv: EZ.csv,
+        time_column: EZ.profile.time_column, y: EZ.target, features: EZ.features, units: EZ.units });
+      EZ.catalog._model = EZ.model; EZ.catalog._key = key;
     } catch (e) { pane.lastChild.remove(); pane.append(h('div', { class: 'note bad' }, e.message)); return; }
     pane.lastChild.remove();
+    EZ.autoFilled = ezApplySuggest(false);
   }
   const cat = EZ.catalog;
-  const inputOpts = cur => {
-    const groups = {};
-    cat.inputs.forEach(o => (groups[o.group] = groups[o.group] || []).push(o));
-    const curVal = (cur || []).join(',');
-    const known = cat.inputs.some(o => o.value === curVal);
-    return [h('option', { value: '' }, '— 물리모델에 안 씀 (ML 만) —'),
-      !known && curVal ? h('option', { value: curVal, selected: true }, curVal) : null,
-      ...Object.entries(groups).map(([g, os]) => h('optgroup', { label: g },
-        os.map(o => h('option', { value: o.value, selected: o.value === curVal }, `${o.label}${o.unit ? ` [${o.unit}]` : ''}`))))];
-  };
-  const obsOpts = cur => [h('option', { value: '' }, '— 연결 안 함 —'),
-    ...cat.observables.map(o => h('option', { value: o.value, selected: (cur || [])[0] === o.value },
-      o.unit && !o.label.includes('[') ? `${o.label} [${o.unit}]` : o.label))];
-  const unitIn = (col, m) => h('input', { class: 'unit', type: 'text', value: (m && m.unit) || EZ.units[col] || '',
-    oninput: e => { m.unit = e.target.value.trim(); ezCheckMapping(); } });
+  pane.append(ezMapCard());
+  const extra = ezExtraCard();
+  if (extra) pane.append(extra);
 
-  EZ.tmap = EZ.tmap || { targets: [], unit: EZ.units[EZ.target] || '' };
-  const rows = [h('tr', { class: 'is-y' },
-    h('td', {}, h('span', { class: 'badge' }, 'y')), h('td', { class: 'name' }, EZ.target),
-    h('td', {}, h('select', { onchange: e => { EZ.tmap.targets = e.target.value ? [e.target.value] : []; ezCheckMapping(); } }, obsOpts(EZ.tmap.targets))),
-    h('td', {}, unitIn(EZ.target, EZ.tmap)), h('td', {}, ''))];
-  EZ.features.forEach(c => {
-    const m = EZ.fmap[c] = EZ.fmap[c] || { targets: [], unit: EZ.units[c] || '', scale: 1 };
-    rows.push(h('tr', {},
-      h('td', {}, h('span', { class: 'badge' }, 'x')), h('td', { class: 'name' }, c),
-      h('td', {}, h('select', { onchange: e => { m.targets = e.target.value ? e.target.value.split(',') : []; ezCheckMapping(); } }, inputOpts(m.targets))),
-      h('td', {}, unitIn(c, m)),
-      h('td', {}, h('input', { type: 'number', step: 'any', value: m.scale, style: 'width:90px', title: '컬럼 값에 곱할 배율 (예: 60 Hz → 회전수비 1.0 이면 0.016667)',
-        oninput: e => { m.scale = +e.target.value || 1; ezCheckMapping(); } }))));
-  });
-  const others = EZ.profile.columns.filter(c => c.usable && c.name !== EZ.target && !EZ.features.includes(c.name));
-  const extraRows = others.map(c => {
-    const m = EZ.extra[c.name] = EZ.extra[c.name] || { targets: [], unit: EZ.units[c.name] || '' };
-    return h('tr', {}, h('td', { class: 'name' }, c.name, c.desc ? h('div', { class: 'desc' }, c.desc) : null),
-      h('td', {}, h('select', { onchange: e => { m.targets = e.target.value ? [e.target.value] : []; ezCheckMapping(); } }, obsOpts(m.targets))),
-      h('td', {}, unitIn(c.name, m)));
-  });
-  const nExtra = Object.values(EZ.extra).filter(m => m.targets && m.targets.length).length;
-  pane.append(h('div', { class: 'card' },
-    h('div', { class: 'card-head' }, h('h3', {}, '컬럼 ↔ 모델 연결'),
-      h('span', { class: 'sub' }, '데이터의 어떤 컬럼이 모델의 무엇인지 알려주세요. 단위가 다르면 실행 전에 알려줍니다.')),
-    h('div', { class: 'tablewrap' }, h('table', { class: 'map' },
-      h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, 'CSV 컬럼'), h('th', {}, '모델 변수'), h('th', {}, '컬럼 단위'), h('th', {}, '배율'))),
-      h('tbody', {}, rows))),
-    h('div', { id: 'ez-map-issues' }),
-    others.length ? h('details', { class: 'fold', style: 'margin-top:12px', open: nExtra > 0 },
-      h('summary', {}, h('b', {}, `보조 관측 (선택) — 연결 ${nExtra}개`),
-        h('span', { class: 'sub' }, ' 유량·차압·온도처럼 모델이 계산하는 다른 계측값을 연결하면 보정이 정확해집니다. 입력으로는 쓰지 않습니다.')),
-      h('div', { class: 'tablewrap', style: 'margin-top:8px' }, h('table', { class: 'map' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'CSV 컬럼'), h('th', {}, '모델 출력'), h('th', {}, '단위'))),
-        h('tbody', {}, extraRows)))) : null));
-
+  // 고급: 기본값이면 충분하다
   if (!EZ.params.length) EZ.params = [...(cat.suggested || [])];
   const prow = cat.params.map(p => h('label', { class: 'prm' + (EZ.params.includes(p.value) ? ' on' : '') },
     h('input', { type: 'checkbox', checked: EZ.params.includes(p.value), onchange: e => {
@@ -648,13 +610,209 @@ async function ezRenderPhysics(pane) {
     } }),
     h('span', { class: 'mono' }, p.value),
     h('span', { class: 'sub' }, `${p.desc || ''}${p.sensitivity_pct ? ` · 민감도 ${fmt(p.sensitivity_pct, 0)}%` : ''}`)));
-  pane.append(h('details', { class: 'card fold' },
-    h('summary', {}, h('b', {}, `보정할 물리 파라미터 — ${EZ.params.length}개 선택`),
-      h('span', { class: 'sub' }, cat.declared_params.length ? ' 모델이 권하는 것을 골라 두었습니다' : ' 타깃에 민감한 것을 골라 두었습니다')),
-    h('div', { class: 'note', style: 'margin-top:10px' }, '많이 고를수록 좋은 게 아닙니다. 데이터로 서로 구분되지 않는 파라미터를 같이 풀면 값이 흔들립니다 — 결과 화면의 식별성 경고를 보세요.'),
-    h('div', { class: 'prms' }, prow)));
-  if ((cat.closures || []).length) pane.append(ezClosureCard());
+  const changed = Object.entries(EZ.closures).filter(([k, v]) => {
+    const sl = (cat.closures || []).find(c => c.key === k);
+    return v && sl && v !== sl.default;
+  }).length;
+  const adv = h('details', { class: 'card fold', id: 'ez-adv', open: EZ.advOpen || changed > 0 },
+    h('summary', { onclick: () => (EZ.advOpen = !$('#ez-adv').open) },
+      h('b', {}, '④ 고급 설정 (선택)'),
+      h('span', { class: 'sub' }, ` 기본값으로 두면 됩니다 — 보정 파라미터 ${EZ.params.length}개 (${cat.declared_params.length ? '모델이 권한 것' : '민감한 순'})`
+        + ((cat.closures || []).length ? ` · 구성방정식 ${cat.closures.length}개${changed ? ` 중 ${changed}개 바꿈` : ' 기본값'}` : ''))),
+    h('div', { class: 'k', style: 'margin-top:12px' }, '보정할 물리 파라미터'),
+    h('div', { class: 'note' }, '많이 고를수록 좋은 게 아닙니다. 데이터로 서로 구분되지 않는 파라미터를 같이 풀면 값이 흔들립니다 — 결과 화면의 식별성 경고를 보세요.'),
+    h('div', { class: 'prms' }, prow),
+    (cat.closures || []).length ? ezClosureCard() : null);
+  pane.append(adv);
   ezCheckMapping();
+}
+
+// ── 컬럼 ↔ 모델 연결: 이름·설명·단위로 추천해 채우고, 사람은 확인만 ───────────
+// 비어 있는 칸만 채운다 (force 면 추천이 있는 칸은 다시). 채운 개수를 돌려준다
+function ezApplySuggest(force) {
+  const sg = EZ.catalog && EZ.catalog.suggest;
+  if (!sg) return 0;
+  const b = sg.best;
+  let n = 0;
+  EZ.tmap = EZ.tmap || { targets: [], unit: EZ.units[EZ.target] || '' };
+  if (b.target && (force || !EZ.tmap.targets.length)) { EZ.tmap.targets = [b.target]; n++; }
+  EZ.features.forEach(c => {
+    const m = EZ.fmap[c] = EZ.fmap[c] || { targets: [], unit: EZ.units[c] || '', scale: 1 };
+    const s = b.inputs[c];
+    if (s && (force || !m.targets.length)) {
+      m.targets = s.value.split(',');
+      if (s.scale) { m.scale = s.scale; m.unit = s.unit || '1'; }
+      n++;
+    }
+  });
+  Object.entries(b.extra || {}).forEach(([c, v]) => {
+    const m = EZ.extra[c] = EZ.extra[c] || { targets: [], unit: EZ.units[c] || '' };
+    if (force || !m.targets.length) { m.targets = [v]; n++; }
+  });
+  return n;
+}
+
+// 선택 상자: ★ 추천 → 모델이 선언한 것 → 나머지 (컴포넌트 · 뜻 [단위])
+function ezOpts(pool, sug, cur, noneLabel) {
+  const curVal = (cur || []).join(',');
+  const sv = new Set((sug || []).map(x => x.value));
+  const lab = o => `${o.label}${o.unit && o.unit !== '1' && !String(o.label).includes('[') ? ` [${o.unit}]` : ''}`;
+  const groups = {};
+  pool.forEach(o => { if (!sv.has(o.value)) (groups[o.group || '기타'] = groups[o.group || '기타'] || []).push(o); });
+  const known = pool.some(o => o.value === curVal);
+  return [h('option', { value: '' }, noneLabel),
+    !known && curVal ? h('option', { value: curVal, selected: true }, curVal) : null,
+    (sug || []).length ? h('optgroup', { label: '★ 추천 — 이름·단위가 맞는 순' },
+      sug.map(x => h('option', { value: x.value, selected: x.value === curVal }, `★ ${lab(pool.find(o => o.value === x.value) || x)}`))) : null,
+    ...Object.entries(groups).map(([g, os]) => h('optgroup', { label: g },
+      os.map(o => h('option', { value: o.value, selected: o.value === curVal }, lab(o)))))];
+}
+
+function ezColCell(name) {
+  const c = EZ.profile.columns.find(x => x.name === name) || {};
+  const u = EZ.units[name];
+  return h('td', { class: 'mcol' }, h('div', { class: 'mono' }, name),
+    (c.desc || u) ? h('div', { class: 'desc' }, [c.desc, u ? `단위 ${u}` : null].filter(Boolean).join(' · ')) : null);
+}
+
+function ezMapCard() {
+  const cat = EZ.catalog, sg = cat.suggest || { target: [], inputs: {} };
+  EZ.tmap = EZ.tmap || { targets: [], unit: EZ.units[EZ.target] || '' };
+  EZ.unitOpen = EZ.unitOpen || {};
+  const row = (role, col, m, pool, sug, none, isX) => {
+    const unit = h('input', { type: 'text', value: m.unit || EZ.units[col] || '', class: 'unit',
+      oninput: e => { m.unit = e.target.value.trim(); ezCheckMapping(); } });
+    const scale = isX ? h('input', { type: 'number', step: 'any', value: m.scale, style: 'width:96px',
+      oninput: e => { m.scale = +e.target.value || 1; ezCheckMapping(); } }) : null;
+    const editor = h('div', { class: 'unitedit', 'data-col': col, hidden: !(m.scale && m.scale !== 1) },
+      h('label', { class: 'row' }, '컬럼 단위', unit),
+      isX ? h('label', { class: 'row' }, '배율', scale) : null,
+      h('span', { class: 'sub hint', style: 'margin:0' }, isX ? '컬럼 값 × 배율 을 이 단위로 읽어 모델에 넣습니다' : ''));
+    const select = h('select', { onchange: e => {
+      m.targets = e.target.value ? e.target.value.split(',') : [];
+      const s = (sug || []).find(x => x.value === e.target.value);
+      if (isX && s && s.scale) { m.scale = s.scale; m.unit = s.unit || '1'; unit.value = m.unit; scale.value = m.scale; }
+      ezCheckMapping();
+    } }, ezOpts(pool, sug, m.targets, none));
+    return h('tr', { class: 'mrow ' + role, 'data-col': col },
+      h('td', { class: 'mrole' }, h('span', { class: 'badge ' + (role === 'is-y' ? 'y' : '') }, role === 'is-y' ? 'y' : 'x')),
+      ezColCell(col),
+      h('td', { class: 'marr' }, '→'),
+      h('td', { class: 'msel' }, select, editor),
+      h('td', { class: 'mstat', 'data-col': col }));
+  };
+  const rows = [row('is-y', EZ.target, EZ.tmap, cat.observables, sg.target, '— 연결 안 함 (물리모델을 못 씀) —', false)];
+  EZ.features.forEach(c => {
+    const m = EZ.fmap[c] = EZ.fmap[c] || { targets: [], unit: EZ.units[c] || '', scale: 1 };
+    rows.push(row('is-x', c, m, cat.inputs, (sg.inputs || {})[c], '— 물리모델에 안 씀 (ML 만) —', true));
+  });
+  const card = h('div', { class: 'card', id: 'ez-map' },
+    h('div', { class: 'card-head' }, h('h3', {}, '② 컬럼 ↔ 모델 연결'),
+      h('span', { class: 'sub' }, 'CSV 컬럼이 모델의 무엇인지. 이름·설명·단위로 추천해 채웠으니 맞는지 확인만 하세요')),
+    h('div', { class: 'mapbar' }, h('div', { id: 'ez-map-summary', class: 'row', style: 'gap:8px;flex-wrap:wrap' }),
+      h('div', { class: 'grow' }),
+      cat.suggest ? h('button', { class: 'btn ghost sm', onclick: () => {
+        const n = ezApplySuggest(true); toast(`추천대로 ${n}칸을 채웠습니다`); ezRenderPhysics($('#ez-model-pane'));
+      } }, '★ 추천대로 다시 채우기') : null),
+    EZ.autoFilled ? h('div', { class: 'note good' }, h('b', {}, `추천으로 ${EZ.autoFilled}칸을 채웠습니다. `),
+      '★ 가 붙은 항목이 추천입니다 — 이름(태그·설명 행)과 단위가 맞는 순서입니다. 틀린 줄만 고르면 됩니다.') : null,
+    h('div', { class: 'tablewrap' }, h('table', { class: 'map mapping' },
+      h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, 'CSV 컬럼'), h('th', {}, ''), h('th', {}, '모델 변수'), h('th', {}, '확인'))),
+      h('tbody', {}, rows))),
+    h('div', { id: 'ez-map-issues' }));
+  return card;
+}
+
+// 보조 계측값: 추천이 있는 컬럼만 체크 목록으로. 나머지는 접어 둔다
+function ezExtraCard() {
+  const cat = EZ.catalog, sg = (cat.suggest || {}).extra || {};
+  const others = EZ.profile.columns.filter(c => c.usable && c.name !== EZ.target && !EZ.features.includes(c.name));
+  if (!others.length) return null;
+  const line = c => {
+    const m = EZ.extra[c.name] = EZ.extra[c.name] || { targets: [], unit: EZ.units[c.name] || '' };
+    const sug = sg[c.name] || [];
+    const select = h('select', { onchange: e => {
+      m.targets = e.target.value ? [e.target.value] : [];
+      chk.checked = !!m.targets.length; ezCheckMapping(); ezExtraSummary();
+    } }, ezOpts(cat.observables, sug, m.targets, '— 연결 안 함 —'));
+    const chk = h('input', { type: 'checkbox', checked: !!m.targets.length, onchange: e => {
+      m.targets = e.target.checked ? [select.value || (sug[0] && sug[0].value)].filter(Boolean) : [];
+      if (m.targets.length) select.value = m.targets[0];
+      e.target.checked = !!m.targets.length; ezCheckMapping(); ezExtraSummary();
+    } });
+    return h('tr', { class: 'mrow', 'data-col': c.name },
+      h('td', { class: 'mrole' }, chk), ezColCell(c.name), h('td', { class: 'marr' }, '→'),
+      h('td', { class: 'msel' }, select), h('td', { class: 'mstat', 'data-col': c.name }));
+  };
+  const withSug = others.filter(c => (sg[c.name] || []).length);
+  const rest = others.filter(c => !(sg[c.name] || []).length);
+  const n = Object.values(EZ.extra).filter(m => m.targets && m.targets.length).length;
+  return h('details', { class: 'card fold', id: 'ez-extra', open: n > 0 || EZ.extraOpen },
+    h('summary', { onclick: () => (EZ.extraOpen = !$('#ez-extra').open) }, h('b', {}, '③ 보조 계측값 (선택)'),
+      h('span', { class: 'sub', id: 'ez-extra-sum' }, '')),
+    h('div', { class: 'sub', style: 'margin:10px 0 8px' }, '모델이 계산하는 다른 계측값(유량·차압·온도 …)을 같이 맞추면 물리 파라미터가 더 잘 갈립니다. 입력으로는 쓰지 않습니다. 모델이 ‘현장 계측값’으로 선언한 것은 켜 두었습니다.'),
+    withSug.length ? h('div', { class: 'tablewrap' }, h('table', { class: 'map mapping' }, h('tbody', {}, withSug.map(line)))) : null,
+    rest.length ? h('details', { class: 'fold', style: 'margin-top:10px' },
+      h('summary', {}, h('span', { class: 'sub' }, `추천이 없는 컬럼 ${rest.length}개도 연결하기`)),
+      h('div', { class: 'tablewrap' }, h('table', { class: 'map mapping' }, h('tbody', {}, rest.map(line))))) : null);
+}
+
+function ezExtraSummary() {
+  const el = $('#ez-extra-sum'); if (!el) return;
+  const n = Object.entries(EZ.extra).filter(([c, m]) => c !== EZ.target && !EZ.features.includes(c) && m.targets && m.targets.length).length;
+  el.textContent = ` 켜진 것 ${n}개 — 보정을 더 정확하게`;
+}
+
+// 확인 칸: 연결됨 ✓ / 단위 확인 ⚠ / 안 씀 —. 틀린 줄은 단위·배율 칸을 연다
+function ezDrawMapStatus(issues) {
+  const byCol = {};
+  (issues || []).forEach(i => (byCol[i.column] = i.message));
+  const sg = (EZ.catalog && EZ.catalog.suggest) || {};
+  let ok = 0, warn = 0, off = 0;
+  $$('#ez-model-pane td.mstat').forEach(td => {
+    const col = td.dataset.col;
+    const isY = col === EZ.target, isX = EZ.features.includes(col);
+    const m = isY ? EZ.tmap : isX ? EZ.fmap[col] : EZ.extra[col];
+    const linked = m && m.targets && m.targets.length;
+    const tr = td.parentNode;
+    td.innerHTML = '';
+    let cls = '';
+    if (!linked) {
+      if (isY) { td.append(h('span', { class: 'st bad' }, '⚠ 연결 필요')); cls = 'bad'; warn++; }
+      else if (isX) { td.append(h('span', { class: 'st off' }, '— ML 만')); off++; }
+      else {
+        const s = ((sg.extra || {})[col] || [])[0];
+        if (s) td.append(h('span', { class: 'st off', title: s.why }, '추천 있음 — 체크하면 연결'));
+      }
+    } else if (byCol[col]) {
+      td.append(h('span', { class: 'st warn', title: byCol[col] }, '⚠ 단위 확인'));
+      cls = 'warn'; if (isY || isX) warn++;
+    } else {
+      const pool = isY ? sg.target : isX ? (sg.inputs || {})[col] : (sg.extra || {})[col];
+      const s = (pool || []).find(x => x.value === m.targets.join(','));
+      td.append(h('span', { class: 'st good', title: s ? s.why : '' }, s ? '✓ 추천과 같음' : '✓ 연결됨'));
+      if (isY || isX) ok++;
+    }
+    tr.classList.toggle('warn', cls === 'warn'); tr.classList.toggle('bad', cls === 'bad');
+    const ed = tr.querySelector('.unitedit');
+    if (ed && linked) td.append(h('button', { class: 'linkbtn', title: '컬럼 단위와 배율을 직접 고칩니다', onclick: () => {
+      EZ.unitOpen[col] = !EZ.unitOpen[col]; ed.hidden = !ed.hidden; } }, '단위·배율'));
+    if (ed) {
+      ed.hidden = !(byCol[col] || EZ.unitOpen[col] || (m && m.scale && m.scale !== 1));
+      const hint = ed.querySelector('.hint');
+      if (hint && byCol[col]) hint.textContent = byCol[col];
+    }
+  });
+  const sum = $('#ez-map-summary');
+  if (sum) {
+    sum.innerHTML = '';
+    const yOk = EZ.tmap && EZ.tmap.targets.length;
+    // Element.append(null) 은 'null' 글자를 넣는다 — 빈 것은 거른다
+    sum.append(...[h('span', { class: 'chip static ' + (yOk ? '' : 'warnchip') }, yOk ? 'y 연결됨' : 'y 연결 필요'),
+      h('span', { class: 'chip static' }, `입력 ${EZ.features.filter(c => EZ.fmap[c] && EZ.fmap[c].targets.length).length}/${EZ.features.length} 연결`),
+      warn ? h('span', { class: 'chip static warnchip' }, `확인 필요 ${warn}`) : null].filter(Boolean));
+  }
+  ezExtraSummary();
 }
 
 // ── 구성방정식 후보: 코드가 추리고 근거를 붙이면, 고르는 건 사용자 ─────────────
@@ -823,15 +981,16 @@ function ezCheckMapping() {
     const box = $('#ez-map-issues'); if (!box) return;
     try {
       const r = await api('/api/easy/check', ezBody(true));
-      box.innerHTML = '';
       const issues = r.mapping_issues || [];
+      ezDrawMapStatus(issues);
+      box.innerHTML = '';
       if (!EZ.tmap || !EZ.tmap.targets.length)
-        box.append(h('div', { class: 'note warn' }, `y(${EZ.target})를 모델 변수에 연결해야 물리모델을 돌릴 수 있습니다.`));
-      if (!EZ.features.some(c => EZ.fmap[c] && EZ.fmap[c].targets.length))
+        box.append(h('div', { class: 'note warn' }, `예측할 값 y(${EZ.target})를 모델 변수에 연결해야 물리모델을 돌릴 수 있습니다.`));
+      else if (!EZ.features.some(c => EZ.fmap[c] && EZ.fmap[c].targets.length))
         box.append(h('div', { class: 'note warn' }, '입력(x)을 하나 이상 모델 변수에 연결하세요. 연결하지 않은 입력은 ML 만 씁니다.'));
-      issues.forEach(i => box.append(h('div', { class: 'note bad' }, h('b', {}, `${i.column} → ${i.target}: `), i.message)));
-      if (!issues.length && EZ.tmap && EZ.tmap.targets.length)
-        box.append(h('div', { class: 'note good' }, '연결과 단위가 맞습니다.'));
+      else if (issues.length)
+        box.append(h('div', { class: 'note warn' }, `⚠ 표시한 ${issues.length}줄의 단위를 확인하세요 — 줄 아래에 이유와 단위·배율 칸이 열려 있습니다.`));
+      else box.append(h('div', { class: 'note good' }, '연결과 단위가 맞습니다. 아래 ▶ 실행을 누르면 됩니다.'));
     } catch (e) { box.innerHTML = ''; box.append(h('div', { class: 'note bad' }, e.message)); }
   }, 250);
 }

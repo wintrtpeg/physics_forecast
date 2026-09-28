@@ -31,7 +31,7 @@ from typing import Any, Callable
 import yaml
 
 from ..core import symbolic as S
-from ..core.component import Component, ParamSpec, PortSpec, Scope, VarSpec
+from ..core.component import ParamSpec, PortSpec, Scope, VarSpec
 from ..core.parser import FunctionTable, parse_equation, parse_expression
 from .flow import GasComponent
 from .gas import (FLUE_GAS, GasMedium, density, enthalpy, humidity_from_rh,
@@ -234,10 +234,14 @@ class EquationComponent(GasComponent):
             eqs = {f"eq{i}": e for i, e in enumerate(eqs)}
         self._equation_src: dict[str, str] = {str(k): str(v) for k, v in eqs.items()}
         self._output_src: dict[str, tuple[str, str]] = {}
+        #: 출력 설명 (화면의 컬럼 연결 추천·목록에 쓴다). 없으면 같은 이름 변수의 desc
+        self.output_desc: dict[str, str] = {}
         for oname, ocfg in (data.get("outputs") or {}).items():
             if isinstance(ocfg, str):
                 ocfg = {"expr": ocfg}
             self._output_src[str(oname)] = (str(ocfg["expr"]), str(ocfg.get("unit", "1")))
+            if ocfg.get("desc"):
+                self.output_desc[str(oname)] = str(ocfg["desc"])
 
         # 파라미터 값 오버라이드는 Component.__init__ 이 받는다
         param_values = {k: v for k, v in (data.get("values") or {}).items()}

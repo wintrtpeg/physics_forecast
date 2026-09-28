@@ -155,8 +155,22 @@ def _has_param(model, name: str) -> bool:
 
 
 def model_catalog(model) -> dict:
-    """컬럼 연결 화면에 필요한 목록: 입력으로 쓸 파라미터, 관측으로 쓸 값, 보정 후보."""
+    """컬럼 연결 화면에 필요한 목록: 입력으로 쓸 파라미터, 관측으로 쓸 값, 보정 후보.
+
+    이름은 사람이 읽는 순서로 적는다 — ``컴포넌트 · 뜻`` (예: ``SRC_DRY · 가동율``). 코드 이름
+    (``SRC_DRY.util``)은 ``value`` 에 남긴다.
+    """
     from .calib.runner import resolve_targets
+
+    comps = getattr(model.system, "components", {}) or {}
+
+    def comp_title(name: str) -> str:
+        from .lib.explain import title_of
+        c = comps.get(name.split(".", 1)[0])
+        try:
+            return title_of(c) if c is not None else ""
+        except Exception:  # noqa: BLE001 — 제목은 보조 정보
+            return ""
 
     inputs = []
     seen = set()
@@ -166,25 +180,56 @@ def model_catalog(model) -> dict:
                    if not p.tunable and p.name.rsplit(".", 1)[-1] == key]
         if not members:
             continue
+        label = d.get("label", key)
         if len(members) > 1 and d.get("mode", "set") != "scale":
-            inputs.append({"value": ",".join(members), "label": f"{d.get('label', key)} — 전체 {len(members)}개",
-                           "unit": d.get("unit", ""), "group": "운전 손잡이"})
+            where = ", ".join(m.split(".", 1)[0] for m in members)
+            inputs.append({"value": ",".join(members), "label": f"{label} — 전체 {len(members)}곳 ({where})",
+                           "unit": d.get("unit", ""), "group": "운전 손잡이 (모델이 선언)", "key": key,
+                           "desc": label, "component": "", "declared": True, "members": len(members)})
         for m in members:
             info = model.parameters[model.par_index(m)]
-            inputs.append({"value": m, "label": f"{m} ({d.get('label', key)})",
-                           "unit": d.get("unit", info.unit), "group": "운전 손잡이"})
+            comp = m.split(".", 1)[0]
+            inputs.append({"value": m, "label": f"{comp} · {label}",
+                           "unit": d.get("unit", info.unit), "group": "운전 손잡이 (모델이 선언)", "key": key,
+                           "desc": " ".join(x for x in (label, info.desc) if x), "component": comp,
+                           "component_title": comp_title(m), "declared": True})
             seen.add(m)
     for p in model.parameters:
         if p.tunable or p.name in seen or p.name.startswith("_"):
             continue
-        inputs.append({"value": p.name, "label": f"{p.name} — {p.desc}" if p.desc else p.name,
-                       "unit": p.unit, "group": "그 밖의 파라미터"})
+        comp, _, key = p.name.rpartition(".")
+        inputs.append({"value": p.name, "label": f"{comp} · {p.desc or key}" if comp else (p.desc or key),
+                       "unit": p.unit, "group": "그 밖의 설계값", "key": key, "desc": p.desc or "",
+                       "component": comp, "component_title": comp_title(p.name), "declared": False})
 
     obs_decl = declared_observables(model)
-    observables = [{"value": n, "label": f"{n} — {d}" if d else n} for n, d in obs_decl.items()]
+    observables = []
+    for n, d in obs_decl.items():
+        observables.append({"value": n, "label": d or n, "group": "현장 계측값 (모델이 선언)",
+                            "desc": d or "", "component": n.split(".", 1)[0], "key": n.split(".", 1)[-1],
+                            "declared": True})
+    def out_desc(n: str) -> str:
+        """출력의 설명: 컴포넌트가 적은 출력 설명 → 같은 이름 변수의 설명."""
+        comp, _, key = n.rpartition(".")
+        c = comps.get(comp)
+        if c is None:
+            return ""
+        d = (getattr(c, "output_desc", None) or {}).get(key)
+        if d:
+            return d
+        try:
+            vs = c.var_specs().get(key)
+        except Exception:  # noqa: BLE001 — 설명은 보조 정보
+            vs = None
+        return (vs.desc if vs is not None else "") or ""
+
     for n, (_, u) in model.outputs.items():
         if n not in obs_decl:
-            observables.append({"value": n, "label": f"{n} [{u}]"})
+            comp, _, key = n.rpartition(".")
+            d = out_desc(n)
+            observables.append({"value": n, "label": f"{comp} · {d or key}" if comp else (d or key),
+                                "group": "그 밖의 모델 출력", "desc": d, "component": comp, "key": key,
+                                "declared": False})
     units = {}
     for o in observables:
         try:
@@ -194,11 +239,179 @@ def model_catalog(model) -> dict:
             units[o["value"]] = ""
     for o in observables:
         o["unit"] = units.get(o["value"], "")
+        o["component_title"] = comp_title(o["value"])
 
     params = [{"value": p.name, "unit": p.unit, "desc": p.desc,
                "value_now": from_si(p.value, p.unit)} for p in model.tunable_params()]
     return {"inputs": inputs, "observables": observables, "params": params,
             "declared_params": declared_calibration(model)}
+
+
+# ---------------------------------------------------------------------------
+# 컬럼 ↔ 모델 변수 자동 추천 — 이름·설명·단위로 점수를 매기고, 고르는 것은 사용자
+# ---------------------------------------------------------------------------
+
+#: 계통과 무관한 일반 계측 용어. 태그 이름 조각(영문)은 토큰으로, 한글은 부분 문자열로 찾는다.
+_CONCEPTS: dict[str, tuple[str, ...]] = {
+    "온도": ("temp", "temperature", "t", "tt", "tmp", "온도"),
+    "유량": ("flow", "flowrate", "q", "mdot", "fr", "ft", "cmm", "유량", "풍량", "수량", "배기량", "배출량"),
+    "압력": ("press", "pressure", "p", "pt", "압력", "정압"),
+    "차압": ("dp", "dpt", "differential", "차압"),
+    "가동률": ("util", "utilization", "utilisation", "load", "가동률", "가동율", "부하율"),
+    "대수": ("cnt", "count", "qty", "num", "n", "대수"),
+    "장비": ("eqp", "equip", "equipment", "tool", "tools", "장비", "설비"),
+    "회전": ("hz", "freq", "frequency", "rpm", "speed", "inv", "inverter", "vfd", "회전수", "주파수", "인버터",
+             "속도"),
+    "외기": ("amb", "ambient", "oa", "outdoor", "outside", "외기", "대기"),
+    "습도": ("humid", "humidity", "rh", "습도"),
+    "습구": ("wb", "wetbulb", "습구"),
+    "전력": ("power", "kw", "pwr", "전력", "동력"),
+    "레벨": ("level", "lvl", "레벨", "수위"),
+    "농도": ("conc", "concentration", "ppm", "농도"),
+    "송풍기": ("fan", "blower", "송풍기", "팬"),
+    "펌프": ("pump", "펌프"),
+    "공급": ("supply", "sup", "공급"),
+    "환수": ("return", "ret", "환수"),
+    "순환": ("circ", "circulation", "순환"),
+    "효율": ("eff", "efficiency", "cop", "효율", "성적계수"),
+}
+_KW2CONCEPT = {k: c for c, kws in _CONCEPTS.items() for k in kws if not re.search("[가-힣]", k)}
+_KO2CONCEPT = [(k, c) for c, kws in _CONCEPTS.items() for k in kws if re.search("[가-힣]", k)]
+
+
+def _text_features(*texts: str) -> tuple[set[str], set[str], set[str]]:
+    """(영문 토큰, 한글 낱말, 개념) — 토큰 끝의 번호(scr01)는 뗀다."""
+    text = " ".join(t for t in texts if t)
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    toks = set()
+    for t in re.split(r"[^0-9A-Za-z]+", spaced.lower()):
+        t = re.sub(r"\d+$", "", t)
+        if t and not t.isdigit():
+            toks.add(t)
+    ko = {w for w in re.findall(r"[가-힣]{2,}", text)}
+    concepts = {_KW2CONCEPT[t] for t in toks if t in _KW2CONCEPT}
+    concepts |= {c for k, c in _KO2CONCEPT if k in text}
+    return toks, ko, concepts
+
+
+def _unit_match(col_unit: str, model_unit: str) -> tuple[bool | None, float | None, str]:
+    """(단위 차원이 맞나 — 모르면 None, 추천 배율, 설명)."""
+    from .core.units import dim_of, dim_str
+    if not col_unit or not model_unit:
+        return None, None, ""
+    try:
+        dc, dm = dim_of(col_unit), dim_of(model_unit)
+    except Exception:  # noqa: BLE001 — 모르는 단위 기호
+        return None, None, ""
+    if dc == dm:
+        return True, None, f"단위 {col_unit} → {model_unit}"
+    # 인버터 주파수·회전수를 정격 대비 비율로 받는 모델 (Hz → 1): 정격으로 나누면 된다
+    if dim_str(dm) == "1" and dim_str(dc) == "1/s":
+        rated = 60.0 if col_unit.lower() == "hz" else None
+        return False, (1.0 / rated if rated else None), (
+            f"{col_unit} 를 정격 대비 비율(1)로 바꿔야 합니다 — 배율 = 1/정격값"
+            + (" (정격 60 Hz 면 0.016667)" if rated else ""))
+    return False, None, f"단위 차원이 다릅니다: {col_unit} [{dim_str(dc)}] vs {model_unit} [{dim_str(dm)}]"
+
+
+def _score(col: dict, cand: dict) -> dict | None:
+    """이름의 **뜻**(측정량·설명 낱말)이 하나는 맞아야 후보가 된다. 위치(컴포넌트 이름)만 같은
+    것은 후보가 아니다 — DRY 가동률 컬럼이 DRY 장비 대수에 붙으면 안 된다."""
+    ctok, cko, ccon = _text_features(col.get("name", ""), col.get("desc", ""))
+    # '전체 N곳' 묶음은 위치 이름을 빼고 뜻만 본다 (모든 곳 이름이 들어 있어 무엇에나 맞으므로)
+    label = cand.get("label", "").split(" — 전체")[0] if cand.get("members") else cand.get("label", "")
+    where = "" if cand.get("members") else cand.get("component", "")
+    mtok, mko, mcon = _text_features(label, cand.get("desc", ""), cand.get("key", ""))
+    ltok, _, _ = _text_features(where)
+    concepts = ccon & mcon
+    concept_kws = set(_KW2CONCEPT)
+    meaning = {t for t in (ctok & mtok) if t not in concept_kws and len(t) >= 2}
+    loc = {t for t in (ctok & ltok) if t not in concept_kws and len(t) >= 2} - meaning
+    ko = {w for w in mko if any(w in x or x in w for x in cko)} - {k for k, _ in _KO2CONCEPT}
+    if not (concepts or meaning or ko):
+        return None
+    toks = meaning | loc
+    score = 1.0 * len(concepts) + 1.0 * len(toks) + 0.6 * len(ko)
+    ok, scale, unit_note = _unit_match(col.get("unit", ""), cand.get("unit", ""))
+    if ok is True:
+        score += 0.5
+    elif ok is False:
+        score *= 0.85 if "정격" in unit_note else 0.25
+    if cand.get("declared"):
+        score += 0.3
+    if cand.get("members"):                 # '전체 N곳': 곳을 가리키는 낱말이 없을 때 더 맞다
+        score += 0.2
+    why = [f"이름 {', '.join(sorted(concepts | toks | ko))}"]
+    if unit_note:
+        why.append(unit_note)
+    out = {"value": cand["value"], "label": cand["label"], "unit": cand.get("unit", ""),
+           "score": round(score, 2), "unit_ok": ok, "why": " · ".join(why),
+           "declared": bool(cand.get("declared"))}
+    if scale is not None:
+        out["scale"] = scale
+    return out
+
+
+#: 이 점수 이상이고 단위가 맞으면(또는 모르면) '추천대로 연결'이 채운다
+SUGGEST_MIN = 1.8
+#: 선택 상자에 ★ 추천으로 보여줄 최소 점수 (뜻이 하나 맞고 단위가 맞는 정도)
+SUGGEST_SHOW = 1.0
+
+
+def suggest_mapping(cat: dict, columns: list[dict], target: str | None, features: list[str],
+                    top: int = 3) -> dict:
+    """CSV 컬럼마다 모델 변수 후보를 점수 순으로. 입력은 한 모델 변수에 한 컬럼만 (겹치면 점수 높은 쪽).
+
+    ``columns``: ``[{"name", "unit", "desc"}]`` (프로파일이 읽은 단위·설명 행). 돌려주는 ``best`` 는
+    자동으로 채워도 될 만큼 확실한 것만 — 점수 ``SUGGEST_MIN`` 이상, 단위가 틀리지 않은 것.
+    """
+    by = {c["name"]: c for c in columns}
+
+    def ranked(col: dict, pool: list[dict], floor: float = SUGGEST_SHOW) -> list[dict]:
+        sc = [x for x in (_score(col, c) for c in pool) if x and x["score"] >= floor]
+        return sorted(sc, key=lambda x: -x["score"])
+
+    res: dict = {"target": [], "inputs": {}, "extra": {}, "best": {"target": None, "inputs": {}, "extra": {}}}
+    if target and target in by:
+        res["target"] = ranked(by[target], cat["observables"])[:top]
+        b = res["target"][0] if res["target"] else None
+        if b and b["score"] >= SUGGEST_MIN and b["unit_ok"] is not False:
+            res["best"]["target"] = b["value"]
+    # 입력: 모든 (컬럼, 후보) 쌍을 점수 순으로 한 번씩만 배정
+    pairs = []
+    for f in features:
+        if f not in by:
+            continue
+        r = ranked(by[f], cat["inputs"])
+        res["inputs"][f] = r[:top]
+        pairs += [(x["score"], f, x) for x in r[:8]]
+    used: set[str] = set()
+    for sc, f, x in sorted(pairs, key=lambda t: -t[0]):
+        members = set(x["value"].split(","))
+        if f in res["best"]["inputs"] or members & used:
+            continue
+        if sc >= SUGGEST_MIN and (x["unit_ok"] is not False or x.get("scale")):
+            b = {"value": x["value"]}
+            if x.get("scale"):                   # 비율로 받는 모델: 단위 1 + 배율
+                b.update(scale=x["scale"], unit=x["unit"] or "1")
+            res["best"]["inputs"][f] = b
+            used |= members
+    # 보조 관측: 나머지 컬럼 중 모델 계측값과 확실히 맞는 것
+    taken = {res["best"]["target"]} if res["best"]["target"] else set()
+    for c in columns:
+        n = c["name"]
+        if n == target or n in features:
+            continue
+        r = [x for x in ranked(c, cat["observables"], SUGGEST_MIN) if x["value"] not in taken]
+        if not r:
+            continue
+        res["extra"][n] = r[:top]
+        # 자동으로 켜는 것은 모델이 '현장 계측값'으로 선언한 것만. 나머지는 추천으로만 보인다
+        # (보정에 넣을 관측은 결과를 바꾸므로 사람이 켠다)
+        if r[0]["score"] >= SUGGEST_MIN + 0.5 and r[0]["unit_ok"] is True and r[0].get("declared"):
+            res["best"]["extra"][n] = r[0]["value"]
+            taken.add(r[0]["value"])
+    return res
 
 
 def param_sensitivity(model, target: str, rel: float = 0.01) -> dict[str, float]:
