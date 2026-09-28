@@ -647,15 +647,25 @@ class Api:
         return {"presets": pre}
 
     def easy_catalog(self, body) -> dict:
-        from ..easy import model_catalog, param_sensitivity
+        from ..easy import model_catalog, param_sensitivity, suggest_mapping
         rel = body["model"]
         model = self.ws.model(rel)
         with self.ws.lock(rel):
             cat = model_catalog(model)
+        # CSV 컬럼 ↔ 모델 변수 추천 (이름·설명 행·단위). 단위는 화면에서 고친 값이 우선
+        suggest = None
+        if body.get("csv") and body.get("y"):
+            tab, _ = self.ws.table(body["csv"], body.get("time_column"))
+            units = body.get("units") or {}
+            cols = [{"name": c, "unit": units.get(c) or tab.report.units.get(c, ""),
+                     "desc": tab.report.descriptions.get(c, "")} for c in tab.df.columns]
+            suggest = suggest_mapping(cat, cols, body["y"], list(body.get("features") or []))
+        hint = body.get("target") or (suggest and suggest["best"]["target"])
+        with self.ws.lock(rel):
             sens = {}
-            if body.get("target"):
+            if hint:
                 try:
-                    sens = param_sensitivity(model, body["target"])
+                    sens = param_sensitivity(model, hint)
                 except Exception:  # noqa: BLE001 — 민감도는 추천용일 뿐이다
                     sens = {}
         for p in cat["params"]:
@@ -667,7 +677,7 @@ class Api:
         from ..scenario import load_model
         path = self.ws.resolve(rel)
         system = load_model({"yaml": str(path)} if path.suffix in (".yaml", ".yml") else {"python": str(path)})
-        return {**cat, "suggested": suggested, "closures": closure_catalog(system)}
+        return {**cat, "suggested": suggested, "closures": closure_catalog(system), "suggest": suggest}
 
     def easy_check(self, body) -> dict:
         from ..easy import check, config_from_body, mapping_issues

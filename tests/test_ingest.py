@@ -107,3 +107,33 @@ def test_text_column_is_reported_not_silently_dropped():
     assert "mode" not in tab.df.columns
     assert "mode" in tab.report.text_columns
     assert any("숫자가 아닌 컬럼" in line for line in tab.report.lines())
+
+
+@pytest.mark.parametrize("values, expect, moved", [
+    # 한 가지 시간대: 떼고 적힌 시각 그대로
+    (["2025-01-01T00:00:00+09:00", "2025-01-01T00:05:00+09:00"], ["2025-01-01 00:00", "2025-01-01 00:05"], 0),
+    (["2025-01-01T00:00:00Z", "2025-01-01T00:05:00.000Z"], ["2025-01-01 00:00", "2025-01-01 00:05"], 0),
+    (["2025-01-01 00:00:00+0900", "2025-01-01 00:05:00 +09:00"], ["2025-01-01 00:00", "2025-01-01 00:05"], 0),
+    # 섞이면 가장 많은 시간대 기준으로 옮긴다 (서머타임 전환, Z 와 +09:00 혼용)
+    (["2025-03-30T01:55:00+01:00", "2025-03-30T03:00:00+02:00", "2025-03-30T03:05:00+02:00"],
+     ["2025-03-30 02:55", "2025-03-30 03:00", "2025-03-30 03:05"], 1),
+    (["2024-12-31T15:00:00Z", "2025-01-01T00:05:00+09:00", "2025-01-01T00:10:00+09:00"],
+     ["2025-01-01 00:00", "2025-01-01 00:05", "2025-01-01 00:10"], 1),
+])
+def test_timezone_suffixes_become_local_wall_clock(values, expect, moved):
+    """시간대가 붙은 시각(+09:00, Z)은 예전엔 TypeError 로 업로드가 통째로 실패했다."""
+    out, stats = parse_times(pd.Series(values))
+    assert [str(t)[:16] for t in out] == expect
+    assert out.dt.tz is None
+    assert any(k.startswith("시간대 표기") for k in stats)
+    assert sum(v for k, v in stats.items() if k.startswith("다른 시간대")) == moved
+
+
+def test_timezone_csv_reads_and_reports(tmp_path):
+    idx = pd.date_range("2025-01-01", periods=12, freq="5min")
+    text = "time,x\n" + "\n".join(f"{t:%Y-%m-%dT%H:%M:%S}+09:00,{i}" for i, t in enumerate(idx))
+    p = tmp_path / "tz.csv"
+    p.write_text(text, encoding="utf-8")
+    tab = read_table(p)
+    assert tab.df.index.tz is None and tab.df.index[0] == pd.Timestamp("2025-01-01 00:00")
+    assert len(tab.df) == 12 and any("+09:00" in line for line in tab.report.lines())

@@ -58,6 +58,21 @@ _NICE_INTERVALS = (1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 300, 600, 900, 1200, 1
                    7200, 10800, 21600, 43200, 86400)
 _RE_DATE_SHAPE = r"\d{4}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{1,2}|\d{1,2}\s*[-./]\s*\d{1,2}\s*[-./]\s*\d{4}"
 _RE_THOUSANDS = r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+#: 시각 뒤에 붙은 시간대 표기: 2025-01-01T00:05:00+09:00, ...Z, ... +0900, ... UTC
+_RE_TZ_SUFFIX = re.compile(r"^(.*\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(Z|z|UTC|GMT|[+-]\d{2}:?\d{2})$")
+
+
+def _offset_minutes(tok: str) -> int:
+    if tok.upper() in ("Z", "UTC", "GMT"):
+        return 0
+    sign = -1 if tok[0] == "-" else 1
+    d = tok[1:].replace(":", "")
+    return sign * (int(d[:2]) * 60 + int(d[2:]))
+
+
+def _fmt_offset(m: int) -> str:
+    return "UTC(Z)" if m == 0 else f"{'+' if m > 0 else '-'}{abs(m) // 60:02d}:{abs(m) % 60:02d}"
+
 _RE_NUM_SUFFIX = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*([^\d\s.,+-].*?)\s*$")
 
 
@@ -84,11 +99,32 @@ def parse_times(values: pd.Series) -> tuple[pd.Series, dict[str, int]]:
     s = values.astype("string").str.strip()
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
     stats: dict[str, int] = {}
+    # 0) 시간대 표기(+09:00, Z)는 떼고 **적힌 시각 그대로** 쓴다. 현장 데이터·생산계획은 현지
+    #    시각으로 맞춰야 하므로 시간대를 붙인 채 두면 안 된다 (pandas 는 붙은 채로 섞으면 거부한다).
+    #    여러 시간대가 섞였으면(서머타임, Z 와 +09:00 혼용) 가장 많은 시간대 기준으로 옮긴다.
+    shift = None
+    tz = s.str.extract(_RE_TZ_SUFFIX)
+    has_tz = tz[0].notna()
+    if has_tz.any():
+        offs = tz.loc[has_tz, 1].map(_offset_minutes)
+        common = int(offs.mode().iloc[0])
+        s = s.copy()
+        s.loc[has_tz] = tz.loc[has_tz, 0]
+        moved = offs != common
+        if moved.any():
+            shift = pd.Series(0, index=s.index, dtype="int64")
+            shift.loc[moved[moved].index] = (common - offs[moved]).astype("int64")
+        kinds = ", ".join(_fmt_offset(int(m)) for m in sorted(offs.unique()))
+        stats[f"시간대 표기({kinds}) 뗌 → {_fmt_offset(common)} 기준 시각"] = int(has_tz.sum())
+        if moved.any():
+            stats[f"다른 시간대 → {_fmt_offset(common)} 로 옮김"] = int(moved.sum())
     empty = s.isna() | (s == "")
     todo = ~empty
 
     def take(mask, parsed, label):
         parsed = pd.to_datetime(parsed, errors="coerce")
+        if isinstance(parsed.dtype, pd.DatetimeTZDtype):     # 방어: 시간대가 남았으면 적힌 시각으로
+            parsed = parsed.dt.tz_localize(None)
         # 일반 파서는 '50.4' 같은 숫자도 날짜로 우긴다 (서기 161년). 상식적인 연도만 받는다.
         ok = parsed.notna() & parsed.dt.year.between(1980, 2100)
         if ok.any():
@@ -141,6 +177,8 @@ def parse_times(values: pd.Series) -> tuple[pd.Series, dict[str, int]]:
         if serial.any():
             parsed = pd.to_datetime(num[serial], unit="D", origin="1899-12-30")
             todo = take(todo, parsed.dt.round("s"), "엑셀 일련번호")
+    if shift is not None:
+        out = out + pd.to_timedelta(shift, unit="min")
     stats["해석 불가"] = int(todo.sum())
     return out, stats
 

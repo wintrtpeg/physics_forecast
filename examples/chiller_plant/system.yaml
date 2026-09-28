@@ -22,6 +22,12 @@ drivers:
   - {key: T_chws,  label: 냉수 공급온도,    unit: degC, lo: 5,    hi: 12}
   - {key: app_nom, label: 냉각탑 접근온도차, unit: K,    lo: 2.5,  hi: 9}
 
+#: 현장에서 재는 값 (보정·검증에 씀). 간편 예측의 컬럼 연결 추천이 이 설명을 본다
+observables:
+  PLANT.W_total: 플랜트 총 전력 [kW]
+  CHILLER.COP: 칠러 성적계수 (COP)
+  TOWER.T_cw: 냉각수 온도 [degC]
+
 limits:
   PLANT.kW_per_RT: {max: 0.85, label: 에너지 원단위 관리기준}
   CHILLER.COP:     {min: 4.5,  label: COP 하한}
