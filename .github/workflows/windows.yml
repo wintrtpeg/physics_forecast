@@ -60,6 +60,23 @@ jobs:
           "---- launcher.out.log"; Get-Content -Encoding utf8 launcher.out.log -ErrorAction SilentlyContinue
           "---- launcher.err.log"; Get-Content -Encoding utf8 launcher.err.log -ErrorAction SilentlyContinue
 
+      - name: 두 번째 실행 — 설치를 건너뛰고 바로 뜨는가 (포트 8766)
+        shell: pwsh
+        env:
+          PF_NO_BROWSER: "1"
+          PF_NO_PAUSE: "1"
+          PF_PORT: "8766"
+        run: |
+          $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'run_pforecast.bat' `
+                 -RedirectStandardOutput second.out.log -RedirectStandardError second.err.log -PassThru -WindowStyle Hidden
+          $t0 = Get-Date
+          while (((Get-Date) - $t0).TotalSeconds -lt 60) {
+            try { if ((Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8766/api/workspace -TimeoutSec 3).StatusCode -eq 200) {
+              "두 번째 실행: $([int]((Get-Date) - $t0).TotalSeconds)초 만에 떴습니다"; Get-Content -Encoding utf8 second.out.log; exit 0 } } catch { }
+            Start-Sleep 2
+          }
+          Get-Content -Encoding utf8 second.out.log; Get-Content -Encoding utf8 second.err.log; exit 1
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

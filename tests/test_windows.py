@@ -114,12 +114,21 @@ def test_examples_are_never_overwritten_and_uploads_are_not_rewritten(server):
     assert up2["path"] == up["path"] and f.stat().st_mtime_ns == before
 
 
-def test_launcher_bat_is_crlf_utf8_and_sets_utf8_mode():
+def test_launcher_bat_is_plain_ascii_crlf_and_delegates_to_python():
+    """cmd.exe 는 chcp 65001 뒤 한글(UTF-8) 배치 파일을 외부 프로그램이 끝난 다음부터 잘못 읽고
+    조용히 멈춘다 (윈도우 점검에서 '가상환경을 만드는 중...' 뒤 아무 말 없이 끝났다). 그래서 배치 파일은
+    ASCII 만, 일과 한글 안내는 scripts/launch.py 가 한다."""
     raw = (ROOT / "run_pforecast.bat").read_bytes()
+    assert all(b < 128 for b in raw), "배치 파일에 ASCII 가 아닌 글자"
     assert b"\r\n" in raw and raw.count(b"\n") == raw.count(b"\r\n"), "배치 파일은 CRLF 만"
-    text = raw.decode("utf-8")
-    lines = text.splitlines()
-    assert lines[0] == "@echo off" and lines[1] == "chcp 65001 >nul"
-    assert 'set "PYTHONUTF8=1"' in text
-    assert 'set "PAUSE=rem"' not in text              # rem 은 한 줄 블록의 뒷부분까지 주석으로 만든다
-    assert 'WORK=%~dp0."' in text                     # 끝의 \ 가 따옴표를 삼키지 않게
+    text = raw.decode("ascii")
+    assert not any(ln.strip().lower().startswith("chcp") for ln in text.splitlines())   # 주석 속 낱말은 괜찮다
+    assert 'set "PYTHONUTF8=1"' in text and "scripts\\launch.py" in text
+    assert "if not defined PF_NO_PAUSE pause" in text
+
+
+def test_launcher_script_runs_on_old_pythons_long_enough_to_explain():
+    """3.10 미만이면 문법 오류 대신 안내가 나와야 한다 — 버전 검사가 다른 import 보다 먼저."""
+    src = (ROOT / "scripts/launch.py").read_text(encoding="utf-8")
+    head = src.split("import hashlib")[0]
+    assert "sys.version_info < (3, 10)" in head
