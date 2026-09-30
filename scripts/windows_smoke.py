@@ -53,6 +53,19 @@ def site_csv() -> bytes:
     return ("\r\n".join(out) + "\r\n").encode("cp949")
 
 
+def site_long_csv() -> bytes:
+    """같은 데이터를 Historian 덤프 모양(긴 형식)으로: 한 줄에 일시·태그명·설명·값·단위, CP949."""
+    lines = (ROOT / "examples/nox_stack/data/plant_5min.csv").read_text(encoding="utf-8").splitlines()
+    cols = lines[0].split(",")[1:]
+    out = ["일시,태그명,태그설명,측정값,단위"]
+    for ln in lines[1:]:
+        t, *vals = ln.split(",")
+        for col, v in zip(cols, vals):
+            d, u = DESC.get(col, ("", ""))
+            out.append(f"{t},{col},{d},{v},{u}")
+    return ("\r\n".join(out) + "\r\n").encode("cp949")
+
+
 class Client:
     def __init__(self, base: str):
         self.base = base
@@ -105,6 +118,19 @@ def main() -> int:
     ok(str(prof["t_start"]).startswith("2025-03-01 00:00"), f"시작 시각 {prof['t_start']} (적힌 시각 그대로)")
     units = {col["name"]: col["unit"] for col in prof["columns"]}
     ok(units.get("F2_UT_SCR01_FAN_HZ") == "Hz", f"단위 행을 읽음 (FAN_HZ={units.get('F2_UT_SCR01_FAN_HZ')})")
+
+    print("[1-2. 업로드 — 긴 형식 (한 줄에 일시·태그·값), CP949]")
+    upl = c.call("/api/upload?name=" + urllib.parse.quote("긴형식 덤프.csv"), raw=site_long_csv())
+    pl = c.call("/api/profile", {"csv": upl["path"]})
+    ok(pl["rows"] == 8640 and [col["name"] for col in pl["columns"]] == [col["name"] for col in prof["columns"]],
+       f"태그별 컬럼으로 펼침 ({pl['rows']}행 × {len(pl['columns'])}컬럼)")
+    ok(any("긴 형식" in ln for ln in pl["ingest"]["lines"]), "정리 내역에 긴 형식 처리가 적힘")
+    lunits = {col["name"]: col["unit"] for col in pl["columns"]}
+    ok(all(lunits.get(k) == units.get(k) for k in DESC), "단위 컬럼에서 태그별 단위를 읽음")
+    lcat = c.call("/api/easy/catalog", {"model": next(m["path"] for m in c.call("/api/workspace")["models"]
+                                                      if m["path"].endswith("nox_stack/model.py")),
+                                        "csv": upl["path"], "y": Y, "features": X, "units": lunits})
+    ok(lcat["suggest"]["best"]["target"] == "STK.C_dry", "긴 형식에서도 자동 연결 (y)")
 
     print("[4. 모델·연결 자동 추천]")
     ws = c.call("/api/workspace")

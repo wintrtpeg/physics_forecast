@@ -230,6 +230,7 @@ class IngestReport:
     units: dict[str, str] = field(default_factory=dict)          # 정규화된 단위
     units_raw: dict[str, str] = field(default_factory=dict)      # 파일에 적힌 그대로
     descriptions: dict[str, str] = field(default_factory=dict)
+    long: dict = field(default_factory=dict)                     # 긴 형식을 펼쳤으면 그 내역
     t_start: str | None = None
     t_end: str | None = None
 
@@ -260,6 +261,7 @@ class IngestReport:
             fm = ", ".join(f"{k} {v:,}행" for k, v in self.time_formats.items()
                            if v and k != "해석 불가")
             out.append(f"시각 컬럼 '{self.time_column}' — {fm}.{(' ' + self.time_column_note) if self.time_column_note else ''}")
+        out.extend(self._long_lines())
         if self.n_repeated_header:
             out.append(f"파일 중간의 반복 헤더 {self.n_repeated_header}행을 뺐습니다 "
                        "(여러 파일을 이어 붙인 흔적).")
@@ -267,8 +269,9 @@ class IngestReport:
             ex = ", ".join(repr(e) for e in self.bad_time_examples[:3])
             out.append(f"시각을 읽을 수 없는 행 {self.n_bad_time}개를 뺐습니다 (예: {ex}).")
         if self.n_out_of_order:
-            out.append(f"시간이 거꾸로 가는 곳이 {self.n_out_of_order}곳 있어 정렬했습니다.")
-        if self.n_duplicate_rows:
+            out.append(f"{'같은 이름 안에서 ' if self.long else ''}시간이 거꾸로 가는 곳이 "
+                       f"{self.n_out_of_order}곳 있어 정렬했습니다.")
+        if self.n_duplicate_rows and not self.long:
             msg = f"같은 시각이 두 번 이상 나온 행 {self.n_duplicate_rows:,}개를 합쳤습니다"
             if self.n_conflicting_duplicates:
                 msg += f" (그중 {self.n_conflicting_duplicates:,}개는 값이 달라 평균)"
@@ -301,6 +304,39 @@ class IngestReport:
                 g = self.gaps[0]
                 msg += f". 가장 긴 공백: {g['start']} ~ {g['end']} ({g['hours']:.1f}시간)"
             out.append(msg + ".")
+        return out
+
+    def _long_lines(self) -> list[str]:
+        L = self.long
+        if not L:
+            return []
+        vals = ", ".join(f"'{v}'" for v in L["values"])
+        cols = (f"컬럼 {L['n_columns']}개" if L["n_columns"] == L["n_names"]
+                else f"이름 × 값 컬럼 = 컬럼 {L['n_columns']}개")
+        out = [f"긴 형식(한 줄에 시각·이름·값 하나씩)을 컬럼별로 펼쳤습니다: '{L['key']}' 의 이름 "
+               f"{L['n_names']}개 × {vals} → {cols}, {L['n_rows']:,}줄 → 시각 {L['n_times']:,}개."]
+        got = [f"단위는 '{L['unit']}'" if L.get("unit") else "",
+               f"설명은 '{L['desc']}'" if L.get("desc") else ""]
+        if any(got):
+            out.append(" · ".join(g for g in got if g) + " 컬럼에서 이름마다 읽었습니다.")
+        if L.get("mixed_units"):
+            ex = ", ".join(f"{k}({' / '.join(v)})" for k, v in L["mixed_units"].items())
+            out.append(f"단위가 섞인 이름 {L['n_mixed_units']}개: {ex} — 가장 많이 나온 단위를 적었고 "
+                       "값은 바꾸지 않았습니다. 확인하세요.")
+        if L.get("status_numeric"):
+            out.append(f"품질 컬럼 '{L['status']}' 은 숫자 코드라 해석하지 않았습니다 (값은 그대로 씀).")
+        elif L.get("n_bad_status"):
+            out.append(f"품질 컬럼 '{L['status']}' 이 불량(Bad 등)인 값 {L['n_bad_status']:,}개는 결측으로 "
+                       "처리했습니다 (아래 상태 문자열 집계에 포함).")
+        if L.get("n_blank_key"):
+            out.append(f"이름이 빈 줄 {L['n_blank_key']:,}개를 뺐습니다.")
+        if L.get("n_dup"):
+            msg = f"같은 시각·같은 이름이 두 번 이상 나온 값 {L['n_dup']:,}개를 합쳤습니다"
+            if L.get("n_dup_conflict"):
+                msg += f" (그중 {L['n_dup_conflict']:,}개는 값이 달라 평균)"
+            out.append(msg + " — 추출 구간이 겹쳤을 가능성이 큽니다.")
+        if L.get("ignored"):
+            out.append("쓰지 않은 컬럼: " + ", ".join(f"'{c}'" for c in L["ignored"]) + ".")
         return out
 
     def to_dict(self) -> dict:
@@ -386,6 +422,233 @@ def _is_num(s: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# --------------------------------------------------------------------------
+# 긴 형식 (한 줄에 시각·이름·값 하나씩) → 넓은 형식
+# --------------------------------------------------------------------------
+# Historian·DB 덤프는 대개 이 모양이다. 그대로 읽으면 이름 컬럼은 글자라 빠지고 값 컬럼 하나만
+# 남는데, 같은 시각의 여러 태그 값이 '중복 시각'으로 평균되어 **한 컬럼으로 뭉개진다**.
+
+#: 컬럼 이름으로 역할 짐작 — (들어 있으면, 정확히 같으면). 소문자·공백/_/- 제거 후 비교.
+#: 앞에서부터 본다 ('상태값' 은 값이 아니라 상태, '태그설명' 은 이름이 아니라 설명).
+_LONG_ROLES = {
+    "status": (("status", "quality", "상태", "품질", "flag"), ("q", "qual")),
+    "unit": (("unit", "단위", "uom", "engunit"), ("eu",)),
+    "desc": (("desc", "설명", "comment", "비고", "remark"), ()),
+    "value": (("value", "값", "reading", "average", "평균", "측정치"),
+              ("val", "pv", "avg", "mean", "data", "v", "y")),
+    "tag": (("tag", "태그", "항목", "point", "signal", "신호", "variable", "변수", "sensor", "센서",
+             "계측", "parameter", "파라미터", "metric", "channel", "채널", "series"),
+            ("name", "이름", "명칭", "item", "id", "tagid", "code", "코드", "attribute", "속성",
+             "key", "키")),
+}
+#: 품질 컬럼에서 '이 값은 믿지 말라'는 표시
+_RE_BAD_STATUS = r"(?i)bad|fail|err|time ?out|comm|i/o|no ?data|shutdown|offline|invalid|불량|오류|이상|통신|실패"
+
+
+def _col_role(name: str) -> str | None:
+    n = re.sub(r"[\s_\-]+", "", name.lower())
+    for role, (subs, exact) in _LONG_ROLES.items():
+        if n in exact or any(s in n for s in subs):
+            return role
+    return None
+
+
+def _mode_per_key(key: np.ndarray, vals: np.ndarray) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """이름마다 가장 많이 나온 값, 그리고 둘 이상 섞인 이름."""
+    s = pd.DataFrame({"k": key, "v": vals})
+    s = s[s["v"] != ""]
+    if s.empty:
+        return {}, {}
+    cnt = s.groupby(["k", "v"], sort=False).size().sort_values(ascending=False, kind="stable")
+    top: dict[str, str] = {}
+    mixed: dict[str, list[str]] = {}
+    for (k, v), _ in cnt.items():
+        if k in top:
+            mixed.setdefault(k, [top[k]]).append(v)
+        else:
+            top[k] = v
+    return top, mixed
+
+
+def _detect_long(names: list[str], body: list[list[str]], tj: int,
+                 t_ns: np.ndarray) -> dict | None:
+    """긴 형식이면 역할(이름·값·단위·설명·품질 컬럼)을, 아니면 None.
+
+    넓은 파일에 글자 컬럼(운전 모드 등)이 하나 있는 경우와 헷갈리면 안 된다. 그래서
+    ① 숫자 컬럼이 4개 이하, ② (시각, 이름) 쌍이 거의 유일, ③ 같은 시각이 여러 줄에 나오거나
+    이름 컬럼답게 불리고 이름마다 전체 기간을 덮을 때만 긴 형식으로 본다.
+    """
+    n = len(body)
+    if n < 6 or len(names) > 12:
+        return None
+    stride = max(1, n // 4000)
+    prof: dict[int, dict] = {}
+    for j, name in enumerate(names):
+        if j == tj:
+            continue
+        col = [r[j] for r in body]
+        samp = [c for c in col[::stride] if c]
+        if not samp:
+            continue
+        arr = np.array(col, dtype=object)
+        prof[j] = {"role": _col_role(name), "arr": arr, "ne": float((arr != "").mean()),
+                   "num": sum(_is_num(c) for c in samp) / len(samp),
+                   "bool": sum(c.upper() in _BOOL_TOKENS for c in samp) / len(samp)}
+    numeric = [j for j, p in prof.items() if p["num"] >= 0.5 and p["role"] not in ("status", "tag")]
+    if not numeric or len(numeric) > 4:
+        return None
+
+    cands = []
+    for j, p in prof.items():
+        if p["ne"] < 0.95 or p["bool"] >= 0.8 or p["role"] not in (None, "tag"):
+            continue
+        if p["num"] > 0.2 and p["role"] != "tag":
+            continue
+        k = len(pd.unique(p["arr"]))
+        if 2 <= k <= min(5000, n // 3):
+            cands.append((p["role"] == "tag", k, j))
+    if not cands:
+        return None
+    cands.sort(reverse=True)
+
+    def unique_frac(cols: list[int]) -> float:
+        d = pd.DataFrame({"t": t_ns, **{f"k{c}": prof[c]["arr"] for c in cols}})
+        return 1.0 - float(d.duplicated().mean())
+
+    keys = [cands[0][2]]
+    u = unique_frac(keys)
+    if u < 0.95:                              # 이름이 두 컬럼에 나뉘어 있을 수 있다 (설비 + 항목)
+        best = max(((unique_frac(sorted(keys + [c[2]])), c[2]) for c in cands[1:]), default=None)
+        if best and best[0] - u >= 0.05:
+            u, keys = best[0], sorted(keys + [best[1]])
+    if u < 0.8:
+        return None
+    key = prof[keys[0]]["arr"] if len(keys) == 1 else np.array(
+        [".".join(x) if all(x) else "" for x in zip(*(prof[c]["arr"] for c in keys))], dtype=object)
+
+    t_dup = 1.0 - len(np.unique(t_ns)) / n
+    g = pd.Series(t_ns).groupby(key)
+    span = float(t_ns.max() - t_ns.min())
+    cover = float(((g.max() - g.min()) / span).median()) if span > 0 else 0.0
+    if g.size().median() < 3:
+        return None
+    named = any(prof[c]["role"] == "tag" for c in keys)
+    if not (t_dup >= 0.3 or (named and cover >= 0.5)):
+        return None
+
+    rest = [j for j in prof if j not in keys]
+    values = [j for j in rest if prof[j]["role"] == "value"]
+    if not values:
+        values = [j for j in rest if prof[j]["role"] is None and prof[j]["num"] >= 0.3]
+    if not values:
+        return None
+    spec = {"keys": keys, "key": key, "values": values, "unit": None, "desc": None,
+            "status": None, "ignored": []}
+    for j in rest:
+        if j in values:
+            continue
+        role = prof[j]["role"]
+        if role in ("unit", "desc", "status") and spec[role] is None:
+            spec[role] = j
+            continue
+        if role is None and prof[j]["num"] < 0.3:
+            # 이름 없는 글자 컬럼: 단위 모양이면 단위, 이름마다 한 값이면 설명
+            vals = pd.unique(prof[j]["arr"][::stride])
+            vals = [v for v in vals if v]
+            if spec["unit"] is None and vals and \
+                    sum(normalize_unit(v) is not None for v in vals) >= 0.8 * len(vals):
+                spec["unit"] = j
+                continue
+            if spec["desc"] is None:
+                per = pd.Series(prof[j]["arr"]).groupby(key).nunique()
+                if (per <= 1).mean() >= 0.95:
+                    spec["desc"] = j
+                    continue
+        spec["ignored"].append(j)
+    spec["prof"] = prof
+    return spec
+
+
+def _pivot_long(names: list[str], t_ns: np.ndarray, spec: dict, rep: IngestReport) -> tuple[pd.DataFrame, pd.Series, list[str]]:
+    """긴 형식을 (문자열 그대로) 넓게 편다. 숫자 변환·상태 문자열 처리는 넓힌 뒤 컬럼마다
+    기존 규칙 그대로 한다 — 그래야 'Bad' 가 어느 태그에서 났는지 보고할 수 있다."""
+    prof, key, vals = spec["prof"], spec["key"], spec["values"]
+    info: dict = {"n_rows": int(len(key)), "key": ", ".join(names[j] for j in spec["keys"]),
+                  "values": [names[j] for j in vals]}
+    long = pd.DataFrame({"t": t_ns, "k": key, **{f"v{j}": prof[j]["arr"] for j in vals}})
+
+    if spec["status"] is not None:
+        j = spec["status"]
+        st = pd.Series(prof[j]["arr"], dtype=object)
+        info["status"] = names[j]
+        if prof[j]["num"] >= 0.9:
+            info["status_numeric"] = True             # 품질 코드 체계는 계통마다 다르다 — 짐작하지 않는다
+        else:
+            bad = st.str.contains(_RE_BAD_STATUS, regex=True).fillna(False).to_numpy(dtype=bool)
+            n_bad = 0
+            for j2 in vals:
+                c = f"v{j2}"
+                hit = bad & (long[c].to_numpy() != "")
+                long.loc[hit, c] = st[hit].to_numpy()  # 값 대신 상태 글자 → 아래에서 결측 + 태그별 집계
+                n_bad = max(n_bad, int(hit.sum()))
+            info["n_bad_status"] = n_bad
+
+    blank = long["k"] == ""
+    info["n_blank_key"] = int(blank.sum())
+    long = long[~blank.to_numpy()]
+    # 이름별로 시간이 거꾸로 가는 곳 (이름 순으로 정렬된 파일은 이름이 바뀔 때마다 시각이 되돌아간다)
+    rep.n_out_of_order = int((long.groupby("k", sort=False)["t"].diff() < 0).sum())
+    occ = long.groupby(["t", "k"], sort=False).cumcount()
+    dup = occ.to_numpy() > 0
+    info["n_dup"] = int(dup.sum())
+    if dup.any():
+        first = long[~dup].set_index(["t", "k"])
+        again = long[dup].set_index(["t", "k"])
+        cols = [f"v{j}" for j in vals]
+        differ = (again[cols] != first.loc[again.index, cols].to_numpy()).any(axis=1)
+        info["n_dup_conflict"] = int(differ.sum())
+
+    order = list(pd.unique(long["k"]))
+    long = long.assign(occ=occ.to_numpy()).set_index(["t", "occ", "k"])
+    wide = long[[f"v{j}" for j in vals]].unstack("k")
+    one = len(vals) == 1
+    colnames, pick = [], []
+    for k in order:
+        for j in vals:
+            colnames.append(k if one else f"{k}.{names[j]}")
+            pick.append((f"v{j}", k))
+    frame = wide.reindex(columns=pd.MultiIndex.from_tuples(pick)).fillna("")
+    frame.columns = colnames
+    times = pd.Series(frame.index.get_level_values("t").to_numpy().astype("datetime64[ns]"))
+    frame = frame.reset_index(drop=True)                  # 이름이 't' 인 태그와 부딪히지 않게
+
+    for role in ("unit", "desc"):
+        j = spec[role]
+        if j is None:
+            continue
+        info[role] = names[j]
+        top, mixed = _mode_per_key(long.index.get_level_values("k").to_numpy(),
+                                   prof[j]["arr"][~blank.to_numpy()])
+        for k, v in top.items():
+            for c in ([k] if one else [f"{k}.{names[j2]}" for j2 in vals]):
+                if role == "unit":
+                    rep.units_raw[c] = v
+                    rep.units[c] = normalize_unit(v) or ""
+                else:
+                    rep.descriptions[c] = v
+        if role == "unit" and mixed:
+            info["mixed_units"] = {k: v for k, v in list(mixed.items())[:5]}
+            info["n_mixed_units"] = len(mixed)
+    rep.has_unit_row = bool(rep.units_raw)
+    rep.has_desc_row = bool(rep.descriptions)
+    info["ignored"] = [names[j] for j in spec["ignored"]]
+    info["n_names"] = len(order)
+    info["n_columns"] = len(colnames)
+    info["n_times"] = int(times.nunique())
+    rep.long = info
+    return frame, times, colnames
 
 
 def read_table(path: str | Path, time_column: str | None = None, *,
@@ -538,7 +801,14 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
     rep.n_data_rows = len(body)
     if not body:
         raise ValueError("시각을 읽을 수 있는 데이터 행이 없습니다")
-    frame = pd.DataFrame(body, columns=names, dtype=object)
+    spec = None
+    if tcol is not None and rep.header_rows == 1:          # 단위·설명 행이 있으면 넓은 형식이다
+        t_ns = times.to_numpy().astype("datetime64[ns]").astype("int64")
+        spec = _detect_long(names, body, tj, t_ns)
+    if spec is not None:
+        frame, times, data_cols = _pivot_long(names, t_ns, spec, rep)
+    else:
+        frame = pd.DataFrame(body, columns=names, dtype=object)
 
     # ---- 숫자 변환 ------------------------------------------------------------
     numeric: dict[str, pd.Series] = {}
@@ -612,6 +882,18 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
     if len(df) > 2:
         d = np.diff(df.index.to_numpy().astype("datetime64[ms]").astype("int64")) / 1000.0
         d = d[d > 0]
+        if rep.long and df.shape[1] > 1:
+            # 이름마다 기록 시각이 다를 수 있다 (예외 기반 저장). 합친 시각의 간격은 실제 주기보다
+            # 훨씬 짧게 나오므로 이름별 주기의 중앙값을 쓴다.
+            per = []
+            for c in df.columns:
+                ix = df.index[df[c].notna().to_numpy()]
+                dc = np.diff(ix.to_numpy().astype("datetime64[ms]").astype("int64")) / 1000.0
+                dc = dc[dc > 0]
+                if len(dc):
+                    per.append(float(np.median(dc)))
+            if per:
+                d = np.array(per)
         if len(d):
             step = float(np.median(d))
             # 현장 기록 주기는 정해진 값 중 하나다. 시각이 1~2초씩 어긋나면 중앙값이

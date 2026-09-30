@@ -137,3 +137,100 @@ def test_timezone_csv_reads_and_reports(tmp_path):
     tab = read_table(p)
     assert tab.df.index.tz is None and tab.df.index[0] == pd.Timestamp("2025-01-01 00:00")
     assert len(tab.df) == 12 and any("+09:00" in line for line in tab.report.lines())
+
+
+# ---- 긴 형식 (한 줄에 시각·이름·값 하나씩) --------------------------------------------
+# 예전엔 이름 컬럼이 글자라 빠지고, 같은 시각의 여러 태그 값이 '중복 시각'으로 평균되어
+# 컬럼 하나로 뭉개졌다.
+
+def _wide_example() -> pd.DataFrame:
+    idx = pd.date_range("2025-01-01", periods=48, freq="5min")
+    return pd.DataFrame({"A_FLOW": range(48), "B_TEMP": [20.0 + 0.1 * i for i in range(48)],
+                         "C_UTIL": [0.5 + 0.01 * i for i in range(48)]}, index=idx)
+
+
+@pytest.mark.parametrize("order", ["tag", "time"])
+def test_long_format_is_spread_to_the_same_columns_as_wide(order):
+    w = _wide_example()
+    long = w.rename_axis("time").reset_index().melt(id_vars="time", var_name="TagName", value_name="Value")
+    if order == "time":
+        long = long.sort_values("time", kind="stable")
+    tab = read_text(long.to_csv(index=False))
+    assert list(tab.df.columns) == list(w.columns)
+    pd.testing.assert_frame_equal(tab.df, w, check_names=False, check_freq=False, check_dtype=False,
+                                  check_index_type=False)
+    assert tab.report.long["n_names"] == 3 and tab.report.n_out_of_order == 0
+    assert any("긴 형식" in line for line in tab.report.lines())
+
+
+def test_long_korean_export_with_unit_desc_quality_columns(tmp_path):
+    rows = ["일시,태그명,태그설명,측정값,단위,품질"]
+    tags = [("CH1_KW", "냉동기1 전력", "kW"), ("CH1_TCHW", "냉수 공급온도", "℃")]
+    for i in range(24):
+        t = pd.Timestamp("2025-01-01 12:00") + pd.Timedelta(minutes=5 * i)
+        ts = f"{t:%Y-%m-%d} 오후 {((t.hour - 1) % 12) + 1}:{t.minute:02d}"
+        for k, (tag, desc, u) in enumerate(tags):
+            q = "Bad" if tag == "CH1_KW" and i in (3, 4) else "Good"
+            rows.append(f'{ts},{tag},{desc},"{1000 + i + 10 * k:,.1f}",{u},{q}')
+    rows.append(rows[3])                                    # 겹친 추출
+    rows.append(rows[1].replace('"1,000.0"', '"999.0"'))     # 같은 시각·이름인데 값이 다름
+    rows.append(f"{ts},,없음,1,kW,Good")                     # 이름이 빈 줄
+    p = tmp_path / "long.csv"
+    p.write_bytes(("\n".join(rows) + "\n").encode("cp949"))
+    tab = read_table(p)
+    r = tab.report
+    assert r.encoding == "cp949" and list(tab.df.columns) == ["CH1_KW", "CH1_TCHW"]
+    assert tab.units == {"CH1_KW": "kW", "CH1_TCHW": "degC"}
+    assert r.descriptions == {"CH1_KW": "냉동기1 전력", "CH1_TCHW": "냉수 공급온도"}
+    assert len(tab.df) == 24 and tab.df.index[0] == pd.Timestamp("2025-01-01 12:00")
+    assert tab.df["CH1_KW"].isna().sum() == 2 and r.status_counts["CH1_KW"] == {"Bad": 2}
+    assert tab.df["CH1_TCHW"].iloc[5] == 1015.0                      # 천 단위 콤마
+    assert tab.df["CH1_KW"].iloc[0] == pytest.approx((1000.0 + 999.0) / 2)
+    L = r.long
+    assert (L["n_dup"], L["n_dup_conflict"], L["n_blank_key"], L["n_bad_status"]) == (2, 1, 1, 2)
+    text = " ".join(r.lines())
+    assert "품질 컬럼 '품질'" in text and "이름이 빈 줄 1개" in text and "값이 달라 평균" in text
+
+
+def test_long_with_name_split_over_two_columns():
+    rows = ["time,equipment,item,value"]
+    for i in range(12):
+        for e in ("CH1", "CH2"):
+            for it in ("kW", "flow"):
+                rows.append(f"2025-01-01T00:{i:02d}:00,{e},{it},{i + 100 * (e == 'CH2') + 10 * (it == 'flow')}")
+    tab = read_text("\n".join(rows))
+    assert list(tab.df.columns) == ["CH1.kW", "CH1.flow", "CH2.kW", "CH2.flow"]
+    assert tab.df.iloc[3].tolist() == [3, 13, 103, 113]
+
+
+def test_long_with_several_value_columns_per_equipment():
+    rows = ["일시,설비,온도,유량"]
+    for i in range(12):
+        for e in ("P1", "P2"):
+            rows.append(f"2025-01-01 00:{i:02d},{e},{20 + i + (e == 'P2')},{5 + i}")
+    tab = read_text("\n".join(rows))
+    assert list(tab.df.columns) == ["P1.온도", "P1.유량", "P2.온도", "P2.유량"]
+    assert tab.df["P2.온도"].iloc[0] == 21
+
+
+def test_long_with_per_tag_timestamps_uses_each_tags_own_interval():
+    """예외 기반 저장: 이름마다 기록 시각이 조금씩 다르다. 합친 시각 간격(17초)으로 격자를 만들면
+    거의 빈 표가 된다 — 이름별 주기(5분)로 잡아야 한다."""
+    rows = ["Timestamp,Tag,Value"]
+    for i in range(30):
+        for k, tag in enumerate(("A", "B", "C")):
+            t = pd.Timestamp("2025-01-01") + pd.Timedelta(minutes=5 * i, seconds=17 * k + 3)
+            rows.append(f"{t},{tag},{10 * k + i}")
+    tab = read_text("\n".join(rows))
+    assert tab.report.interval_s == 300 and len(tab.df) == 30
+    assert tab.df.notna().all().all() and tab.df["C"].iloc[4] == 24
+
+
+def test_wide_file_with_a_text_column_is_not_taken_for_long():
+    rows = ["ts,a,b,mode"]
+    for i in range(60):
+        t = pd.Timestamp("2025-01-01") + pd.Timedelta(minutes=5 * i)
+        rows.append(f"{t},{i},{2 * i},{'AUTO' if (i // 3) % 2 else 'MAN'}")
+    tab = read_text("\n".join(rows))
+    assert not tab.report.long and list(tab.df.columns) == ["a", "b"]
+    assert "mode" in tab.report.text_columns
