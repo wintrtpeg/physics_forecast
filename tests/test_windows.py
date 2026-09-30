@@ -114,6 +114,41 @@ def test_examples_are_never_overwritten_and_uploads_are_not_rewritten(server):
     assert up2["path"] == up["path"] and f.stat().st_mtime_ns == before
 
 
+def test_upload_is_streamed_to_disk_and_limit_is_enforced(server, monkeypatch):
+    """수 GB 업로드: 본문을 메모리에 모으지 않고 조각으로 임시 파일에 쓴 뒤 이름을 바꾼다."""
+    from pforecast.app import server as srv
+    base, ws = server
+    rows = "\n".join(f"2025-01-01 00:{i % 60:02d}:00,{i}" for i in range(400_000))
+    data = ("t,x\n" + rows + "\n").encode()                    # 약 9 MB — 조각(8 MB) 여러 개
+    code, up = _post(base + "/api/upload?name=big.csv", None, raw=data)
+    assert code == 200 and up["path"] == "uploads/big.csv"
+    assert (ws / "uploads/big.csv").read_bytes() == data
+    assert not list((ws / "uploads").glob(".*.part"))        # 임시 파일이 남지 않는다
+    code, up2 = _post(base + "/api/upload?name=big.csv", None, raw=data[:-2] + b"8\n")   # 크기는 같고 내용만 다름
+    assert code == 200 and up2["path"] == "uploads/big_1.csv"
+    monkeypatch.setattr(srv, "MAX_UPLOAD", 1000)
+    code, r = _post(base + "/api/upload?name=big.csv", None, raw=data)
+    assert code == 413 and "넘습니다" in r["error"]
+    code, _ = _post(base + "/api/upload?name=ok.csv", None, raw=b"t,x\n2025-01-01,1\n")
+    assert code == 200                                        # 거절한 뒤에도 연결이 살아 있다
+
+
+def test_table_prepare_runs_as_a_job_then_is_ready(server):
+    base, ws = server
+    (ws / "uploads").mkdir(exist_ok=True)
+    shutil.copy(ROOT / "examples/nox_stack/data/plant_5min.csv", ws / "uploads/p.csv")
+    code, r = _post(base + "/api/table/prepare", {"csv": "uploads/p.csv"})
+    assert code == 200 and "job" in r
+    for _ in range(100):
+        j = json.loads(_get(base + f"/api/job?id={r['job']['id']}")[2])
+        if j["status"] != "running":
+            break
+        threading.Event().wait(0.1)
+    assert j["status"] == "done" and j["result"]["rows"] == 8640
+    code, r2 = _post(base + "/api/table/prepare", {"csv": "uploads/p.csv"})
+    assert r2 == {"ready": True}
+
+
 def test_launcher_bat_is_plain_ascii_crlf_and_delegates_to_python():
     """cmd.exe 는 chcp 65001 뒤 한글(UTF-8) 배치 파일을 외부 프로그램이 끝난 다음부터 잘못 읽고
     조용히 멈춘다 (윈도우 점검에서 '가상환경을 만드는 중...' 뒤 아무 말 없이 끝났다). 그래서 배치 파일은

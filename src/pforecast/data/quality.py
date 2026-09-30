@@ -25,6 +25,9 @@
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -156,18 +159,43 @@ def _noise_scale(x: np.ndarray) -> float:
     return max(float(1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2.0)), resolution)
 
 
+#: 이보다 칸이 많은 표는 컬럼을 나눠 여러 프로세스로 본다 (컬럼마다 독립이다)
+_PARALLEL_CELLS = 20_000_000
+
+
+def _assess_workers(cells: int, n_cols: int) -> int:
+    if cells < _PARALLEL_CELLS or n_cols < 4:
+        return 1
+    return max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
 def assess(df: pd.DataFrame, columns: list[str] | None = None, *,
            spike_k: float = 8.0, spike_window: int = 7, spike_max_run: int = 6,
-           min_days_recurring: int = 10, recurring_frac: float = 0.3) -> QualityReport:
-    """컬럼별 값 이상을 찾는다. 규칙적인 시간 격자를 가정한다 (:func:`read_table` 결과)."""
+           min_days_recurring: int = 10, recurring_frac: float = 0.3,
+           workers: int | None = None, alive: np.ndarray | None = None) -> QualityReport:
+    """컬럼별 값 이상을 찾는다. 규칙적인 시간 격자를 가정한다 (:func:`read_table` 결과).
+
+    컬럼마다 독립이라 큰 표(태그 수백 개 × 수십만 행)는 컬럼을 나눠 여러 프로세스로 본다 — 결과는
+    한 프로세스로 본 것과 같다. 컬럼끼리 엮이는 것은 '다른 컬럼은 살아 있는 행'(``alive``) 하나뿐이라
+    그것만 전체로 먼저 구해 넘긴다.
+    """
     cols = [c for c in (columns or list(df.columns)) if c in df.columns]
+    kw = {"spike_k": spike_k, "spike_window": spike_window, "spike_max_run": spike_max_run,
+          "min_days_recurring": min_days_recurring, "recurring_frac": recurring_frac}
+    if alive is None:
+        alive = df[cols].notna().sum(axis=1).to_numpy() > max(1, 0.3 * len(cols))
+    n_workers = workers if workers is not None else _assess_workers(len(df) * len(cols), len(cols))
+    if n_workers > 1 and len(cols) >= 2:
+        try:
+            return _assess_parallel(df, cols, alive, n_workers, kw)
+        except (OSError, BrokenProcessPool):          # 작업 프로세스를 못 띄우는 PC — 한 프로세스로
+            pass
     interval = _interval(df)
     rep = QualityReport(n_rows=len(df), interval_s=interval)
     idx = df.index
     per_hour = 3600.0 / interval if np.isfinite(interval) and interval > 0 else np.nan
     per_day = 86400.0 / interval if np.isfinite(interval) and interval > 0 else np.nan
 
-    alive = df[cols].notna().sum(axis=1).to_numpy() > max(1, 0.3 * len(cols))
     for c in cols:
         x = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
         finite = np.isfinite(x)
@@ -321,6 +349,19 @@ def assess(df: pd.DataFrame, columns: list[str] | None = None, *,
 
         if mask.any():
             rep.masks[c] = mask
+    return rep
+
+
+def _assess_parallel(df: pd.DataFrame, cols: list[str], alive: np.ndarray, n_workers: int,
+                     kw: dict) -> QualityReport:
+    groups = [list(g) for g in np.array_split(np.array(cols, dtype=object), min(n_workers, len(cols))) if len(g)]
+    with ProcessPoolExecutor(max_workers=len(groups)) as ex:
+        parts = [f.result() for f in [ex.submit(assess, df[g], g, workers=1, alive=alive, **kw)
+                                      for g in groups]]
+    rep = QualityReport(n_rows=len(df), interval_s=_interval(df))
+    for r in parts:                                   # 묶음이 컬럼 순서대로라 이어 붙이면 순서도 같다
+        rep.issues.extend(r.issues)
+        rep.masks.update(r.masks)
     return rep
 
 

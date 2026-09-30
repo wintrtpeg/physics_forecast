@@ -226,6 +226,83 @@ def test_long_with_per_tag_timestamps_uses_each_tags_own_interval():
     assert tab.df.notna().all().all() and tab.df["C"].iloc[4] == 24
 
 
+# ---- 큰 파일: 조각으로 나눠 읽기 ---------------------------------------------------------
+# 통째로 읽으면 칸마다 파이썬 문자열이 생겨 5GB 파일에 메모리가 수십 GB 든다. 조각으로 읽은 결과는
+# 통째로 읽은 결과와 **표도 정리 내역도** 같아야 한다 (작은 조각 크기로 강제해서 비교).
+
+def _messy_big_csv(n: int = 400) -> str:
+    """현장 엑셀 저장본 모양 (3행 헤더·오후 표기·상태 문자열·천 단위 콤마·순서 뒤바뀜·겹친 구간·빈 줄)."""
+    head = "일시,NOX,FLOW,PUMP,DEAD\n,굴뚝 NOx,배출유량,펌프,죽은 입력\n,mg/Sm³,Sm³/h,,\n"
+    t0 = pd.Timestamp("2025-01-01")
+    rows = []
+    for i in range(n):
+        t = t0 + pd.Timedelta(minutes=5 * i)
+        ts = f"{t:%Y-%m-%d} {'오후' if t.hour >= 12 else '오전'} {((t.hour - 1) % 12) + 1}:{t.minute:02d}"
+        nox = "Bad" if i % 37 == 5 else f"{50 + (i % 11) * 0.5:.1f}"
+        rows.append(f'{ts},{nox},"{11000 + i:,.1f}",{"ON" if i % 7 else "OFF"},Bad')
+    rows[100:110] = rows[150:160] + rows[100:110]        # 순서 뒤바뀜 + 겹친 구간
+    rows.insert(200, "")
+    rows.insert(250, "일시,NOX,FLOW,PUMP,DEAD")          # 이어 붙이며 딸려온 헤더
+    return head + "\n".join(rows) + "\n"
+
+
+def _assert_same_read(p, **kw):
+    a = read_table(p)
+    b = read_table(p, cache=False, **kw)
+    pd.testing.assert_frame_equal(a.df, b.df, check_freq=False)
+    assert a.report.lines() == b.report.lines()
+    for k in ("n_data_rows", "n_repeated_header", "n_blank_rows", "n_out_of_order", "n_duplicate_rows",
+              "n_conflicting_duplicates", "interval_s", "units", "descriptions", "status_counts",
+              "text_columns", "bool_columns", "thousands"):
+        assert getattr(a.report, k) == getattr(b.report, k), k
+    return a, b
+
+
+def test_chunked_read_equals_whole_read_on_a_messy_field_export(tmp_path):
+    p = tmp_path / "field.csv"
+    p.write_bytes(_messy_big_csv().encode("cp949"))
+    a, b = _assert_same_read(p, chunk_bytes=2000)
+    assert a.report.header_rows == 3 and a.report.n_out_of_order >= 1 and a.report.n_duplicate_rows == 10
+    assert "DEAD" in a.report.text_columns and "DEAD" not in b.df.columns
+
+
+@pytest.mark.parametrize("order", ["tag", "time"])
+def test_chunked_read_of_long_format_equals_whole_read(tmp_path, order):
+    """이름 순으로 정렬된 긴 파일은 한 조각에 이름이 하나뿐이다 — 긴 형식 판정을 파일 곳곳의 표본으로
+    미리 해야 한다. 시각 순이면 한 시각의 태그들이 조각 경계에서 갈린다 — 한 행으로 합쳐야 한다."""
+    w = _wide_example()
+    long = w.rename_axis("time").reset_index().melt(id_vars="time", var_name="Tag", value_name="Value")
+    if order == "time":
+        long = long.sort_values("time", kind="stable")
+    long["Unit"] = long["Tag"].map({"A_FLOW": "m3/h", "B_TEMP": "℃", "C_UTIL": "%"})
+    p = tmp_path / "long.csv"
+    p.write_text(long.to_csv(index=False), encoding="utf-8")
+    a, b = _assert_same_read(p, chunk_bytes=700)
+    assert list(b.df.columns) == list(w.columns) and b.report.long["n_names"] == 3
+    assert b.units == {"A_FLOW": "m3/h", "B_TEMP": "degC", "C_UTIL": "%"}
+
+
+def test_chunked_read_with_worker_processes(tmp_path):
+    p = tmp_path / "field.csv"
+    p.write_bytes(_messy_big_csv(1500).encode("cp949"))
+    _assert_same_read(p, chunk_bytes=8000, workers=2)
+
+
+def test_big_file_result_is_cached_next_to_the_csv(tmp_path):
+    p = tmp_path / "field.csv"
+    p.write_bytes(_messy_big_csv().encode("cp949"))
+    a = read_table(p, chunk_bytes=2000)
+    caches = list((tmp_path / ".pforecast_cache").glob("field.csv.*.npz"))
+    assert len(caches) == 1
+    b = read_table(p, chunk_bytes=2000)                        # 캐시에서
+    pd.testing.assert_frame_equal(a.df, b.df)
+    assert a.report.lines() == b.report.lines()
+    p.write_bytes(_messy_big_csv(300).encode("cp949"))         # CSV 가 바뀌면 다시 읽고 옛 캐시는 지운다
+    c = read_table(p, chunk_bytes=2000)
+    assert len(c.df) < len(a.df)
+    assert len(list((tmp_path / ".pforecast_cache").glob("field.csv.*.npz"))) == 1
+
+
 def test_wide_file_with_a_text_column_is_not_taken_for_long():
     rows = ["ts,a,b,mode"]
     for i in range(60):

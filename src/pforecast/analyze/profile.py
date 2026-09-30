@@ -86,6 +86,10 @@ def steady_state_mask(df: pd.DataFrame, columns: list[str], window: int = 6,
     return ok
 
 
+#: 중복 컬럼 후보를 거를 때 쓰는 행 수 (이보다 긴 표는 고르게 뽑는다)
+_CORR_ROWS = 20000
+
+
 def profile_dataset(df: pd.DataFrame, units: dict[str, str] | None = None,
                     duplicate_corr: float = 0.9999) -> DatasetProfile:
     units = units or {}
@@ -124,15 +128,19 @@ def profile_dataset(df: pd.DataFrame, units: dict[str, str] | None = None,
         prof.columns[name] = c
 
     # 사실상 같은 컬럼 찾기 (중복을 넣으면 중요도가 반씩 갈린다)
+    # 큰 표는 기간 전체에 고르게 뽑은 행으로 후보만 거르고, 후보 쌍은 전체 행으로 다시 확인한다
+    # (결측이 있는 pandas 상관은 쌍마다 따로 계산해서 36만 행 × 300 컬럼에 81초가 걸렸다).
     usable = [n for n, c in prof.columns.items() if not c.is_constant]
     if len(usable) > 1:
-        corr = num[usable].corr().abs()
+        step = int(np.ceil(len(num) / _CORR_ROWS))
+        corr = num[usable].iloc[::step].corr().abs()
+        screen = duplicate_corr - 1e-3 if step > 1 else duplicate_corr
         for i, a in enumerate(usable):
             for b in usable[i + 1:]:
                 if prof.columns[b].duplicate_of:
                     continue
                 v = corr.loc[a, b]
-                if np.isfinite(v) and v >= duplicate_corr:
+                if np.isfinite(v) and v >= screen and (step == 1 or abs(num[a].corr(num[b])) >= duplicate_corr):
                     prof.columns[b].duplicate_of = a
 
     live = [n for n, c in prof.columns.items() if c.usable]

@@ -73,6 +73,22 @@ async function api(path, body) {
   return data;
 }
 
+// CSV 를 서버가 읽어 두게 한다. 큰 파일(GB 급)은 처음 한 번 몇 분 걸리므로 작업으로 돌리고
+// 진행 메시지를 onMsg 로 넘긴다. stillWanted() 가 false 가 되면(다른 파일을 골랐으면) 기다리기를 그만둔다.
+async function prepareTable(path, onMsg, stillWanted = () => true) {
+  const r = await api('/api/table/prepare', { csv: path });
+  if (!r.job) return true;
+  for (;;) {
+    await new Promise(res => setTimeout(res, 1000));
+    if (!stillWanted()) return false;
+    const j = await api('/api/job?id=' + r.job.id);
+    if (j.message) onMsg(j.message);
+    if (j.status === 'running') continue;
+    if (j.status === 'error') throw new Error(j.error);
+    return true;
+  }
+}
+
 function niceTicks(lo, hi, n) {
   const span = hi - lo;
   if (!(span > 0)) return [lo];
@@ -331,6 +347,8 @@ async function pickDataset(path) {
   $('#profile-pane').append(h('div', { class: 'card' },
     h('div', { class: 'sub' }, '프로파일링 중…'), h('div', { class: 'progress' }, h('i'))));
   try {
+    const msg = $('#profile-pane .sub');
+    if (!(await prepareTable(path, m => (msg.textContent = m), () => S.csv === path))) return;
     S.profile = await api('/api/profile', { csv: path });
     S.timeCol = S.profile.time_column;
     S.units = {}; S.target = null; S.controllable = []; S.drivers = [];

@@ -23,10 +23,21 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
+import functools
+import glob
+import hashlib
 import io
+import json
+import os
 import re
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
+from operator import itemgetter
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -94,11 +105,18 @@ def _from_parts(parts: pd.DataFrame, ampm_col: int | None, order: tuple[int, ...
     return pd.to_datetime(frame, errors="coerce")
 
 
-def parse_times(values: pd.Series) -> tuple[pd.Series, dict[str, int]]:
-    """여러 표기가 섞인 시각 문자열을 해석한다. (결과, 표기별 행 수)를 돌려준다."""
+def parse_times(values: pd.Series, counts=None) -> tuple[pd.Series, dict[str, int]]:
+    """여러 표기가 섞인 시각 문자열을 해석한다. (결과, 표기별 행 수)를 돌려준다.
+
+    ``counts`` 는 값마다 몇 행에 나왔는지 (서로 다른 값만 넘겨 해석할 때). 표기별 행 수는 이걸로 센다.
+    """
     s = values.astype("string").str.strip()
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
     stats: dict[str, int] = {}
+    w = pd.Series(1 if counts is None else np.asarray(counts), index=s.index, dtype="int64")
+
+    def n(mask) -> int:
+        return int(w[mask[mask].index].sum())
     # 0) 시간대 표기(+09:00, Z)는 떼고 **적힌 시각 그대로** 쓴다. 현장 데이터·생산계획은 현지
     #    시각으로 맞춰야 하므로 시간대를 붙인 채 두면 안 된다 (pandas 는 붙은 채로 섞으면 거부한다).
     #    여러 시간대가 섞였으면(서머타임, Z 와 +09:00 혼용) 가장 많은 시간대 기준으로 옮긴다.
@@ -115,9 +133,9 @@ def parse_times(values: pd.Series) -> tuple[pd.Series, dict[str, int]]:
             shift = pd.Series(0, index=s.index, dtype="int64")
             shift.loc[moved[moved].index] = (common - offs[moved]).astype("int64")
         kinds = ", ".join(_fmt_offset(int(m)) for m in sorted(offs.unique()))
-        stats[f"시간대 표기({kinds}) 뗌 → {_fmt_offset(common)} 기준 시각"] = int(has_tz.sum())
+        stats[f"시간대 표기({kinds}) 뗌 → {_fmt_offset(common)} 기준 시각"] = n(has_tz)
         if moved.any():
-            stats[f"다른 시간대 → {_fmt_offset(common)} 로 옮김"] = int(moved.sum())
+            stats[f"다른 시간대 → {_fmt_offset(common)} 로 옮김"] = n(moved)
     empty = s.isna() | (s == "")
     todo = ~empty
 
@@ -129,7 +147,7 @@ def parse_times(values: pd.Series) -> tuple[pd.Series, dict[str, int]]:
         ok = parsed.notna() & parsed.dt.year.between(1980, 2100)
         if ok.any():
             out.loc[ok[ok].index] = parsed[ok].astype("datetime64[ns]")
-            stats[label] = stats.get(label, 0) + int(ok.sum())
+            stats[label] = stats.get(label, 0) + n(ok)
         return mask & ~out.notna()
 
     # 1) 한국어 엑셀: 2025-01-01 오후 3:05
@@ -179,7 +197,7 @@ def parse_times(values: pd.Series) -> tuple[pd.Series, dict[str, int]]:
             todo = take(todo, parsed.dt.round("s"), "엑셀 일련번호")
     if shift is not None:
         out = out + pd.to_timedelta(shift, unit="min")
-    stats["해석 불가"] = int(todo.sum())
+    stats["해석 불가"] = n(todo)
     return out, stats
 
 
@@ -231,6 +249,7 @@ class IngestReport:
     units_raw: dict[str, str] = field(default_factory=dict)      # 파일에 적힌 그대로
     descriptions: dict[str, str] = field(default_factory=dict)
     long: dict = field(default_factory=dict)                     # 긴 형식을 펼쳤으면 그 내역
+    chunk_stats: dict = field(default_factory=dict, repr=False)  # 큰 파일 조각을 합칠 때만 쓴다
     t_start: str | None = None
     t_end: str | None = None
 
@@ -340,7 +359,7 @@ class IngestReport:
         return out
 
     def to_dict(self) -> dict:
-        d = {k: v for k, v in self.__dict__.items()}
+        d = {k: v for k, v in self.__dict__.items() if k != "chunk_stats"}
         d["interval_s"] = None if not np.isfinite(self.interval_s) else self.interval_s
         d["lines"] = self.lines()
         d["status_total"] = self.status_total()
@@ -404,16 +423,33 @@ def _sniff_delimiter(text: str) -> str:
     return best
 
 
+def _needs_strip(text: str, delimiter: str) -> bool:
+    """칸 앞뒤에 공백이 있을 수 있는가. 구분자·줄 끝 옆에 공백이 하나도 없으면 칸마다 다듬을 필요가
+    없다 — 큰 파일에서 칸마다 strip 하는 것이 가장 비싼 일이었다 (칸 수천만 개)."""
+    for ws in " \t":
+        if ws == delimiter:
+            continue
+        if (text.startswith(ws) or ws + delimiter in text or delimiter + ws in text
+                or ws + "\n" in text or ws + "\r" in text or "\n" + ws in text):
+            return True
+    return False
+
+
 def _parse_rows(text: str, delimiter: str) -> list[list[str]]:
     """문자열 그대로의 2차원 표. pandas C 토크나이저가 빠르고, 행마다 칸 수가 다르면
     (여러 출처를 이어 붙인 파일) 표준 csv 모듈로 떨어진다."""
+    strip = _needs_strip(text, delimiter)
     try:
         raw = pd.read_csv(io.StringIO(text), sep=delimiter, header=None, dtype=str,
                           na_filter=False, skip_blank_lines=False, engine="c")
-        rows = raw.to_numpy(dtype=object).tolist()
     except (pd.errors.ParserError, ValueError):
         rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
-    return [[c.strip() if isinstance(c, str) else "" for c in r] for r in rows]
+        return [[c.strip() for c in r] for r in rows] if strip else rows
+    if raw.isna().to_numpy().any():
+        raw = raw.fillna("")
+    if strip:
+        raw = raw.apply(lambda s: s.str.strip())
+    return raw.to_numpy(dtype=object).tolist()
 
 
 def _is_num(s: str) -> bool:
@@ -472,13 +508,49 @@ def _mode_per_key(key: np.ndarray, vals: np.ndarray) -> tuple[dict[str, str], di
     return top, mixed
 
 
+def _join_keys(prof: dict, keys: list[int]) -> np.ndarray:
+    if len(keys) == 1:
+        return prof[keys[0]]["arr"]
+    return np.array([".".join(x) if all(x) else "" for x in zip(*(prof[c]["arr"] for c in keys))],
+                    dtype=object)
+
+
+def _long_roles(names: list[str], spec: dict) -> dict:
+    """판정 결과를 컬럼 이름으로 — 큰 파일은 표본에서 한 번 정하고 조각마다 그대로 쓴다."""
+    def nm(j):
+        return None if j is None else names[j]
+    return {"keys": [names[j] for j in spec["keys"]], "values": [names[j] for j in spec["values"]],
+            "unit": nm(spec["unit"]), "desc": nm(spec["desc"]), "status": nm(spec["status"]),
+            "ignored": [names[j] for j in spec["ignored"]]}
+
+
+def _spec_from_roles(names: list[str], body: list[list[str]], roles: dict) -> dict:
+    idx = {n: j for j, n in enumerate(names)}
+    need = roles["keys"] + roles["values"] + [roles[r] for r in ("unit", "desc", "status") if roles[r]]
+    missing = [n for n in need if n not in idx]
+    if missing:
+        raise ValueError(f"긴 형식 컬럼이 이 부분에 없습니다: {missing}")
+    stride = max(1, len(body) // 4000)
+    prof = {}
+    for n in need:
+        col = list(map(itemgetter(idx[n]), body))
+        samp = [c for c in col[::stride] if c]
+        prof[idx[n]] = {"arr": np.array(col, dtype=object),
+                        "num": sum(_is_num(c) for c in samp) / len(samp) if samp else 0.0}
+    keys = [idx[n] for n in roles["keys"]]
+    return {"keys": keys, "key": _join_keys(prof, keys), "values": [idx[n] for n in roles["values"]],
+            **{r: (idx[roles[r]] if roles[r] else None) for r in ("unit", "desc", "status")},
+            "ignored": [idx[n] for n in roles["ignored"] if n in idx], "prof": prof}
+
+
 def _detect_long(names: list[str], body: list[list[str]], tj: int,
-                 t_ns: np.ndarray) -> dict | None:
+                 t_ns: np.ndarray, need_cover: bool = True) -> dict | None:
     """긴 형식이면 역할(이름·값·단위·설명·품질 컬럼)을, 아니면 None.
 
     넓은 파일에 글자 컬럼(운전 모드 등)이 하나 있는 경우와 헷갈리면 안 된다. 그래서
     ① 숫자 컬럼이 4개 이하, ② (시각, 이름) 쌍이 거의 유일, ③ 같은 시각이 여러 줄에 나오거나
-    이름 컬럼답게 불리고 이름마다 전체 기간을 덮을 때만 긴 형식으로 본다.
+    이름 컬럼답게 불리고 이름마다 전체 기간을 덮을 때만 긴 형식으로 본다. 파일 여기저기서 뜬 표본
+    (큰 파일)은 기간을 덮는지 알 수 없어 ``need_cover=False`` 로 이름만 본다.
     """
     n = len(body)
     if n < 6 or len(names) > 12:
@@ -488,7 +560,7 @@ def _detect_long(names: list[str], body: list[list[str]], tj: int,
     for j, name in enumerate(names):
         if j == tj:
             continue
-        col = [r[j] for r in body]
+        col = list(map(itemgetter(j), body))
         samp = [c for c in col[::stride] if c]
         if not samp:
             continue
@@ -525,8 +597,7 @@ def _detect_long(names: list[str], body: list[list[str]], tj: int,
             u, keys = best[0], sorted(keys + [best[1]])
     if u < 0.8:
         return None
-    key = prof[keys[0]]["arr"] if len(keys) == 1 else np.array(
-        [".".join(x) if all(x) else "" for x in zip(*(prof[c]["arr"] for c in keys))], dtype=object)
+    key = _join_keys(prof, keys)
 
     t_dup = 1.0 - len(np.unique(t_ns)) / n
     g = pd.Series(t_ns).groupby(key)
@@ -535,7 +606,7 @@ def _detect_long(names: list[str], body: list[list[str]], tj: int,
     if g.size().median() < 3:
         return None
     named = any(prof[c]["role"] == "tag" for c in keys)
-    if not (t_dup >= 0.3 or (named and cover >= 0.5)):
+    if not (t_dup >= 0.3 or (named and (cover >= 0.5 or not need_cover))):
         return None
 
     rest = [j for j in prof if j not in keys]
@@ -619,10 +690,11 @@ def _pivot_long(names: list[str], t_ns: np.ndarray, spec: dict, rep: IngestRepor
         for j in vals:
             colnames.append(k if one else f"{k}.{names[j]}")
             pick.append((f"v{j}", k))
-    frame = wide.reindex(columns=pd.MultiIndex.from_tuples(pick)).fillna("")
-    frame.columns = colnames
-    times = pd.Series(frame.index.get_level_values("t").to_numpy().astype("datetime64[ns]"))
-    frame = frame.reset_index(drop=True)                  # 이름이 't' 인 태그와 부딪히지 않게
+    wide = wide.reindex(columns=pd.MultiIndex.from_tuples(pick))
+    times = pd.Series(wide.index.get_level_values("t").to_numpy().astype("datetime64[ns]"))
+    cells = np.array(wide.to_numpy(dtype=object), dtype=object)   # to_numpy 는 읽기 전용 뷰일 수 있다
+    cells[pd.isna(cells)] = ""                          # 컬럼마다 fillna 하면 태그 수백 개에서 느리다
+    frame = pd.DataFrame(cells, columns=colnames)         # 새 번호 — 이름이 't' 인 태그와 부딪히지 않게
 
     for role in ("unit", "desc"):
         j = spec[role]
@@ -651,24 +723,400 @@ def _pivot_long(names: list[str], t_ns: np.ndarray, spec: dict, rep: IngestRepor
     return frame, times, colnames
 
 
+#: 이보다 큰 파일은 조각으로 나눠 읽는다. 통째로 읽으면 칸마다 파이썬 문자열이 생겨 메모리가 파일
+#: 크기의 10배 넘게 든다 (5GB 파일이면 수십 GB).
+BIG_FILE = 64 * 2 ** 20
+#: 조각 하나의 크기 [바이트]. 조각 하나를 읽는 동안 메모리는 대략 이것의 10~20배.
+CHUNK_BYTES = 32 * 2 ** 20
+#: 큰 파일의 정리 결과를 두는 곳 (CSV 옆). 앱은 '.' 으로 시작하는 폴더를 목록에서 뺀다.
+CACHE_DIR = ".pforecast_cache"
+
+
 def read_table(path: str | Path, time_column: str | None = None, *,
-               encoding: str | None = None, regularize: bool = True) -> Table:
-    """현장 CSV 를 읽어 정리한다. 무엇을 고쳤는지는 ``Table.report`` 에 남는다."""
-    raw = Path(path).read_bytes()
-    text, enc = _decode(raw, encoding)
-    tab = read_text(text, time_column=time_column, regularize=regularize)
+               encoding: str | None = None, regularize: bool = True,
+               progress: Callable[[str], None] | None = None, chunk_bytes: int | None = None,
+               cache: bool = True, workers: int | None = None) -> Table:
+    """현장 CSV 를 읽어 정리한다. 무엇을 고쳤는지는 ``Table.report`` 에 남는다.
+
+    ``BIG_FILE`` 보다 큰 파일은 조각으로 나눠 읽어 메모리가 파일 크기를 따라가지 않게 하고, 결과를
+    CSV 옆 ``.pforecast_cache/`` 에 저장해 두었다가 다음부터는 바로 읽는다 (CSV 가 바뀌거나 이 모듈이
+    바뀌면 다시 읽는다). ``progress(메시지)`` 로 진행 상황을 알린다. ``chunk_bytes`` 를 주면 그보다 큰
+    파일을 그 크기로 나눠 읽는다 (시험용). ``workers`` 는 조각을 나눠 읽을 프로세스 수 (기본: 파일이 크면 코어 수 - 1,
+    최대 4).
+    """
+    p = Path(path)
+    size = p.stat().st_size
+    if size <= (chunk_bytes or BIG_FILE):
+        text, enc = _decode(p.read_bytes(), encoding)
+        tab = read_text(text, time_column=time_column, regularize=regularize)
+        tab.report.encoding = enc
+    else:
+        cpath = _cache_path(p, time_column, encoding, regularize) if cache else None
+        tab = _cache_load(cpath) if cpath is not None else None
+        if tab is None:
+            tab = _read_chunks(p, time_column, encoding, regularize, chunk_bytes or CHUNK_BYTES,
+                               progress or (lambda m: None), workers)
+            if cpath is not None:
+                if progress:
+                    progress("정리 결과를 저장하는 중 (다음부터는 바로 열립니다)")
+                _cache_save(cpath, tab)
     tab.report.path = str(path)
-    tab.report.encoding = enc
     return tab
 
 
+# --------------------------------------------------------------------------
+# 큰 파일: 조각으로 나눠 읽기
+# --------------------------------------------------------------------------
+
+def _sample_blocks(p: Path, size: int, head: int = 2 << 20, n: int = 24,
+                   block: int = 256 << 10) -> list[bytes]:
+    """맨 앞 조각 + 파일 여기저기서 뜬 조각들. 앞 조각 말고는 줄 경계로 자른다."""
+    out = []
+    with open(p, "rb") as f:
+        raw = f.read(head)
+        out.append(raw[:raw.rfind(b"\n") + 1] or raw)
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):      # UTF-16 은 줄 경계를 바이트로 못 자른다
+            return out
+        # 조각끼리 겹치면 같은 줄이 두 번 들어가 (시각, 이름) 쌍이 중복으로 보인다
+        start = len(out[0])
+        blk = min(block, (size - start) // n)
+        if blk < 4096:
+            return out
+        for i in range(n):
+            f.seek(start + int((size - start) * i / n))
+            b = f.read(blk)
+            s, e = b.find(b"\n") + 1, b.rfind(b"\n") + 1
+            if 0 < s < e:
+                out.append(b[s:e])
+    return out
+
+
+def _sniff_encoding(blocks: list[bytes], encoding: str | None) -> str:
+    """앞부분만 보면 안 된다 — 앞은 영문 태그뿐이고 뒤에 한글(CP949)이 나오는 파일이 있다."""
+    if encoding:
+        return encoding.lower()
+    if blocks[0][:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            for i, b in enumerate(blocks):
+                b.decode(enc if i == 0 else enc.replace("-sig", ""))
+            return enc.replace("-sig", "")
+        except UnicodeDecodeError:
+            continue
+    return "latin-1"
+
+
+def _read_chunks(p: Path, time_column: str | None, encoding: str | None, regularize: bool,
+                 step: int, say: Callable[[str], None], workers: int | None = None) -> Table:
+    size = p.stat().st_size
+    say(f"파일 구조를 보는 중 ({_fmt_size(size)})")
+    blocks = _sample_blocks(p, size)
+    enc = _sniff_encoding(blocks, encoding)
+    py_enc = "utf-8-sig" if enc == "utf-8" else enc
+    head_text = blocks[0].decode(py_enc, errors="replace")
+
+    # ---- 헤더·시각 컬럼은 앞부분으로, 긴 형식 판정은 파일 곳곳의 표본으로 한 번만 -----------
+    lay = IngestReport()
+    lay.delimiter = _sniff_delimiter(head_text)
+    names, _, _, tcol, _, n_head = _split_header(_parse_rows(head_text, lay.delimiter), time_column, lay)
+    lines = head_text.split("\n")
+    hb = "\n".join(lines[lay.title_rows:n_head]) + "\n"       # 조각마다 앞에 붙일 헤더 (단위·설명 행 포함)
+    hb_lines = n_head - lay.title_rows
+    roles: dict | bool = False
+    if tcol is not None and lay.header_rows == 1:
+        sample = hb + "\n".join(lines[n_head:]) + "".join(
+            b.decode(enc, errors="replace") for b in blocks[1:])
+        srep = IngestReport()
+        names_s, _, body, _, tj, _ = _split_header(_parse_rows(sample, lay.delimiter), tcol, srep)
+        body = [r for r in body if any(r)]
+        if body:
+            t, _ = parse_times(pd.Series(list(map(itemgetter(tj), body)), dtype=object))
+            ok = t.notna().to_numpy()
+            body = [r for r, k in zip(body, ok) if k]
+            if body:
+                t_ns = t[ok].to_numpy().astype("datetime64[ns]").astype("int64")
+                spec = _detect_long(names_s, body, tj, t_ns, need_cover=False)
+                roles = _long_roles(names_s, spec) if spec else False
+
+    # ---- 조각마다 기존 규칙 그대로 (헤더를 붙여 read_text) — 코어가 여럿이면 나눠서 -------------
+    args = (tcol, lay.delimiter, roles)
+
+    def chunks():
+        with open(p, "r", encoding=py_enc, errors="replace", newline="") as f:
+            for _ in range(n_head):
+                f.readline()
+            while True:
+                lines_ = f.readlines(step)
+                if not lines_:
+                    return
+                yield hb + "".join(lines_), len(lines_), f.buffer.tell()
+
+    n_workers = workers if workers is not None else _auto_workers(size, step)
+    try:
+        acc = _collect(chunks(), args, n_workers, hb_lines, size, say)
+    except (OSError, BrokenProcessPool) as exc:       # 작업 프로세스를 못 띄우는 PC — 한 코어로 다시
+        if n_workers <= 1:
+            raise
+        say(f"여러 코어로 읽지 못해 한 코어로 다시 읽습니다 ({type(exc).__name__})")
+        acc = _collect(chunks(), args, 1, hb_lines, size, say)
+    reps, frames, order, counts, idx, n_boundary = (acc[k] for k in (
+        "reps", "frames", "order", "counts", "idx", "n_boundary"))
+    if idx is None:
+        raise ValueError("시각을 읽을 수 있는 데이터 행이 없습니다")
+
+    # ---- 합치기: 조각 경계에서 갈린 시각은 한 행으로, 진짜 중복은 평균 + 보고 --------------------
+    # 최종 표를 한 번에 잡아 두고 컬럼마다 채운다. 컬럼마다 시각 색인을 따로 만들면 5GB 파일에서
+    # 메모리가 두세 배로 불었다 (6.3 GB).
+    say("조각을 합치는 중")
+    rep = _merge_reports(reps, lay, n_head, hb_lines)
+    long_mode = bool(rep.long)
+    if not long_mode:
+        rep.n_out_of_order += n_boundary
+    drop = set()
+    for c, (n_num, n_ne) in counts.items():        # 통째로 읽을 때와 같은 기준 (read_text 의 숫자 변환)
+        if n_num < max(3, 0.05 * n_ne):
+            drop.add(c)
+            st = rep.status_counts.pop(c, {})
+            rep.text_columns[c] = [k for k, _ in sorted(st.items(), key=lambda kv: -kv[1])[:3]]
+    seen = set(order)
+    cols = [c for c in (order if long_mode else names) if c in seen and c not in drop]
+    positions = [idx.get_indexer(d.index) for d in frames]
+    out = np.full((len(idx), len(cols)), np.nan)
+    dup_rows = conf_rows = 0
+    for j, c in enumerate(cols):
+        P = [pos for pos, d in zip(positions, frames) if c in d.columns]
+        V = [d[c].to_numpy(dtype=float) for d in frames if c in d.columns]
+        if not P:
+            continue
+        P, V = np.concatenate(P), np.concatenate(V)
+        ok = ~np.isnan(V)
+        P, V = P[ok], V[ok]
+        cnt = np.bincount(P, minlength=len(idx))
+        if len(cnt) and cnt.max() <= 1:
+            out[P, j] = V
+            continue
+        has = cnt > 0
+        out[has, j] = np.bincount(P, weights=V, minlength=len(idx))[has] / cnt[has]
+        extra = int((cnt[cnt > 1] - 1).sum())
+        o = np.lexsort((V, P))
+        Ps, Vs = P[o], V[o]
+        starts = np.r_[0, np.flatnonzero(np.diff(Ps)) + 1]
+        ends = np.r_[starts[1:], len(Ps)]
+        multi = (ends - starts) > 1
+        scale = float(np.median(np.abs(V))) or 1.0
+        conf = int(np.sum(Vs[ends[multi] - 1] - Vs[starts[multi]] > 1e-9 * scale + 1e-12))
+        if long_mode:
+            rep.long["n_dup"] = rep.long.get("n_dup", 0) + extra
+            rep.long["n_dup_conflict"] = rep.long.get("n_dup_conflict", 0) + conf
+        else:
+            dup_rows, conf_rows = max(dup_rows, extra), max(conf_rows, conf)
+    frames.clear()
+    rep.n_duplicate_rows += dup_rows
+    rep.n_conflicting_duplicates += conf_rows
+    df = pd.DataFrame(out, index=idx, columns=cols)
+    rep.dropped_columns = [c for c in rep.dropped_columns if c not in df.columns]
+    rep.text_columns = {c: v for c, v in rep.text_columns.items() if c not in df.columns}
+    if long_mode:
+        rep.long["n_columns"] = df.shape[1]
+        rep.long["n_names"] = df.shape[1] // max(1, len(rep.long["values"]))
+        rep.long["n_times"] = len(idx)
+    rep.encoding = enc
+    say("시간 격자를 맞추는 중")
+    return Table(df=_regularize(df, rep, regularize, tcol), report=rep)
+
+
+def _auto_workers(size: int, step: int) -> int:
+    """조각이 넉넉할 때만 여러 코어로. 작업 프로세스 하나가 조각 하나에 메모리를 수백 MB 쓴다."""
+    if size < 8 * step:
+        return 1
+    return max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
+def _parse_chunk(text: str, tcol: str | None, delimiter: str, roles) -> Table | None:
+    """조각 하나 (작업 프로세스에서도 돈다). 빈 줄·반복 헤더뿐인 조각은 None."""
+    try:
+        return read_text(text, time_column=tcol, regularize=False, delimiter=delimiter,
+                         long=roles, chunk=True)
+    except ValueError as exc:
+        if "데이터 행이 없습니다" not in str(exc):
+            raise
+        return None
+
+
+def _collect(chunks, args: tuple, n_workers: int, hb_lines: int, size: int,
+             say: Callable[[str], None]) -> dict:
+    """조각 결과를 **파일 순서대로** 모은다 (경계의 시간 역행·긴 형식 컬럼 순서가 순서에 달렸다)."""
+    acc = {"reps": [], "frames": [], "order": [], "counts": {}, "idx": None, "n_boundary": 0, "last": None}
+
+    def take(part: Table | None, n_lines: int, pos: int) -> None:
+        say(f"읽는 중 {min(99, int(pos / size * 100))}% ({_fmt_size(pos)} / {_fmt_size(size)})")
+        if part is None:
+            blank = IngestReport()
+            blank.n_lines = hb_lines + n_lines
+            blank.n_blank_rows = n_lines
+            acc["reps"].append(blank)
+            return
+        acc["reps"].append(part.report)
+        cs = part.report.chunk_stats
+        for c, (a, b) in cs.get("counts", {}).items():
+            cnt = acc["counts"].setdefault(c, [0, 0])
+            cnt[0] += a
+            cnt[1] += b
+        if "edges" in cs:                       # 조각 경계에서 시간이 거꾸로 가는가 (파일 순서 기준)
+            if acc["last"] is not None and cs["edges"][0] < acc["last"]:
+                acc["n_boundary"] += 1
+            acc["last"] = cs["edges"][1]
+        d = part.df
+        if len(d.index):
+            acc["idx"] = d.index if acc["idx"] is None else acc["idx"].union(d.index)
+            acc["frames"].append(d)
+        known = set(acc["order"])
+        acc["order"] += [c for c in d.columns if c not in known]
+
+    if n_workers <= 1:
+        for text, n_lines, pos in chunks:
+            take(_parse_chunk(text, *args), n_lines, pos)
+        return acc
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        pending: deque = deque()
+        for text, n_lines, pos in chunks:
+            pending.append((ex.submit(_parse_chunk, text, *args), n_lines, pos))
+            while len(pending) >= 2 * n_workers:       # 읽어 둔 조각이 쌓여 메모리가 불지 않게
+                fut, nl, ps = pending.popleft()
+                take(fut.result(), nl, ps)
+        while pending:
+            fut, nl, ps = pending.popleft()
+            take(fut.result(), nl, ps)
+    return acc
+
+
+def _merge_reports(reps: list[IngestReport], lay: IngestReport, n_head: int, hb_lines: int) -> IngestReport:
+    """조각별 정리 내역을 파일 하나의 내역으로."""
+    r = IngestReport()
+    first = next((x for x in reps if x.time_column is not None), reps[0])
+    r.delimiter, r.title_rows, r.header_rows = lay.delimiter, lay.title_rows, lay.header_rows
+    r.time_column, r.time_column_note = lay.time_column, lay.time_column_note
+    r.has_unit_row, r.has_desc_row = first.has_unit_row, first.has_desc_row
+    r.renamed_columns = dict(first.renamed_columns)
+    r.n_lines = n_head + sum(x.n_lines - hb_lines for x in reps)
+    for a in ("n_data_rows", "n_repeated_header", "n_blank_rows", "n_bad_time", "n_out_of_order",
+              "n_duplicate_rows", "n_conflicting_duplicates"):
+        setattr(r, a, sum(getattr(x, a) for x in reps))
+    for x in reps:
+        for k, v in x.time_formats.items():
+            r.time_formats[k] = r.time_formats.get(k, 0) + v
+        r.bad_time_examples.extend(x.bad_time_examples[:5 - len(r.bad_time_examples)])
+        for c, d in x.status_counts.items():
+            tgt = r.status_counts.setdefault(c, {})
+            for k, v in d.items():
+                tgt[k] = tgt.get(k, 0) + v
+        for c, v in x.thousands.items():
+            r.thousands[c] = r.thousands.get(c, 0) + v
+        for c, u in x.suffix_units.items():
+            r.suffix_units.setdefault(c, u)
+        r.bool_columns += [c for c in x.bool_columns if c not in r.bool_columns]
+        for name in ("units", "units_raw", "descriptions"):
+            dst = getattr(r, name)
+            for k, v in getattr(x, name).items():
+                if not dst.get(k):
+                    dst[k] = v
+        r.dropped_columns += [c for c in x.dropped_columns if c not in r.dropped_columns]
+        for c, v in x.text_columns.items():
+            r.text_columns.setdefault(c, v)
+    longs = [x.long for x in reps if x.long]
+    if longs:
+        L = dict(longs[0])
+        for k in ("n_rows", "n_blank_key", "n_bad_status", "n_dup", "n_dup_conflict"):
+            if any(k in x for x in longs):
+                L[k] = sum(x.get(k, 0) for x in longs)
+        mixed: dict[str, list[str]] = {}
+        for x in longs:
+            for k, v in x.get("mixed_units", {}).items():
+                mixed.setdefault(k, v)
+        L.pop("mixed_units", None)
+        L.pop("n_mixed_units", None)
+        if mixed:
+            L["mixed_units"] = dict(list(mixed.items())[:5])
+            L["n_mixed_units"] = len(mixed)
+        r.long = L
+    return r
+
+
+def _fmt_size(n: float) -> str:
+    return f"{n / 2 ** 30:.1f} GB" if n >= 2 ** 30 else f"{n / 2 ** 20:.0f} MB"
+
+
+# ---- 정리 결과 캐시 (큰 파일만) ---------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def _code_version() -> str:
+    """이 모듈이나 단위 표가 바뀌면 캐시를 버린다 — 고친 정리 규칙이 옛 결과에 가려지지 않게."""
+    h = hashlib.sha256()
+    for f in (Path(__file__), Path(__file__).parents[1] / "core" / "units.py"):
+        h.update(f.read_bytes())
+    return h.hexdigest()[:12]
+
+
+def _cache_path(p: Path, time_column, encoding, regularize) -> Path:
+    st = p.stat()
+    key = f"{st.st_size}|{st.st_mtime_ns}|{time_column}|{encoding}|{regularize}|{_code_version()}"
+    return p.parent / CACHE_DIR / f"{p.name}.{hashlib.sha256(key.encode()).hexdigest()[:16]}.npz"
+
+
+def _cache_load(c: Path) -> Table | None:
+    if not c.exists():
+        return None
+    try:
+        with np.load(c, allow_pickle=False) as z:
+            meta = json.loads(bytes(z["meta"]).decode("utf-8"))
+            values, index = z["values"], z["index"]
+        freq = pd.Timedelta(seconds=meta["freq_s"]) if meta.get("freq_s") else None
+        idx = pd.DatetimeIndex(index.astype("datetime64[ns]"), name=meta["index_name"], freq=freq)
+        df = pd.DataFrame(values, index=idx, columns=meta["columns"])
+        return Table(df=df, report=IngestReport(**meta["report"]))
+    except (OSError, ValueError, KeyError, TypeError):      # 깨진 캐시는 무시하고 다시 읽는다
+        return None
+
+
+def _cache_save(c: Path, tab: Table) -> None:
+    df = tab.df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return
+    try:
+        c.parent.mkdir(exist_ok=True)
+        stem = c.name.rsplit(".", 2)[0]
+        for old in c.parent.glob(glob.escape(stem) + ".*.npz"):
+            old.unlink(missing_ok=True)
+        meta = {"columns": [str(x) for x in df.columns], "index_name": df.index.name,
+                "freq_s": tab.report.interval_s if df.index.freq is not None else None,
+                "report": dataclasses.asdict(tab.report)}
+        tmp = c.with_name(c.name + ".part")
+        with open(tmp, "wb") as f:
+            np.savez(f, values=df.to_numpy(dtype=float),
+                     index=df.index.to_numpy().astype("datetime64[ns]").astype("int64"),
+                     meta=np.frombuffer(json.dumps(meta, ensure_ascii=False).encode("utf-8"), dtype=np.uint8))
+        os.replace(tmp, c)
+    except (OSError, TypeError, ValueError):                # 읽기 전용 폴더 등 — 캐시는 없어도 된다
+        return
+
+
 def read_text(text: str, time_column: str | None = None, *, regularize: bool = True,
-              delimiter: str | None = None) -> Table:
+              delimiter: str | None = None, long: bool | dict | None = None,
+              chunk: bool = False) -> Table:
+    """``long`` — None: 긴 형식이면 알아서 펼친다, False: 펼치지 않는다, dict: 이 역할(`_long_roles`)대로
+    펼친다 (큰 파일의 조각은 한 조각에 이름이 하나뿐일 수 있어 판정을 파일 표본으로 미리 한다).
+    ``chunk`` — 큰 파일의 한 조각: 글자 컬럼 판정은 합친 뒤 파일 전체로 하도록 컬럼을 남기고 개수만 센다."""
     rep = IngestReport()
     rep.delimiter = delimiter or _sniff_delimiter(text)
     rows = _parse_rows(text, rep.delimiter)
     rep.n_lines = len(rows)
+    names, header_set, body, tcol, tj, _ = _split_header(rows, time_column, rep)
+    return _body_to_table(names, header_set, body, tcol, tj, rep, regularize, long, chunk)
 
+
+def _split_header(rows: list[list[str]], time_column: str | None, rep: IngestReport):
+    """(이름, 헤더·메타 행들, 데이터 행, 시각 컬럼, 그 위치, 데이터 앞 줄 수)."""
     # ---- 헤더: 비어 있지 않은 칸이 둘 이상이고 대부분 숫자가 아닌 첫 행 ------------
     h = 0
     while h < len(rows):
@@ -680,7 +1128,7 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
         raise ValueError("헤더 행을 찾지 못했습니다 (숫자가 아닌 이름이 둘 이상 있는 행)")
     rep.title_rows = h
     header = rows[h]
-    width = max(len(r) for r in rows[h:])
+    width = max(map(len, rows[h:]))
     header = header + [""] * (width - len(header))
     names, seen = [], {}
     for j, c in enumerate(header):
@@ -694,7 +1142,9 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
             seen[name] = 1
         names.append(name)
 
-    body = [r + [""] * (width - len(r)) for r in rows[h + 1:]]
+    body = rows[h + 1:]
+    if min(map(len, body), default=width) < width:          # 칸 수가 다른 행 (csv 모듈로 읽은 경우)
+        body = [r + [""] * (width - len(r)) for r in body]
 
     # ---- 시각 컬럼 -------------------------------------------------------------
     sample = [r for r in body[:600] if any(r)]
@@ -751,9 +1201,11 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
             for j, c in cells:
                 rep.descriptions[names[j]] = c
     rep.header_rows = 1 + sum(1 for r in meta if any(r))
-    body = body[len(meta):]
-    header_set = [header] + meta
+    return names, [header] + meta, body[len(meta):], tcol, tj, h + 1 + len(meta)
 
+
+def _body_to_table(names, header_set, body, tcol, tj, rep: IngestReport, regularize: bool,
+                   long: bool | dict | None, chunk: bool = False) -> Table:
     # ---- 데이터 행 분류 ----------------------------------------------------------
     # 시각을 먼저 읽는다. 반복 헤더·잡음 행은 시각이 안 읽히는 소수의 행 안에만 있으므로
     # 그 행들만 따로 들여다보면 된다 (7만 행 전체를 문자열 비교하면 수 초가 걸린다).
@@ -771,7 +1223,15 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
         return False
 
     if tcol is not None:
-        times, rep.time_formats = parse_times(pd.Series([r[tj] for r in body], dtype=object))
+        tvals = pd.Series(list(map(itemgetter(tj), body)), dtype=object)
+        codes, uniq = pd.factorize(tvals)
+        if len(uniq) < 0.8 * len(tvals):
+            # 긴 형식은 같은 시각이 태그 수만큼 반복된다 — 서로 다른 시각만 해석한다
+            pu, rep.time_formats = parse_times(pd.Series(uniq, dtype=object),
+                                               counts=np.bincount(codes, minlength=len(uniq)))
+            times = pd.Series(pu.to_numpy()[codes])
+        else:
+            times, rep.time_formats = parse_times(tvals)
         bad = times.isna().to_numpy()
         keep = ~bad
         for i in np.flatnonzero(bad):
@@ -791,6 +1251,8 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
         t = times.to_numpy()
         if len(t) > 1:
             rep.n_out_of_order = int(np.sum(t[1:] < t[:-1]))
+        if chunk and len(t):
+            rep.chunk_stats["edges"] = (t[0], t[-1])
         data_cols = [c for c in names if c != tcol]
     else:
         hdr = [looks_like_header(r) for r in body]
@@ -802,9 +1264,10 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
     if not body:
         raise ValueError("시각을 읽을 수 있는 데이터 행이 없습니다")
     spec = None
-    if tcol is not None and rep.header_rows == 1:          # 단위·설명 행이 있으면 넓은 형식이다
+    if tcol is not None and rep.header_rows == 1 and long is not False:   # 단위·설명 행이 있으면 넓은 형식
         t_ns = times.to_numpy().astype("datetime64[ns]").astype("int64")
-        spec = _detect_long(names, body, tj, t_ns)
+        spec = (_spec_from_roles(names, body, long) if isinstance(long, dict)
+                else _detect_long(names, body, tj, t_ns))
     if spec is not None:
         frame, times, data_cols = _pivot_long(names, t_ns, spec, rep)
     else:
@@ -812,16 +1275,27 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
 
     # ---- 숫자 변환 ------------------------------------------------------------
     numeric: dict[str, pd.Series] = {}
-    for c in data_cols:
-        arr = frame[c].to_numpy(dtype=object)
-        nonempty_np = arr != ""
+    # 한 번에 숫자로 바꿔 본다 — 컬럼 수백 개를 하나씩 바꾸면 컬럼마다 드는 고정비가 더 크다.
+    # 숫자가 아닌 칸이 남은 컬럼만 아래에서 하나씩 들여다본다 (콤마·ON/OFF·단위 기호·상태 문자열).
+    A = frame[data_cols].to_numpy(dtype=object) if data_cols else np.empty((len(frame), 0), dtype=object)
+    NE = A != ""
+    V = np.asarray(pd.to_numeric(np.where(NE, A, None).ravel(), errors="coerce"),
+                   dtype=float).reshape(A.shape)
+    for jc, c in enumerate(data_cols):
+        arr = A[:, jc]
+        nonempty_np = NE[:, jc]
         n_nonempty = int(nonempty_np.sum())
         if n_nonempty == 0:
             rep.dropped_columns.append(c)
             continue
+        vj = V[:, jc]
+        if not (np.isnan(vj) & nonempty_np).any() and n_nonempty >= 3:
+            if chunk:
+                rep.chunk_stats.setdefault("counts", {})[c] = (n_nonempty, n_nonempty)
+            numeric[c] = pd.Series(vj, index=frame.index)
+            continue
         nonempty = pd.Series(nonempty_np, index=frame.index)
-        v = pd.Series(pd.to_numeric(np.where(nonempty_np, arr, None), errors="coerce"),
-                      index=frame.index, dtype=float)
+        v = pd.Series(vj.copy(), index=frame.index, dtype=float)
         left = v.isna() & nonempty
         if left.any():
             t = pd.Series(arr[left.to_numpy()], index=left[left].index, dtype=object)
@@ -851,7 +1325,9 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
                         rep.units_raw.setdefault(c, suffix)
             left = v.isna() & nonempty
         n_num = n_nonempty - int(left.sum())
-        if n_num < max(3, 0.05 * n_nonempty):
+        if chunk:
+            rep.chunk_stats.setdefault("counts", {})[c] = (n_num, n_nonempty)
+        elif n_num < max(3, 0.05 * n_nonempty):
             rep.text_columns[c] = [str(x) for x in
                                    pd.Series(arr[nonempty_np]).value_counts().head(3).index]
             continue
@@ -865,8 +1341,11 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
         return Table(df=df.reset_index(drop=True), report=rep)
     df.index = pd.DatetimeIndex(times.to_numpy(), name=tcol)
     df = df.sort_index(kind="stable")
+    return Table(df=_regularize(_dedupe(df, rep), rep, regularize, tcol), report=rep)
 
-    # ---- 중복 시각 --------------------------------------------------------------
+
+def _dedupe(df: pd.DataFrame, rep: IngestReport) -> pd.DataFrame:
+    """같은 시각 행을 평균으로 합친다 (정렬된 표)."""
     if df.index.has_duplicates:
         dup = df.index.duplicated(keep=False)
         g = df[dup].groupby(level=0)
@@ -877,8 +1356,11 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
         df = df.groupby(level=0).mean()
         rep.n_duplicate_rows = n_before - len(df)
         rep.n_conflicting_duplicates = int(conflict.sum())
+    return df
 
-    # ---- 격자 ------------------------------------------------------------------
+
+def _regularize(df: pd.DataFrame, rep: IngestReport, regularize: bool, tcol: str | None) -> pd.DataFrame:
+    """기록 주기를 정하고 규칙 격자에 놓는다 (빠진 시각은 빈 행)."""
     if len(df) > 2:
         d = np.diff(df.index.to_numpy().astype("datetime64[ms]").astype("int64")) / 1000.0
         d = d[d > 0]
@@ -921,7 +1403,7 @@ def read_text(text: str, time_column: str | None = None, *, regularize: bool = T
         rep.gaps = _gaps(df, rep.interval_s)
     rep.t_start = str(df.index[0]) if len(df) else None
     rep.t_end = str(df.index[-1]) if len(df) else None
-    return Table(df=df, report=rep)
+    return df
 
 
 def _gaps(df: pd.DataFrame, interval_s: float, min_steps: int = 3, top: int = 10) -> list[dict]:

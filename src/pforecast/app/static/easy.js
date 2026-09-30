@@ -98,9 +98,12 @@ async function ezSelectCsv(path) {
   EZ.csv = path;
   $$('#ez-datasets .chip').forEach(c => c.classList.toggle('on', c.title === path));
   const box = $('#ez-data-summary'); box.innerHTML = '';
-  box.append(h('div', { class: 'card' }, h('div', { class: 'sub' }, '파일을 읽고 정리하는 중… (10MB 에 몇 초)'),
+  box.append(h('div', { class: 'card' },
+    h('div', { class: 'sub' }, '파일을 읽고 정리하는 중… (10MB 에 몇 초. GB 급 파일은 처음 한 번 몇 분 — 다음부터는 바로 열립니다)'),
     h('div', { class: 'progress' }, h('i'))));
   try {
+    const msg = box.querySelector('.sub');
+    if (!(await prepareTable(path, m => (msg.textContent = m), () => EZ.csv === path))) return;
     const [prof, pre] = await Promise.all([
       api('/api/profile', { csv: path }),
       api('/api/easy/presets', { csv: path }).catch(() => ({ presets: [] })),

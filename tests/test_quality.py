@@ -73,6 +73,22 @@ def test_step_signals_are_classified():
     assert labels["spare"] == "상수"
 
 
+def test_parallel_assess_equals_serial():
+    """태그 수백 개 표는 컬럼을 나눠 여러 프로세스로 본다 — 결과(이상 목록·순서·마스크)가 같아야 한다.
+    컬럼끼리 엮이는 '다른 컬럼은 살아 있는 행'도 전체 기준이어야 한다 (죽은 센서 판정)."""
+    df = _frame()
+    for d in range(20):
+        df.iloc[d * 288 + 36:d * 288 + 38, 0] = 160.0          # 정기 교정
+    df.iloc[1000:1400, 1] = df.iloc[999, 1]                    # 고착
+    df.iloc[3000, 6] = 999.9                                   # 스파이크
+    df.iloc[2000:, 2] = np.nan                                 # 센서 정지
+    df.iloc[3000:3010, :] = np.nan                             # 통신 두절
+    a, b = assess(df, workers=1), assess(df, workers=3)
+    assert [i.to_dict() for i in a.issues] == [i.to_dict() for i in b.issues]
+    assert list(a.masks) == list(b.masks)
+    assert all(np.array_equal(a.masks[c], b.masks[c]) for c in a.masks)
+
+
 def test_dead_sensor_reported_once_even_across_comm_outages():
     df = _frame()
     df.iloc[2000:, 1] = np.nan

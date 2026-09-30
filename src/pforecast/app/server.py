@@ -14,9 +14,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import mimetypes
+import os
 import re
+import shutil
 import threading
 import traceback
 import uuid
@@ -31,8 +35,44 @@ import numpy as np
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-#: 업로드 상한. 5분 데이터 1년치 × 수십 태그가 수십 MB 수준이다.
-MAX_UPLOAD = 300 * 1024 * 1024
+#: 업로드 상한. 1분 데이터 수년치 × 수백 태그의 긴 형식 덤프가 수 GB 다. 본문은 메모리에 모으지 않고
+#: 조각으로 디스크에 쓰고, 큰 CSV 는 나눠 읽으므로(``data.ingest``) 메모리가 파일 크기를 따라가지 않는다.
+MAX_UPLOAD = 5 * 1024 ** 3
+#: 업로드 뒤에도 남겨 둘 디스크 여유 (결과·캐시 파일)
+_DISK_MARGIN = 512 * 1024 ** 2
+
+
+def _fmt_bytes(n: float) -> str:
+    return f"{n / 1024 ** 3:.2f} GB" if n >= 1024 ** 3 else f"{n / 1024 ** 2:.0f} MB"
+
+
+class _Body:
+    """HTTP 본문을 Content-Length 만큼만 읽는 스트림. 오류로 끝나도 남은 본문을 버려 연결을 살린다."""
+
+    def __init__(self, f, length: int):
+        self.f, self.left = f, max(int(length), 0)
+
+    def read(self, k: int = -1) -> bytes:
+        k = self.left if k is None or k < 0 else min(k, self.left)
+        if k <= 0:
+            return b""
+        b = self.f.read(k)
+        self.left = self.left - len(b) if b else 0
+        return b
+
+    def drain(self) -> None:
+        while self.left > 0:
+            self.read(1 << 20)
+
+
+def _same_file(path: Path, size: int, digest: str) -> bool:
+    if path.stat().st_size != size:
+        return False
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest() == digest
 
 
 # --- 작업 큐 ----------------------------------------------------------------
@@ -95,21 +135,35 @@ class Workspace:
         self._tables: dict[str, tuple] = {}       # 경로 -> (mtime, size, Table, QualityReport)
         self._tlock = threading.Lock()
 
-    def table(self, rel: str, time_column: str | None = None):
-        """CSV 를 읽어 정리한 결과를 캐시한다. 10MB 에 2~3초라 미리보기마다 다시 읽을 수 없다."""
+    def _table_hit(self, rel: str, time_column: str | None):
+        st = self.resolve(rel).stat()
+        with self._tlock:
+            hit = self._tables.get(f"{rel}|{time_column or ''}")
+        return hit if hit and hit[0] == st.st_mtime and hit[1] == st.st_size else None
+
+    def table_ready(self, rel: str, time_column: str | None = None) -> bool:
+        return self._table_hit(rel, time_column) is not None
+
+    def table(self, rel: str, time_column: str | None = None, progress=None):
+        """CSV 를 읽어 정리한 결과를 캐시한다. 10MB 에 2~3초, GB 급은 처음 한 번 몇 분이라 미리보기마다
+        다시 읽을 수 없다. 같은 파일을 두 요청이 동시에 읽지 않게 파일마다 잠근다."""
         from ..data.ingest import read_table
         from ..data.quality import assess
-        path = self.resolve(rel)
-        st = path.stat()
-        key = f"{rel}|{time_column or ''}"
-        with self._tlock:
-            hit = self._tables.get(key)
-            if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        hit = self._table_hit(rel, time_column)
+        if hit:
+            return hit[2], hit[3]
+        with self.lock(f"table:{rel}|{time_column or ''}"):
+            hit = self._table_hit(rel, time_column)
+            if hit:
                 return hit[2], hit[3]
-        tab = read_table(path, time_column=time_column)
-        q = assess(tab.df)
-        with self._tlock:
-            self._tables[key] = (st.st_mtime, st.st_size, tab, q)
+            path = self.resolve(rel)
+            st = path.stat()
+            tab = read_table(path, time_column=time_column, progress=progress)
+            if progress:
+                progress("값 이상을 찾는 중 (교정 창·고착·스파이크)")
+            q = assess(tab.df)
+            with self._tlock:
+                self._tables[f"{rel}|{time_column or ''}"] = (st.st_mtime, st.st_size, tab, q)
         return tab, q
 
     def _rel(self, p: Path) -> str:
@@ -359,13 +413,39 @@ class Api:
     def __init__(self, ws: Workspace):
         self.ws = ws
         self.jobs = JobRegistry()
+        self._profiles: dict[tuple, tuple] = {}   # (csv, 시각 컬럼) -> (mtime, size, 요약)
 
     # -- 엔드포인트 --
     def workspace(self, _body) -> dict:
         return {"root": str(self.ws.root), "datasets": self.ws.datasets(),
                 "models": self.ws.model_files()}
 
+    def table_prepare(self, body) -> dict:
+        """큰 CSV 는 처음 읽는 데 몇 분 걸린다 — 작업으로 돌리고 화면은 진행률을 본다."""
+        rel, ts = body["csv"], body.get("timestamp")
+        if self.ws.table_ready(rel, ts):
+            return {"ready": True}
+
+        def work(job):
+            tab, _ = self.ws.table(rel, ts, progress=lambda m: setattr(job, "message", m))
+            job.message = "요약 통계를 계산하는 중"
+            self.profile(body)                   # 화면이 곧 부른다 — 기다리는 동안 미리
+            return {"rows": len(tab.df), "columns": int(tab.df.shape[1])}
+
+        return {"job": self.jobs.start("table", work).payload()}
+
     def profile(self, body) -> dict:
+        """1단계 요약. 같은 파일이면 한 번만 계산한다 (GB 급 표는 수십 초)."""
+        key = (body["csv"], body.get("timestamp"))
+        st = self.ws.resolve(body["csv"]).stat()
+        hit = self._profiles.get(key)
+        if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+            return hit[2]
+        res = self._profile(body)
+        self._profiles[key] = (st.st_mtime, st.st_size, res)
+        return res
+
+    def _profile(self, body) -> dict:
         from ..analyze.profile import profile_dataset
         from ..analyze.units_guess import guess_units
         from ..data.quality import apply
@@ -622,25 +702,51 @@ class Api:
         return {"job": self.jobs.start("forecast", work).payload()}
 
     # -- 간편 예측 (업로드 → 변수 → 기간 → 모델 → 결과) --
-    def upload(self, name: str, data: bytes) -> dict:
-        """CSV 를 작업 폴더의 ``uploads/`` 에 저장한다. 이 PC 밖으로는 아무것도 나가지 않는다."""
+    def upload(self, name: str, data, length: int | None = None) -> dict:
+        """CSV 를 작업 폴더의 ``uploads/`` 에 저장한다. 이 PC 밖으로는 아무것도 나가지 않는다.
+
+        ``data`` 는 bytes 또는 HTTP 본문 스트림. 수 GB 파일도 메모리에 모으지 않고 조각으로 임시 파일에
+        쓴 뒤 이름을 바꾼다 — 중간에 끊기면 반쪽 CSV 가 목록에 뜨지 않는다.
+        """
+        if isinstance(data, (bytes, bytearray)):
+            data, length = io.BytesIO(data), len(data)
         base = Path(str(name).replace("\\", "/")).name
         stem, suffix = Path(base).stem, Path(base).suffix.lower()
         if suffix not in (".csv", ".txt"):
             raise ValueError("CSV 파일만 올릴 수 있습니다 (.csv). 엑셀은 'CSV 로 저장' 후 올리세요.")
-        if not data:
+        if not length:
             raise ValueError("빈 파일입니다.")
         from ..fileio import safe_stem
         safe = safe_stem(stem, "upload")
         folder = self.ws.root / "uploads"
         folder.mkdir(exist_ok=True)
-        path, i = folder / f"{safe}.csv", 1
-        while path.exists() and path.read_bytes() != data:
-            path, i = folder / f"{safe}_{i}.csv", i + 1
-        if not path.exists():               # 같은 내용이면 다시 쓰지 않는다 (엑셀이 열어 둔 파일은 잠겨 있다)
-            path.write_bytes(data)
-        return {"path": self.ws._rel(path), "name": path.name,
-                "size_kb": round(len(data) / 1024, 1)}
+        free = shutil.disk_usage(folder).free
+        if length + _DISK_MARGIN > free:
+            raise ValueError(f"디스크 여유 공간이 부족합니다 (파일 {_fmt_bytes(length)}, 남은 공간 "
+                             f"{_fmt_bytes(free)}). 작업 폴더가 있는 드라이브를 비우고 다시 올리세요.")
+        tmp = folder / f".{safe}.{uuid.uuid4().hex[:8]}.part"
+        h, n = hashlib.sha256(), 0
+        try:
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = data.read(8 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    f.write(chunk)
+                    n += len(chunk)
+            if n != length:
+                raise ValueError(f"업로드가 중간에 끊겼습니다 ({_fmt_bytes(n)} / {_fmt_bytes(length)}). "
+                                 "다시 올리세요.")
+            digest = h.hexdigest()
+            path, i = folder / f"{safe}.csv", 1
+            while path.exists() and not _same_file(path, n, digest):
+                path, i = folder / f"{safe}_{i}.csv", i + 1
+            if not path.exists():           # 같은 내용이면 다시 쓰지 않는다 (엑셀이 열어 둔 파일은 잠겨 있다)
+                os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return {"path": self.ws._rel(path), "name": path.name, "size_kb": round(n / 1024, 1)}
 
     def easy_presets(self, body) -> dict:
         from ..easy import find_presets
@@ -821,6 +927,7 @@ def _analysis_payload(res, report_rel: str) -> dict:
 _ROUTES: dict[str, str] = {
     "/api/workspace": "workspace",
     "/api/profile": "profile",
+    "/api/table/prepare": "table_prepare",
     "/api/preview": "preview",
     "/api/analyze": "analyze",
     "/api/job": "job",
@@ -893,18 +1000,20 @@ def make_handler(api: Api):
             length = int(self.headers.get("Content-Length") or 0)
             parsed = urlparse(self.path)
             if parsed.path == "/api/upload":
+                body = _Body(self.rfile, length)
                 if length > MAX_UPLOAD:
-                    # 본문을 읽지 않으면 연결이 꼬이므로 버리면서 읽는다
-                    left = length
-                    while left > 0:
-                        left -= len(self.rfile.read(min(left, 1 << 20)) or b"x" * left)
-                    return self._json(413, {"error": f"파일이 {MAX_UPLOAD // 2**20} MB 를 넘습니다."})
-                data = self.rfile.read(length) if length else b""
+                    body.drain()                  # 본문을 읽지 않으면 연결이 꼬이므로 버리면서 읽는다
+                    return self._json(413, {"error": f"파일이 {_fmt_bytes(MAX_UPLOAD)} 를 넘습니다 "
+                                                     f"({_fmt_bytes(length)})."})
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 try:
-                    return self._json(200, api.upload(query.get("name", "upload.csv"), data))
+                    return self._json(200, api.upload(query.get("name", "upload.csv"), body, length))
                 except ValueError as exc:
+                    body.drain()
                     return self._json(400, {"error": str(exc)})
+                except OSError as exc:            # 디스크가 가득 참, 백신이 막음 ...
+                    body.drain()
+                    return self._json(507, {"error": f"파일을 쓰지 못했습니다: {exc}"})
             raw = self.rfile.read(length) if length else b"{}"
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")

@@ -16,6 +16,8 @@ venv/
 # 예외는 결정론적으로 재생성 가능한 예제용 합성 데이터 하나뿐.
 /data/
 uploads/
+# 큰 CSV 의 정리 결과 캐시 (CSV 옆에 생긴다 — 현장 값이 들어 있다)
+.pforecast_cache/
 examples/**/data/*
 !examples/nox_stack/data/plant_5min.csv
 *.parquet
