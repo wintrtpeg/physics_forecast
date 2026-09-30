@@ -191,9 +191,8 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
 * 모델 만들기는 예제(`examples/`)를 덮어쓰지 않는다 — 사본으로 `models/` 에. 저장은 작업 폴더
   안 `.yaml` 만.
 * JS 를 고치면 브라우저 점검 전에 `node --check` 를 돌린다 (괄호 하나로 시작 화면이 통째로 안 떴다).
-* 윈도우 `.bat` 은 **ASCII 만 + CRLF** (`.gitattributes`). 한글·`chcp 65001` 을 넣지 말 것 — cmd 는
-  UTF-8 배치 파일을 외부 프로그램(파이썬·pip)이 끝난 다음 줄부터 잘못 읽고 **아무 말 없이 멈춘다**
-  (윈도우 점검에서 '가상환경을 만드는 중...' 뒤 그대로 끝났다). 일과 한글 안내는 `scripts/launch.py`.
+* 윈도우 `.bat` 은 **ASCII 만 + CRLF** (`.gitattributes`). 한글·`chcp 65001` 을 넣지 말 것 (cmd 가
+  UTF-8 배치 파일을 잘못 읽는 경우가 있다). 일과 한글 안내는 `scripts/launch.py`.
   파이썬 확인은 실제로 실행해 본다 (`python -c "import sys"`) — 설치 안 된 PC 의 `python.exe` 는
   스토어를 여는 가짜다.
 * 서버가 화면에 주는 경로는 **항상 `/`** (`fileio.rel_posix`). 윈도우의 `\` 를 주면 `examples/` 판별이
@@ -201,6 +200,9 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
   정적 파일 Content-Type 은 `_STATIC_TYPES` 로 고정 (윈도우 mimetypes 는 레지스트리를 읽는다).
 * 윈도우 동작은 `.github/workflows/windows.yml` 로 확인한다 (bat 실행 → API·Edge 화면 점검 → pytest).
   리눅스 테스트 통과만으로 "윈도우에서 된다"고 말하지 말 것.
+* 그 점검에서 앱 실행·대기·점검은 **한 단계 안에서** (`app_check.ps1`). 단계가 끝나면 그 콘솔에 붙은
+  백그라운드 앱도 끝난다 — 이걸 모르고 '배치 파일이 조용히 멈춘다'고 잘못 진단한 적이 있다.
+  증상이 단계 경계와 겹치면 점검 틀부터 의심할 것.
 * 오프라인 묶음(`scripts/make_offline_bundle.py`)은 **이 PC 에 깔린 버전으로 고정**해서 받는다
   (테스트를 통과한 조합). 소스는 git 추적 파일만 — 현장 데이터가 섞이지 않게.
 
