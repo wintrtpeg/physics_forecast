@@ -29,6 +29,7 @@ import pandas as pd
 from .core.units import from_si
 from .data.split import check_split
 from .data.tagmap import TagEntry, TagMap
+from .fileio import rel_posix, write_locked_ok
 from .scenario import load_model
 
 #: 예측 결과 차트에 보내는 최대 점 수 (브라우저가 가볍게 그리는 선)
@@ -747,7 +748,7 @@ def advise_easy(cfg: EasyConfig, root: str | Path = ".", progress: Callable[[str
     say("학습 기간 데이터 정리 중")
     tm = _tagmap(cfg, True)
     tm_path = out_dir / f"{_slug(cfg.name or Path(cfg.csv).stem)}.advice.tagmap.yaml"
-    tm.dump(tm_path)
+    tm_path, _ = write_locked_ok(tm_path, tm.dump)
     a, b, c, d = period_bounds(cfg.train, cfg.test)
     spec = {"yaml": cfg.model} if str(cfg.model).endswith((".yaml", ".yml")) else {"python": cfg.model}
     wcfg = WorkflowConfig(name=cfg.name, csv=str(cfg.csv), tagmap=str(tm_path),
@@ -923,7 +924,7 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
     say("데이터 정리 중 (학습·간격·예측 구간을 따로 정제)")
     tm = _tagmap(cfg, physics)
     tm_path = out_dir / f"{stem}.tagmap.yaml"
-    tm.dump(tm_path)
+    tm_path, _ = write_locked_ok(tm_path, tm.dump)
     a, b, c, d = period_bounds(cfg.train, cfg.test)
     wcfg = WorkflowConfig(
         name=cfg.name, csv=str(cfg.csv), tagmap=str(tm_path),
@@ -1057,15 +1058,20 @@ def run_easy(cfg: EasyConfig, root: str | Path = ".",
     for name, (_, pte) in preds.items():
         pred_df[name] = pte
     pred_df.index.name = "timestamp"
-    pred_path = out_dir / f"{stem}.predictions.csv"
-    pred_df.to_csv(pred_path, encoding="utf-8-sig")
+    # 엑셀이 열어 둔 결과 파일은 잠겨 있다 (윈도우) — 새 이름으로 쓰고 알린다
+    pred_path, locked = write_locked_ok(out_dir / f"{stem}.predictions.csv",
+                                        lambda p: pred_df.to_csv(p, encoding="utf-8-sig"))
+    if locked:
+        notes.append(locked)
     cfg_path = None
     if physics:
-        cfg_path = out_dir / f"{stem}.calibration.yaml"
-        _write_calibration_yaml(cfg_path, cfg, wcfg, tm_path, params, x_cols, y_col)
+        cfg_path, locked = write_locked_ok(out_dir / f"{stem}.calibration.yaml", lambda p: _write_calibration_yaml(
+            p, cfg, wcfg, tm_path, params, x_cols, y_col))
+        if locked:
+            notes.append(locked)
 
     headline = _headline(models, split, show_unit, physics, physics_failed)
-    rel = lambda p: str(Path(p).resolve().relative_to(root.resolve())) if p else None  # noqa: E731
+    rel = lambda p: rel_posix(p, root) if p else None  # noqa: E731 — 화면은 '/' 경로만 안다
     return {
         "mode": "physics" if physics else "ml",
         "target": {"column": cfg.target, "unit": show_unit},

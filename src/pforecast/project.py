@@ -23,7 +23,8 @@ DIR = "projects"
 
 
 def safe_name(name: str) -> str:
-    return re.sub(r"[^0-9A-Za-z가-힣_\-]+", "_", str(name)).strip("_") or "project"
+    from .fileio import safe_stem
+    return safe_stem(re.sub(r"[^0-9A-Za-z가-힣_\-]+", "_", str(name)).strip("_") or "project", "project")
 
 
 def project_path(root: str | Path, name: str) -> Path:

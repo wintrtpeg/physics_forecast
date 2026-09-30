@@ -113,10 +113,10 @@ class Workspace:
         return tab, q
 
     def _rel(self, p: Path) -> str:
-        try:
-            return str(p.resolve().relative_to(self.root))
-        except ValueError:
-            return str(p.resolve())
+        # 화면은 '/' 경로만 안다 — 윈도우의 '\\' 를 그대로 주면 예제 판별(examples/)이 틀려
+        # 예제를 덮어쓰고, 다운로드 이름·목록 표시가 어긋난다
+        from ..fileio import rel_posix
+        return rel_posix(p, self.root)
 
     #: 작업 폴더를 훑을 때 들어가지 않는 폴더. 저장소 안에 만든 가상환경(.venv, venv)은
     #: 파일이 수만 개라 목록이 느려지고 남의 YAML 이 모델로 잡힌다.
@@ -537,6 +537,8 @@ class Api:
         path = self.ws.resolve(rel)
         if path.suffix not in (".yaml", ".yml"):
             raise ValueError("모델은 .yaml 로 저장합니다.")
+        if (self.ws.root / "examples") in path.parents:
+            raise ValueError("예제는 덮어쓰지 않습니다 — models/ 에 사본으로 저장하세요.")
         saved = save_model(body["model"], path)
         self.ws.forget(self.ws._rel(saved))
         return {"path": self.ws._rel(saved)}
@@ -586,9 +588,11 @@ class Api:
                          base_days=float(body.get("base_days", 7)), horizon_days=float(body.get("horizon_days", 14)),
                          step=str(body.get("step") or "1h"), adjust=body.get("adjust") or [])
         name = _safe_name(body.get("plan_name") or f"{Path(body['csv']).stem}_계획_{plan.index.min():%Y%m%d}")
-        path = save_plan(plan, self.ws.root / "plans" / f"{name}.csv")
+        path, locked = save_plan(plan, self.ws.root / "plans" / f"{name}.csv")
         chk = check_plan(plan, feats, self._history(body))
-        return {"path": self.ws._rel(path), "check": chk, "preview": _plan_preview(plan, feats)}
+        if locked:
+            chk.setdefault("warnings", []).insert(0, locked)
+        return {"path": self.ws._rel(path), "check": chk, "preview": _plan_preview(plan, feats), "note": locked}
 
     def forecast_check(self, body) -> dict:
         from ..forecast import check_plan, read_plan
@@ -626,13 +630,15 @@ class Api:
             raise ValueError("CSV 파일만 올릴 수 있습니다 (.csv). 엑셀은 'CSV 로 저장' 후 올리세요.")
         if not data:
             raise ValueError("빈 파일입니다.")
-        safe = re.sub(r"[^0-9A-Za-z가-힣._()\- ]+", "_", stem).strip(" ._") or "upload"
+        from ..fileio import safe_stem
+        safe = safe_stem(stem, "upload")
         folder = self.ws.root / "uploads"
         folder.mkdir(exist_ok=True)
         path, i = folder / f"{safe}.csv", 1
         while path.exists() and path.read_bytes() != data:
             path, i = folder / f"{safe}_{i}.csv", i + 1
-        path.write_bytes(data)
+        if not path.exists():               # 같은 내용이면 다시 쓰지 않는다 (엑셀이 열어 둔 파일은 잠겨 있다)
+            path.write_bytes(data)
         return {"path": self.ws._rel(path), "name": path.name,
                 "size_kb": round(len(data) / 1024, 1)}
 
@@ -737,8 +743,9 @@ def _plan_preview(plan, feats: list[str], n: int = 400) -> dict:
 
 
 def _safe_name(name: str) -> str:
-    """파일 이름으로 쓸 수 있게 (한글·영문·숫자·_- 만)."""
-    return re.sub(r"[^0-9A-Za-z가-힣_\-]+", "_", str(name)).strip("_") or "model"
+    """파일 이름으로 쓸 수 있게 (한글·영문·숫자·_- 만, 윈도우 예약 이름 피하기)."""
+    from ..fileio import safe_stem
+    return safe_stem(re.sub(r"[^0-9A-Za-z가-힣_\-]+", "_", str(name)).strip("_") or "model", "model")
 
 
 def _num(v) -> float | None:
@@ -840,6 +847,12 @@ _ROUTES: dict[str, str] = {
 }
 
 
+#: 레지스트리에 기대지 않는 콘텐츠 형식 (윈도우에서 .js 가 text/plain 으로 나가면 화면이 안 뜬다)
+_STATIC_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
+                 ".json": "application/json", ".csv": "text/csv", ".yaml": "text/yaml", ".yml": "text/yaml",
+                 ".png": "image/png", ".ico": "image/x-icon", ".md": "text/markdown", ".txt": "text/plain"}
+
+
 def make_handler(api: Api):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -917,9 +930,10 @@ def make_handler(api: Api):
 
         def _static(self, rel: str) -> None:
             p = (STATIC_DIR / rel).resolve()
-            if not str(p).startswith(str(STATIC_DIR.resolve())) or not p.exists():
+            if STATIC_DIR.resolve() not in p.parents or not p.is_file():
                 return self._json(404, {"error": f"없는 파일: {rel}"})
-            ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+            # 윈도우의 mimetypes 는 레지스트리를 읽어 .js 를 text/plain 으로 주는 PC 가 있다 — 고정한다
+            ctype = _STATIC_TYPES.get(p.suffix.lower()) or mimetypes.guess_type(p.name)[0] or "application/octet-stream"
             if ctype.startswith("text/") or ctype.endswith("javascript"):
                 ctype += "; charset=utf-8"
             self._send(200, p.read_bytes(), ctype)
@@ -929,9 +943,9 @@ def make_handler(api: Api):
                 p = api.ws.resolve(rel)
             except ValueError as exc:
                 return self._json(400, {"error": str(exc)})
-            if not p.exists():
+            if not p.is_file():
                 return self._json(404, {"error": f"없는 파일: {rel}"})
-            ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+            ctype = _STATIC_TYPES.get(p.suffix.lower()) or mimetypes.guess_type(p.name)[0] or "application/octet-stream"
             if ctype.startswith("text/"):
                 ctype += "; charset=utf-8"
             self._send(200, p.read_bytes(), ctype)

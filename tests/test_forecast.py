@@ -62,7 +62,8 @@ def test_make_plan_repeats_recent_pattern_and_applies_adjustments(ws):
 def test_plan_roundtrips_through_the_field_csv_reader(ws):
     """엑셀에서 고쳐 다시 올린 계획도 현장 CSV 와 같은 수집기로 읽는다."""
     plan = make_plan(ws / "plant.csv", "timestamp", FEATS, base_days=1, horizon_days=2, step="1h")
-    p = save_plan(plan, ws / "plans" / "p.csv")
+    p, note = save_plan(plan, ws / "plans" / "p.csv")
+    assert note is None
     back, _log = read_plan(p)
     assert list(back.columns) == FEATS
     np.testing.assert_allclose(back.to_numpy(), plan.to_numpy(), rtol=1e-5)

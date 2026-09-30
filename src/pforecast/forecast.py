@@ -81,12 +81,11 @@ def make_plan(csv: str | Path, time_column: str | None, features: list[str], bas
     return plan
 
 
-def save_plan(plan: pd.DataFrame, path: str | Path) -> Path:
-    """엑셀에서 열어 고칠 수 있게 UTF-8(BOM) CSV 로."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    plan.to_csv(p, encoding="utf-8-sig", float_format="%.6g")
-    return p
+def save_plan(plan: pd.DataFrame, path: str | Path) -> tuple[Path, str | None]:
+    """엑셀에서 열어 고칠 수 있게 UTF-8(BOM) CSV 로. 같은 이름 파일이 엑셀에 열려 있으면(윈도우 잠금)
+    새 이름으로 쓰고 알림을 돌려준다 — (실제 경로, 알림 또는 None)."""
+    from .fileio import write_locked_ok
+    return write_locked_ok(path, lambda p: plan.to_csv(p, encoding="utf-8-sig", float_format="%.6g"))
 
 
 def read_plan(path: str | Path) -> tuple[pd.DataFrame, list[str]]:
@@ -176,7 +175,8 @@ def forecast_easy(cfg, plan: str | Path | pd.DataFrame, root: str | Path = ".",
     say("과거 데이터 정리 중")
     tm = _tagmap(cfg, physics)
     tm_path = out_dir / f"{stem}.tagmap.yaml"
-    tm.dump(tm_path)
+    from .fileio import write_locked_ok as _wl
+    tm_path, _ = _wl(tm_path, tm.dump)
     q = ""
     if history:
         q = f"index >= '{_bound(history[0], False)}' and index < '{_bound(history[1], True)}'"
@@ -310,9 +310,11 @@ def forecast_easy(cfg, plan: str | Path | pd.DataFrame, root: str | Path = ".",
         out["물리모델_상태폭_하한"], out["물리모델_상태폭_상한"] = lo, hi
     out["학습범위밖"] = outside
     out.index.name = "timestamp"
-    path = out_dir / f"{stem}.forecast.csv"
-    out.to_csv(path, encoding="utf-8-sig")
-    rel = lambda p_: str(Path(p_).resolve().relative_to(root.resolve()))  # noqa: E731
+    from .fileio import rel_posix, write_locked_ok
+    path, locked = write_locked_ok(out_dir / f"{stem}.forecast.csv", lambda p_: out.to_csv(p_, encoding="utf-8-sig"))
+    if locked:
+        notes.append(locked)
+    rel = lambda p_: rel_posix(p_, root)  # noqa: E731 — 화면은 '/' 경로만 안다
     return {
         "mode": "physics" if physics else "ml",
         "target": {"column": cfg.target, "unit": show_unit},

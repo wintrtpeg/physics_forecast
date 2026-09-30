@@ -267,7 +267,10 @@ def cmd_forecast(args) -> int:
     else:
         plan = make_plan(cfg.csv, cfg.time_column, cfg.features, base_days=args.base_days,
                          horizon_days=args.days, step=args.step, adjust=_parse_adjust(args.adjust))
-        plan_path = save_plan(plan, root / "plans" / f"{doc['name']}_계획_{plan.index.min():%Y%m%d}.csv")
+        from .fileio import safe_stem
+        plan_path, locked = save_plan(plan, root / "plans" / f"{safe_stem(doc['name'])}_계획_{plan.index.min():%Y%m%d}.csv")
+        if locked:
+            print("  !  " + locked)
         print(f"계획을 만들었습니다: {plan_path}  (엑셀에서 고쳐 --plan 으로 다시 줄 수 있음)")
     plan_df, _log = read_plan(plan_path)
     chk = check_plan(plan_df, cfg.features, _history_table(cfg.csv, cfg.time_column, cfg.features))
