@@ -31,51 +31,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: run_pforecast.bat 실행 (더블클릭과 같음, 백그라운드)
+      # 실행 → 대기 → 점검을 한 단계에서 (단계가 끝나면 백그라운드 앱도 같이 끝난다)
+      - name: run_pforecast.bat 실행(인터넷 설치) → API 점검 → Edge 화면 점검 → 두 번째 실행
         shell: pwsh
-        env:
-          PF_NO_BROWSER: "1"
-          PF_NO_PAUSE: "1"
-        run: |
-          $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'run_pforecast.bat' `
-                 -RedirectStandardOutput launcher.out.log -RedirectStandardError launcher.err.log -PassThru -WindowStyle Hidden
-          $p.Id | Out-File -Encoding ascii launcher.pid
-
-      - name: 앱이 뜰 때까지 기다리기 (처음 설치 포함)
-        shell: pwsh
-        run: ./.github/workflows/wait_app.ps1
-
-      - name: API 점검 (업로드 CP949·+09:00 → 자동 연결 → 물리+ML → 미래 예측 → 프로젝트 → 모델 만들기)
-        run: .venv\Scripts\python.exe scripts\windows_smoke.py --root .
-
-      - name: 화면 점검 (Edge)
-        run: |
-          .venv\Scripts\python.exe -m pip install --quiet playwright
-          .venv\Scripts\python.exe scripts\windows_ui_smoke.py --channel msedge --shots ui_shots
-
-      - name: 실행 창 로그
-        if: always()
-        shell: pwsh
-        run: |
-          "---- launcher.out.log"; Get-Content -Encoding utf8 launcher.out.log -ErrorAction SilentlyContinue
-          "---- launcher.err.log"; Get-Content -Encoding utf8 launcher.err.log -ErrorAction SilentlyContinue
-
-      - name: 두 번째 실행 — 설치를 건너뛰고 바로 뜨는가 (포트 8766)
-        shell: pwsh
-        env:
-          PF_NO_BROWSER: "1"
-          PF_NO_PAUSE: "1"
-          PF_PORT: "8766"
-        run: |
-          $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'run_pforecast.bat' `
-                 -RedirectStandardOutput second.out.log -RedirectStandardError second.err.log -PassThru -WindowStyle Hidden
-          $t0 = Get-Date
-          while (((Get-Date) - $t0).TotalSeconds -lt 60) {
-            try { if ((Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8766/api/workspace -TimeoutSec 3).StatusCode -eq 200) {
-              "두 번째 실행: $([int]((Get-Date) - $t0).TotalSeconds)초 만에 떴습니다"; Get-Content -Encoding utf8 second.out.log; exit 0 } } catch { }
-            Start-Sleep 2
-          }
-          Get-Content -Encoding utf8 second.out.log; Get-Content -Encoding utf8 second.err.log; exit 1
+        run: ./.github/workflows/app_check.ps1 -Ui
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -83,7 +42,8 @@ jobs:
           name: windows-online
           path: |
             ui_shots/
-            launcher.*.log
+            *.out.log
+            *.err.log
           if-no-files-found: ignore
 
   launcher-offline:
@@ -104,32 +64,12 @@ jobs:
           if (-not $v) { $v = (python -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')") }
           "bat 이 쓸 파이썬: $v"
           python scripts/make_offline_bundle.py --latest --python $v
-          Get-ChildItem wheels | Select-Object -ExpandProperty Name
 
-      - name: run_pforecast.bat 실행 — 인터넷 없이 (PyPI 주소를 막음)
+      - name: run_pforecast.bat 실행 — 인터넷 없이 (PyPI 주소를 막음) → API 점검 → 두 번째 실행
         shell: pwsh
         env:
-          PF_NO_BROWSER: "1"
-          PF_NO_PAUSE: "1"
           PIP_INDEX_URL: "http://127.0.0.1:9/simple"
-        run: |
-          $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'run_pforecast.bat' `
-                 -RedirectStandardOutput launcher.out.log -RedirectStandardError launcher.err.log -PassThru -WindowStyle Hidden
-          $p.Id | Out-File -Encoding ascii launcher.pid
-
-      - name: 앱이 뜰 때까지 기다리기
-        shell: pwsh
-        run: ./.github/workflows/wait_app.ps1
-
-      - name: API 점검
-        run: .venv\Scripts\python.exe scripts\windows_smoke.py --root .
-
-      - name: 실행 창 로그
-        if: always()
-        shell: pwsh
-        run: |
-          "---- launcher.out.log"; Get-Content -Encoding utf8 launcher.out.log -ErrorAction SilentlyContinue
-          "---- launcher.err.log"; Get-Content -Encoding utf8 launcher.err.log -ErrorAction SilentlyContinue
+        run: ./.github/workflows/app_check.ps1
 
   tests:
     runs-on: windows-latest
