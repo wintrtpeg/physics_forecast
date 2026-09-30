@@ -224,6 +224,9 @@ L0 core/symbolic.py core/units.py core/component.py core/parser.py
   가 작은 조각으로 강제해 비교한다. 글자 컬럼·긴 형식·시간 역행 판정은 조각이 아니라 **파일 전체**
   기준이다 (한 조각만 보면 컬럼이 통째로 'Bad' 이거나 이름이 하나뿐이다 — 둘 다 실제로 틀렸다).
   긴 형식 판정용 표본 블록이 앞 조각과 겹치면 같은 줄이 두 번 들어가 판정이 실패한다 (실제로 났다).
+  줄은 pandas 와 **같은 규칙**(`\n`·`\r\n`·`\r` 모두 줄 끝, `io.StringIO(newline="")`)으로 센다.
+  `split("\n")` 은 `\r\r\n` 파일(윈도우에서 줄 끝이 두 번 바뀐 CSV — 테스트의 `to_csv()` + `write_text`
+  가 윈도우에서 바로 이걸 만든다)에서 어긋나 첫 데이터 줄이 조각마다 복사됐다 (윈도우 점검에서만 드러남).
 * 큰 CSV 의 정리 결과는 CSV 옆 `.pforecast_cache/*.npz` (`allow_pickle=False`). 키에 `ingest.py`·
   `units.py` 해시가 들어가 정리 규칙을 고치면 저절로 다시 읽는다. 업로드는 메모리에 모으지 않는다
   (`_Body` → 임시 `.part` → `os.replace`, 디스크 여유 먼저 확인).

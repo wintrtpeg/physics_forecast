@@ -820,12 +820,17 @@ def _read_chunks(p: Path, time_column: str | None, encoding: str | None, regular
     lay = IngestReport()
     lay.delimiter = _sniff_delimiter(head_text)
     names, _, _, tcol, _, n_head = _split_header(_parse_rows(head_text, lay.delimiter), time_column, lay)
-    lines = head_text.split("\n")
-    hb = "\n".join(lines[lay.title_rows:n_head]) + "\n"       # 조각마다 앞에 붙일 헤더 (단위·설명 행 포함)
+    # 줄은 조각을 읽을 때와 **같은 규칙**(\n · \r\n · \r 모두 줄 끝)으로 센다. split("\n") 으로 세면
+    # '\r\r\n' 파일(윈도우에서 줄 끝이 두 번 바뀐 CSV)에서 한 줄을 두 줄로 세는 pandas 와 어긋나
+    # 첫 데이터 줄이 헤더에 딸려 모든 조각에 복사됐다 (윈도우 점검에서 실제로 났다).
+    lines = io.StringIO(head_text, newline="").readlines()
+    hb = "".join(lines[lay.title_rows:n_head])               # 조각마다 앞에 붙일 헤더 (단위·설명 행 포함)
+    if not hb.endswith(("\n", "\r")):
+        hb += "\n"
     hb_lines = n_head - lay.title_rows
     roles: dict | bool = False
     if tcol is not None and lay.header_rows == 1:
-        sample = hb + "\n".join(lines[n_head:]) + "".join(
+        sample = hb + "".join(lines[n_head:]) + "".join(
             b.decode(enc, errors="replace") for b in blocks[1:])
         srep = IngestReport()
         names_s, _, body, _, tj, _ = _split_header(_parse_rows(sample, lay.delimiter), tcol, srep)

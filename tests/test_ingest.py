@@ -246,7 +246,7 @@ def _messy_big_csv(n: int = 400) -> str:
     return head + "\n".join(rows) + "\n"
 
 
-def _assert_same_read(p, **kw):
+def _assert_same_read(p, skip=(), **kw):
     a = read_table(p)
     b = read_table(p, cache=False, **kw)
     pd.testing.assert_frame_equal(a.df, b.df, check_freq=False)
@@ -254,7 +254,8 @@ def _assert_same_read(p, **kw):
     for k in ("n_data_rows", "n_repeated_header", "n_blank_rows", "n_out_of_order", "n_duplicate_rows",
               "n_conflicting_duplicates", "interval_s", "units", "descriptions", "status_counts",
               "text_columns", "bool_columns", "thousands"):
-        assert getattr(a.report, k) == getattr(b.report, k), k
+        if k not in skip:
+            assert getattr(a.report, k) == getattr(b.report, k), k
     return a, b
 
 
@@ -276,10 +277,23 @@ def test_chunked_read_of_long_format_equals_whole_read(tmp_path, order):
         long = long.sort_values("time", kind="stable")
     long["Unit"] = long["Tag"].map({"A_FLOW": "m3/h", "B_TEMP": "℃", "C_UTIL": "%"})
     p = tmp_path / "long.csv"
-    p.write_text(long.to_csv(index=False), encoding="utf-8")
+    p.write_bytes(long.to_csv(index=False, lineterminator="\n").encode("utf-8"))   # 줄 끝은 아래 시험에서
     a, b = _assert_same_read(p, chunk_bytes=700)
     assert list(b.df.columns) == list(w.columns) and b.report.long["n_names"] == 3
     assert b.units == {"A_FLOW": "m3/h", "B_TEMP": "degC", "C_UTIL": "%"}
+
+
+@pytest.mark.parametrize("nl", ["\n", "\r\n", "\r\r\n", "\r"])
+def test_chunked_read_with_any_line_endings(tmp_path, nl):
+    """'\\r\\r\\n' 은 윈도우에서 줄 끝이 두 번 바뀐 파일이다 (to_csv 가 \\r\\n 을 주고 텍스트 모드 쓰기가
+    또 바꿈). 헤더를 split('\\n') 으로 세면 pandas 와 줄 수가 어긋나 첫 데이터 줄이 조각마다 복사됐다."""
+    w = _wide_example()
+    long = w.rename_axis("time").reset_index().melt(id_vars="time", var_name="Tag", value_name="Value")
+    p = tmp_path / "long.csv"
+    p.write_bytes(long.to_csv(index=False, lineterminator=nl).encode("utf-8"))
+    # '\r\r\n' 의 빈 줄 수만은 다를 수 있다 (pandas 가 글 끝의 빈 줄을 조각마다 하나씩 빼고 센다 — 화면에 안 나감)
+    a, b = _assert_same_read(p, skip=("n_blank_rows",), chunk_bytes=700)
+    assert len(b.df) == 48 and b.report.long["n_rows"] == 144 and not b.report.long.get("n_dup")
 
 
 def test_chunked_read_with_worker_processes(tmp_path):
