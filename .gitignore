@@ -36,3 +36,5 @@ plans/
 wheels/
 offline/
 dist/
+# 파일 형식 지정 (현장 CSV 옆에 생긴다)
+*.csv.layout.json

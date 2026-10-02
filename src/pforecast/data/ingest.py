@@ -201,6 +201,33 @@ def parse_times(values: pd.Series, counts=None) -> tuple[pd.Series, dict[str, in
     return out, stats
 
 
+#: 날짜 없이 시각만 (13:05, 13:05:00, 오후 1:05, 1:05 PM)
+_RE_TIME_OF_DAY = re.compile(r"^\s*(?:(?:오전|오후|AM|PM|am|pm)\s*)?\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+                             r"(?:\s*(?:오전|오후|AM|PM|am|pm))?\s*$")
+
+
+def _time_of_day_column(names: list[str], sample: list[list[str]], tj: int) -> int | None:
+    """시각 컬럼이 날짜뿐이면(2025-03-01) 시각만 든 짝 컬럼(13:05:00)을 찾는다. 한국 엑셀·MES 추출에
+    흔하다 — 짝을 못 찾으면 하루가 한 시각이 되어 하루치가 평균 한 줄로 뭉개진다."""
+    dates = [r[tj] for r in sample if r[tj]]
+    if not dates or sum(":" not in d for d in dates) < 0.95 * len(dates):
+        return None
+    order = sorted((j for j in range(len(names)) if j != tj),
+                   key=lambda j: (not any(w in names[j].lower() for w in _TIME_WORDS), abs(j - tj)))
+    for j in order:
+        vals = [r[j] for r in sample if j < len(r) and r[j]]
+        if len(vals) >= 0.9 * len(sample) and \
+                sum(bool(_RE_TIME_OF_DAY.match(v)) for v in vals) >= 0.9 * len(vals):
+            return j
+    return None
+
+
+def _time_strings(body: list[list[str]], tj: int, tj2: int | None) -> list[str]:
+    if tj2 is None:
+        return list(map(itemgetter(tj), body))
+    return [f"{r[tj]} {r[tj2]}" if r[tj] and r[tj2] else r[tj] for r in body]
+
+
 def _time_score(values: list[str]) -> float:
     if not values:
         return 0.0
@@ -223,6 +250,7 @@ class IngestReport:
     has_unit_row: bool = False
     has_desc_row: bool = False
     time_column: str | None = None
+    time_column2: str | None = None          # 날짜와 시각이 두 컬럼으로 나뉘었으면 시각 쪽
     time_column_note: str = ""
     time_formats: dict[str, int] = field(default_factory=dict)
     n_lines: int = 0
@@ -249,6 +277,11 @@ class IngestReport:
     units_raw: dict[str, str] = field(default_factory=dict)      # 파일에 적힌 그대로
     descriptions: dict[str, str] = field(default_factory=dict)
     long: dict = field(default_factory=dict)                     # 긴 형식을 펼쳤으면 그 내역
+    long_why: list[str] = field(default_factory=list)            # 긴 형식으로 보지 않은 이유
+    long_hint: dict = field(default_factory=dict)                # 긴 형식일지 모르는 파일 — 화면이 고르게
+    time_repeat_frac: float = 0.0                                # 같은 시각이 반복되는 줄의 비율
+    columns_raw: list[str] = field(default_factory=list)         # 파일의 컬럼 (처음 순서 그대로)
+    layout: dict = field(default_factory=dict)                   # 사람이 지정한 파일 형식 (.layout.json)
     chunk_stats: dict = field(default_factory=dict, repr=False)  # 큰 파일 조각을 합칠 때만 쓴다
     t_start: str | None = None
     t_end: str | None = None
@@ -279,7 +312,12 @@ class IngestReport:
         if self.time_column:
             fm = ", ".join(f"{k} {v:,}행" for k, v in self.time_formats.items()
                            if v and k != "해석 불가")
-            out.append(f"시각 컬럼 '{self.time_column}' — {fm}.{(' ' + self.time_column_note) if self.time_column_note else ''}")
+            tc = (f"'{self.time_column}' + '{self.time_column2}' (날짜·시각 두 컬럼을 합쳐 읽음)"
+                  if self.time_column2 else f"'{self.time_column}'")
+            out.append(f"시각 컬럼 {tc} — {fm}.{(' ' + self.time_column_note) if self.time_column_note else ''}")
+        if self.layout:
+            out.append("파일 형식은 지정한 대로 읽었습니다 ("
+                       + ("넓은 형식" if self.layout.get("format") == "wide" else "긴 형식") + ").")
         out.extend(self._long_lines())
         if self.n_repeated_header:
             out.append(f"파일 중간의 반복 헤더 {self.n_repeated_header}행을 뺐습니다 "
@@ -314,6 +352,10 @@ class IngestReport:
                        f" ({', '.join(self.dropped_columns[:4])}).")
         if self.text_columns:
             out.append("숫자가 아닌 컬럼은 분석에서 뺐습니다: " + ", ".join(self.text_columns) + ".")
+        if self.long_hint:
+            why = f" (자동으로 펼치지 않은 이유: {self.long_why[0]})" if self.long_why else ""
+            out.append("한 줄에 시각·이름·값이 하나씩인 긴 형식일 수 있습니다 — 그렇다면 '파일 형식' 에서 "
+                       f"이름 컬럼과 값 컬럼을 골라 펼치세요{why}.")
         if self.n_snapped:
             out.append(f"격자에서 어긋난 시각 {self.n_snapped:,}개를 가장 가까운 격자에 맞췄습니다.")
         if self.n_missing_grid:
@@ -332,7 +374,8 @@ class IngestReport:
         vals = ", ".join(f"'{v}'" for v in L["values"])
         cols = (f"컬럼 {L['n_columns']}개" if L["n_columns"] == L["n_names"]
                 else f"이름 × 값 컬럼 = 컬럼 {L['n_columns']}개")
-        out = [f"긴 형식(한 줄에 시각·이름·값 하나씩)을 컬럼별로 펼쳤습니다: '{L['key']}' 의 이름 "
+        how = "지정한 대로" if L.get("manual") else "컬럼별로"
+        out = [f"긴 형식(한 줄에 시각·이름·값 하나씩)을 {how} 펼쳤습니다: '{L['key']}' 의 이름 "
                f"{L['n_names']}개 × {vals} → {cols}, {L['n_rows']:,}줄 → 시각 {L['n_times']:,}개."]
         got = [f"단위는 '{L['unit']}'" if L.get("unit") else "",
                f"설명은 '{L['desc']}'" if L.get("desc") else ""]
@@ -347,6 +390,11 @@ class IngestReport:
         elif L.get("n_bad_status"):
             out.append(f"품질 컬럼 '{L['status']}' 이 불량(Bad 등)인 값 {L['n_bad_status']:,}개는 결측으로 "
                        "처리했습니다 (아래 상태 문자열 집계에 포함).")
+        if L.get("periods"):
+            lo, hi, st, n_slow = L["periods"]
+            msg = (f"이름마다 기록 주기가 다릅니다 ({_fmt_interval(lo)} ~ {_fmt_interval(hi)}). 대부분의 이름이 채워지는 "
+                   f"{_fmt_interval(st)} 격자로 맞췄습니다 — 더 촘촘한 이름은 격자 칸마다 평균했습니다")
+            out.append(msg + (f", 더 성긴 이름 {n_slow}개는 빈칸이 남습니다." if n_slow else "."))
         if L.get("n_blank_key"):
             out.append(f"이름이 빈 줄 {L['n_blank_key']:,}개를 뺐습니다.")
         if L.get("n_dup"):
@@ -475,7 +523,8 @@ _LONG_ROLES = {
     "value": (("value", "값", "reading", "average", "평균", "측정치"),
               ("val", "pv", "avg", "mean", "data", "v", "y")),
     "tag": (("tag", "태그", "항목", "point", "signal", "신호", "variable", "변수", "sensor", "센서",
-             "계측", "parameter", "파라미터", "metric", "channel", "채널", "series"),
+             "계측", "parameter", "param", "파라미터", "metric", "channel", "채널", "series", "item",
+             "name", "명칭"),
             ("name", "이름", "명칭", "item", "id", "tagid", "code", "코드", "attribute", "속성",
              "key", "키")),
 }
@@ -526,10 +575,13 @@ def _long_roles(names: list[str], spec: dict) -> dict:
 
 def _spec_from_roles(names: list[str], body: list[list[str]], roles: dict) -> dict:
     idx = {n: j for j, n in enumerate(names)}
-    need = roles["keys"] + roles["values"] + [roles[r] for r in ("unit", "desc", "status") if roles[r]]
+    keys_n, vals_n = list(roles.get("keys") or []), list(roles.get("values") or [])
+    if not keys_n or not vals_n:
+        raise ValueError("긴 형식 지정에 이름 컬럼과 값 컬럼이 하나 이상씩 있어야 합니다")
+    need = keys_n + vals_n + [roles[r] for r in ("unit", "desc", "status") if roles.get(r)]
     missing = [n for n in need if n not in idx]
     if missing:
-        raise ValueError(f"긴 형식 컬럼이 이 부분에 없습니다: {missing}")
+        raise ValueError(f"긴 형식으로 지정한 컬럼이 파일에 없습니다: {missing}")
     stride = max(1, len(body) // 4000)
     prof = {}
     for n in need:
@@ -537,40 +589,71 @@ def _spec_from_roles(names: list[str], body: list[list[str]], roles: dict) -> di
         samp = [c for c in col[::stride] if c]
         prof[idx[n]] = {"arr": np.array(col, dtype=object),
                         "num": sum(_is_num(c) for c in samp) / len(samp) if samp else 0.0}
-    keys = [idx[n] for n in roles["keys"]]
-    return {"keys": keys, "key": _join_keys(prof, keys), "values": [idx[n] for n in roles["values"]],
-            **{r: (idx[roles[r]] if roles[r] else None) for r in ("unit", "desc", "status")},
-            "ignored": [idx[n] for n in roles["ignored"] if n in idx], "prof": prof}
+    keys = [idx[n] for n in keys_n]
+    used = set(need)
+    return {"keys": keys, "key": _join_keys(prof, keys), "values": [idx[n] for n in vals_n],
+            **{r: (idx[roles[r]] if roles.get(r) else None) for r in ("unit", "desc", "status")},
+            "ignored": [idx[n] for n in roles.get("ignored", []) if n in idx and n not in used],
+            "prof": prof, "manual": bool(roles.get("manual"))}
 
 
-def _detect_long(names: list[str], body: list[list[str]], tj: int,
-                 t_ns: np.ndarray, need_cover: bool = True) -> dict | None:
-    """긴 형식이면 역할(이름·값·단위·설명·품질 컬럼)을, 아니면 None.
+#: 값 컬럼으로 바로 믿는 이름 (소문자·공백/_/- 제거 후 정확히 같을 때). 'vValue'(값의 글자판) 같은
+#: '값이 들어간 이름' 보다 앞선다.
+_VALUE_NAMES = {"value", "values", "값", "val", "pv", "avg", "average", "mean", "평균", "data", "reading",
+                "측정값", "측정치", "결과값", "결과", "수치", "v", "y", "numericvalue", "realvalue"}
 
-    넓은 파일에 글자 컬럼(운전 모드 등)이 하나 있는 경우와 헷갈리면 안 된다. 그래서
-    ① 숫자 컬럼이 4개 이하, ② (시각, 이름) 쌍이 거의 유일, ③ 같은 시각이 여러 줄에 나오거나
-    이름 컬럼답게 불리고 이름마다 전체 기간을 덮을 때만 긴 형식으로 본다. 파일 여기저기서 뜬 표본
-    (큰 파일)은 기간을 덮는지 알 수 없어 ``need_cover=False`` 로 이름만 본다.
+
+def _norm_name(name: str) -> str:
+    return re.sub(r"[\s_\-]+", "", name.lower())
+
+
+def _detect_long(names: list[str], body: list[list[str]], tj: int, t_ns: np.ndarray,
+                 need_cover: bool = True, skip: tuple = (), why: list | None = None) -> dict | None:
+    """긴 형식이면 역할(이름·값·단위·설명·품질 컬럼)을, 아니면 None (``why`` 에 이유를 적는다).
+
+    넓은 파일에 글자 컬럼(운전 모드 등)이 하나 있는 경우와 헷갈리면 안 된다. 결정적인 것은 구조다:
+    **같은 시각이 여러 줄에 나오고**, 어떤 글자 컬럼(이름)을 더하면 (시각, 이름) 이 거의 유일해지고,
+    이름마다 여러 줄이 있다. 넓은 파일은 한 시각이 한 줄이라 첫 조건에서 걸러진다. 같은 시각이 반복되지
+    않는 긴 파일(태그마다 기록 시각이 다른 예외 기반 저장)은 이름 컬럼이 이름답게 불리고, 숫자 컬럼이
+    4개 이하이고, 이름마다 기간 전체를 덮을 때만 본다. 파일 여기저기서 뜬 표본(큰 파일)은 기간을 덮는지
+    알 수 없어 ``need_cover=False`` 로 이름만 본다.
+
+    예전 판정(숫자 컬럼 4개 이하·컬럼 12개 이하·값 컬럼이 숫자)은 현장 파일 상당수를 놓쳤다 — Historian
+    덤프의 부가 컬럼(품질 코드·태그 번호 …), ON/OFF 가 대부분인 값, '12.3 kW' 처럼 단위가 붙은 값,
+    겹친 추출 (실제로 '쓸 수 있는 컬럼 1개' 로 보고됐다).
     """
-    n = len(body)
-    if n < 6 or len(names) > 12:
+    def no(msg: str):
+        if why is not None:
+            why.append(msg)
         return None
+
+    n = len(body)
+    if n < 6:
+        return no("데이터 줄이 너무 적습니다")
+    if len(names) > 80:
+        return no(f"컬럼이 {len(names)}개로 많아 넓은 형식으로 봤습니다")
+    t_dup = 1.0 - len(np.unique(t_ns)) / n
+    roles = {j: _col_role(nm) for j, nm in enumerate(names) if j != tj and j not in skip}
+    if t_dup < 0.3 and "tag" not in roles.values():
+        return no("같은 시각이 여러 줄에 나오지 않습니다 (한 시각 = 한 줄)")
     stride = max(1, n // 4000)
+    samp_rows = body[::stride]
+    arrs: dict[int, np.ndarray] = {}
+
+    def arr(j: int) -> np.ndarray:
+        if j not in arrs:
+            arrs[j] = np.array(list(map(itemgetter(j), body)), dtype=object)
+        return arrs[j]
+
     prof: dict[int, dict] = {}
-    for j, name in enumerate(names):
-        if j == tj:
-            continue
-        col = list(map(itemgetter(j), body))
-        samp = [c for c in col[::stride] if c]
+    for j, role in roles.items():
+        col = [r[j] for r in samp_rows]
+        samp = [c for c in col if c]
         if not samp:
             continue
-        arr = np.array(col, dtype=object)
-        prof[j] = {"role": _col_role(name), "arr": arr, "ne": float((arr != "").mean()),
+        prof[j] = {"role": role, "ne": len(samp) / len(col),
                    "num": sum(_is_num(c) for c in samp) / len(samp),
                    "bool": sum(c.upper() in _BOOL_TOKENS for c in samp) / len(samp)}
-    numeric = [j for j, p in prof.items() if p["num"] >= 0.5 and p["role"] not in ("status", "tag")]
-    if not numeric or len(numeric) > 4:
-        return None
 
     cands = []
     for j, p in prof.items():
@@ -578,15 +661,17 @@ def _detect_long(names: list[str], body: list[list[str]], tj: int,
             continue
         if p["num"] > 0.2 and p["role"] != "tag":
             continue
-        k = len(pd.unique(p["arr"]))
-        if 2 <= k <= min(5000, n // 3):
-            cands.append((p["role"] == "tag", k, j))
+        k = len(pd.unique(arr(j)))
+        if 2 <= k <= min(20000, n // 3):
+            # 이름답게 불리는 것 → 글자인 것(태그 번호보다 태그 이름) → 값 종류가 많은 것 → 앞 컬럼
+            cands.append((p["role"] == "tag", p["num"] <= 0.2, k, -j))
     if not cands:
-        return None
+        return no("이름 컬럼 후보(같은 값이 여러 줄에 반복되는 글자 컬럼)가 없습니다")
     cands.sort(reverse=True)
+    cands = [(c[0], c[2], -c[3]) for c in cands]
 
     def unique_frac(cols: list[int]) -> float:
-        d = pd.DataFrame({"t": t_ns, **{f"k{c}": prof[c]["arr"] for c in cols}})
+        d = pd.DataFrame({"t": t_ns, **{f"k{c}": arr(c) for c in cols}})
         return 1.0 - float(d.duplicated().mean())
 
     keys = [cands[0][2]]
@@ -595,26 +680,43 @@ def _detect_long(names: list[str], body: list[list[str]], tj: int,
         best = max(((unique_frac(sorted(keys + [c[2]])), c[2]) for c in cands[1:]), default=None)
         if best and best[0] - u >= 0.05:
             u, keys = best[0], sorted(keys + [best[1]])
-    if u < 0.8:
-        return None
+    for j in keys:
+        prof[j]["arr"] = arr(j)
+    named = any(prof[c]["role"] == "tag" for c in keys)
+    # 겹친 추출(같은 구간을 두 번 받음)은 (시각, 이름) 이 덜 유일하다. 이름답게 불리는 컬럼이고 시각만
+    # 볼 때보다 크게 유일해지면 받는다 (넓은 파일을 통째로 두 번 붙인 것은 이름을 더해도 그대로다).
+    if not (u >= 0.8 or (named and u >= 0.5 and u - (1.0 - t_dup) >= 0.3)):
+        return no(f"(시각, '{', '.join(names[c] for c in keys)}') 이 겹치는 줄이 {100 * (1 - u):.0f}% 입니다")
     key = _join_keys(prof, keys)
 
-    t_dup = 1.0 - len(np.unique(t_ns)) / n
     g = pd.Series(t_ns).groupby(key)
-    span = float(t_ns.max() - t_ns.min())
-    cover = float(((g.max() - g.min()) / span).median()) if span > 0 else 0.0
     if g.size().median() < 3:
-        return None
-    named = any(prof[c]["role"] == "tag" for c in keys)
-    if not (t_dup >= 0.3 or (named and (cover >= 0.5 or not need_cover))):
-        return None
-
+        return no(f"'{names[keys[0]]}' 의 값마다 줄이 너무 적습니다")
     rest = [j for j in prof if j not in keys]
-    values = [j for j in rest if prof[j]["role"] == "value"]
+    if t_dup < 0.3:
+        span = float(t_ns.max() - t_ns.min())
+        cover = float(((g.max() - g.min()) / span).median()) if span > 0 else 0.0
+        numeric = [j for j in rest if prof[j]["num"] >= 0.5 and prof[j]["role"] not in ("status", "unit", "desc")]
+        if not named or len(numeric) > 4 or (need_cover and cover < 0.5):
+            return no("같은 시각이 여러 줄에 나오지 않고, 이름 컬럼마다 기간 전체를 덮지 않습니다")
+
+    def varies_within_key(j: int) -> bool:
+        per = pd.Series(arr(j)).groupby(key).nunique()
+        return float((per > 1).mean()) >= 0.5
+
+    def row_counter(j: int) -> bool:
+        x = pd.to_numeric(pd.Series(arr(j)), errors="coerce").to_numpy(dtype=float)
+        return bool(np.isfinite(x).all() and len(x) > 2 and np.all(np.diff(x) > 0))
+
+    values = [j for j in rest if _norm_name(names[j]) in _VALUE_NAMES]
     if not values:
-        values = [j for j in rest if prof[j]["role"] is None and prof[j]["num"] >= 0.3]
+        values = [j for j in rest if prof[j]["role"] == "value"]
     if not values:
-        return None
+        # 이름이 없으면 숫자 컬럼 — 단, 이름마다 한 값뿐인 것(태그 번호·관리 한계)과 줄 번호는 값이 아니다
+        values = [j for j in rest if prof[j]["role"] is None and prof[j]["num"] >= 0.3
+                  and varies_within_key(j) and not row_counter(j)]
+    if not values:
+        return no("값 컬럼을 찾지 못했습니다 (Value·값 같은 이름이나, 이름마다 바뀌는 숫자 컬럼)")
     spec = {"keys": keys, "key": key, "values": values, "unit": None, "desc": None,
             "status": None, "ignored": []}
     for j in rest:
@@ -626,18 +728,18 @@ def _detect_long(names: list[str], body: list[list[str]], tj: int,
             continue
         if role is None and prof[j]["num"] < 0.3:
             # 이름 없는 글자 컬럼: 단위 모양이면 단위, 이름마다 한 값이면 설명
-            vals = pd.unique(prof[j]["arr"][::stride])
+            vals = pd.unique(arr(j)[::stride])
             vals = [v for v in vals if v]
             if spec["unit"] is None and vals and \
                     sum(normalize_unit(v) is not None for v in vals) >= 0.8 * len(vals):
                 spec["unit"] = j
                 continue
-            if spec["desc"] is None:
-                per = pd.Series(prof[j]["arr"]).groupby(key).nunique()
-                if (per <= 1).mean() >= 0.95:
-                    spec["desc"] = j
-                    continue
+            if spec["desc"] is None and len(vals) > 1 and not varies_within_key(j):
+                spec["desc"] = j
+                continue
         spec["ignored"].append(j)
+    for j in values + [spec[r] for r in ("unit", "desc", "status") if spec[r] is not None]:
+        prof[j]["arr"] = arr(j)
     spec["prof"] = prof
     return spec
 
@@ -647,7 +749,9 @@ def _pivot_long(names: list[str], t_ns: np.ndarray, spec: dict, rep: IngestRepor
     기존 규칙 그대로 한다 — 그래야 'Bad' 가 어느 태그에서 났는지 보고할 수 있다."""
     prof, key, vals = spec["prof"], spec["key"], spec["values"]
     info: dict = {"n_rows": int(len(key)), "key": ", ".join(names[j] for j in spec["keys"]),
-                  "values": [names[j] for j in vals]}
+                  "values": [names[j] for j in vals], "roles": _long_roles(names, spec)}
+    if spec.get("manual"):
+        info["manual"] = True
     long = pd.DataFrame({"t": t_ns, "k": key, **{f"v{j}": prof[j]["arr"] for j in vals}})
 
     if spec["status"] is not None:
@@ -732,6 +836,60 @@ CHUNK_BYTES = 32 * 2 ** 20
 CACHE_DIR = ".pforecast_cache"
 
 
+#: 사람이 정한 파일 형식을 두는 곳 (CSV 옆, ``<이름>.csv.layout.json``). 앱의 '파일 형식' 이 쓴다.
+#: read_table 이 읽으므로 검증·예측·분석·CLI 어디서 읽든 같은 형식이 적용된다.
+LAYOUT_SUFFIX = ".layout.json"
+
+
+def layout_path(path: str | Path) -> Path:
+    p = Path(path)
+    return p.with_name(p.name + LAYOUT_SUFFIX)
+
+
+def read_layout(path: str | Path) -> dict:
+    """``{"format": "long", "keys": [...], "values": [...], "unit"?, "desc"?, "status"?, "time"?}`` 또는
+    ``{"format": "wide"}``. 없거나 깨졌으면 ``{}`` (자동 판정)."""
+    try:
+        d = json.loads(layout_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) and d.get("format") in ("long", "wide") else {}
+
+
+def write_layout(path: str | Path, layout: dict | None) -> None:
+    """``None`` 이면 지우고 자동 판정으로 돌아간다."""
+    f = layout_path(path)
+    if not layout:
+        f.unlink(missing_ok=True)
+        return
+    fmt = layout.get("format")
+    if fmt not in ("long", "wide"):
+        raise ValueError("파일 형식은 'long' 또는 'wide' 입니다")
+    out: dict = {"format": fmt}
+    if fmt == "long":
+        keys = [str(k) for k in layout.get("keys") or [] if k]
+        values = [str(v) for v in layout.get("values") or [] if v]
+        if not keys or not values:
+            raise ValueError("긴 형식에는 이름 컬럼과 값 컬럼을 하나 이상씩 골라야 합니다")
+        if set(keys) & set(values):
+            raise ValueError("같은 컬럼을 이름과 값으로 함께 고를 수 없습니다")
+        out.update(keys=keys[:2], values=values)
+        for r in ("unit", "desc", "status", "time"):
+            if layout.get(r):
+                out[r] = str(layout[r])
+    f.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _layout_long(layout: dict):
+    """read_text 의 ``long`` 인자로."""
+    if layout.get("format") == "wide":
+        return False
+    if layout.get("format") == "long":
+        return {"keys": layout["keys"], "values": layout["values"], "unit": layout.get("unit"),
+                "desc": layout.get("desc"), "status": layout.get("status"), "ignored": [], "manual": True}
+    return None
+
+
 def read_table(path: str | Path, time_column: str | None = None, *,
                encoding: str | None = None, regularize: bool = True,
                progress: Callable[[str], None] | None = None, chunk_bytes: int | None = None,
@@ -746,16 +904,22 @@ def read_table(path: str | Path, time_column: str | None = None, *,
     """
     p = Path(path)
     size = p.stat().st_size
+    layout = read_layout(p)
+    long = _layout_long(layout)
+    if layout.get("time") and not time_column:
+        time_column = layout["time"]
     if size <= (chunk_bytes or BIG_FILE):
         text, enc = _decode(p.read_bytes(), encoding)
-        tab = read_text(text, time_column=time_column, regularize=regularize)
+        rep0 = IngestReport(layout=layout)
+        tab = read_text(text, time_column=time_column, regularize=regularize, long=long, _rep=rep0)
         tab.report.encoding = enc
     else:
-        cpath = _cache_path(p, time_column, encoding, regularize) if cache else None
+        cpath = _cache_path(p, time_column, encoding, regularize, layout) if cache else None
         tab = _cache_load(cpath) if cpath is not None else None
         if tab is None:
             tab = _read_chunks(p, time_column, encoding, regularize, chunk_bytes or CHUNK_BYTES,
-                               progress or (lambda m: None), workers)
+                               progress or (lambda m: None), workers, long=long)
+            tab.report.layout = layout
             if cpath is not None:
                 if progress:
                     progress("정리 결과를 저장하는 중 (다음부터는 바로 열립니다)")
@@ -808,7 +972,8 @@ def _sniff_encoding(blocks: list[bytes], encoding: str | None) -> str:
 
 
 def _read_chunks(p: Path, time_column: str | None, encoding: str | None, regularize: bool,
-                 step: int, say: Callable[[str], None], workers: int | None = None) -> Table:
+                 step: int, say: Callable[[str], None], workers: int | None = None,
+                 long: bool | dict | None = None) -> Table:
     size = p.stat().st_size
     say(f"파일 구조를 보는 중 ({_fmt_size(size)})")
     blocks = _sample_blocks(p, size)
@@ -829,19 +994,24 @@ def _read_chunks(p: Path, time_column: str | None, encoding: str | None, regular
         hb += "\n"
     hb_lines = n_head - lay.title_rows
     roles: dict | bool = False
-    if tcol is not None and lay.header_rows == 1:
+    if isinstance(long, dict):                          # 사람이 지정한 형식
+        roles = long
+    elif tcol is not None and lay.header_rows == 1 and long is None:
         sample = hb + "".join(lines[n_head:]) + "".join(
             b.decode(enc, errors="replace") for b in blocks[1:])
         srep = IngestReport()
         names_s, _, body, _, tj, _ = _split_header(_parse_rows(sample, lay.delimiter), tcol, srep)
+        tj2 = names_s.index(srep.time_column2) if srep.time_column2 in names_s else None
         body = [r for r in body if any(r)]
         if body:
-            t, _ = parse_times(pd.Series(list(map(itemgetter(tj), body)), dtype=object))
+            t, _ = parse_times(pd.Series(_time_strings(body, tj, tj2), dtype=object))
             ok = t.notna().to_numpy()
             body = [r for r, k in zip(body, ok) if k]
             if body:
                 t_ns = t[ok].to_numpy().astype("datetime64[ns]").astype("int64")
-                spec = _detect_long(names_s, body, tj, t_ns, need_cover=False)
+                lay.time_repeat_frac = 1.0 - len(np.unique(t_ns)) / len(t_ns)
+                spec = _detect_long(names_s, body, tj, t_ns, need_cover=False,
+                                    skip=(tj2,) if tj2 is not None else (), why=lay.long_why)
                 roles = _long_roles(names_s, spec) if spec else False
 
     # ---- 조각마다 기존 규칙 그대로 (헤더를 붙여 read_text) — 코어가 여럿이면 나눠서 -------------
@@ -927,6 +1097,8 @@ def _read_chunks(p: Path, time_column: str | None, encoding: str | None, regular
         rep.long["n_names"] = df.shape[1] // max(1, len(rep.long["values"]))
         rep.long["n_times"] = len(idx)
     rep.encoding = enc
+    if long is None:                                    # 형식을 지정했으면 다시 묻지 않는다
+        _set_long_hint(rep, list(df.columns))
     say("시간 격자를 맞추는 중")
     return Table(df=_regularize(df, rep, regularize, tcol), report=rep)
 
@@ -1002,6 +1174,8 @@ def _merge_reports(reps: list[IngestReport], lay: IngestReport, n_head: int, hb_
     first = next((x for x in reps if x.time_column is not None), reps[0])
     r.delimiter, r.title_rows, r.header_rows = lay.delimiter, lay.title_rows, lay.header_rows
     r.time_column, r.time_column_note = lay.time_column, lay.time_column_note
+    r.time_column2, r.columns_raw = lay.time_column2, list(lay.columns_raw)
+    r.long_why, r.time_repeat_frac = list(lay.long_why), lay.time_repeat_frac
     r.has_unit_row, r.has_desc_row = first.has_unit_row, first.has_desc_row
     r.renamed_columns = dict(first.renamed_columns)
     r.n_lines = n_head + sum(x.n_lines - hb_lines for x in reps)
@@ -1063,9 +1237,10 @@ def _code_version() -> str:
     return h.hexdigest()[:12]
 
 
-def _cache_path(p: Path, time_column, encoding, regularize) -> Path:
+def _cache_path(p: Path, time_column, encoding, regularize, layout: dict | None = None) -> Path:
     st = p.stat()
-    key = f"{st.st_size}|{st.st_mtime_ns}|{time_column}|{encoding}|{regularize}|{_code_version()}"
+    lay = json.dumps(layout or {}, sort_keys=True, ensure_ascii=False)
+    key = f"{st.st_size}|{st.st_mtime_ns}|{time_column}|{encoding}|{regularize}|{lay}|{_code_version()}"
     return p.parent / CACHE_DIR / f"{p.name}.{hashlib.sha256(key.encode()).hexdigest()[:16]}.npz"
 
 
@@ -1108,11 +1283,11 @@ def _cache_save(c: Path, tab: Table) -> None:
 
 def read_text(text: str, time_column: str | None = None, *, regularize: bool = True,
               delimiter: str | None = None, long: bool | dict | None = None,
-              chunk: bool = False) -> Table:
+              chunk: bool = False, _rep: IngestReport | None = None) -> Table:
     """``long`` — None: 긴 형식이면 알아서 펼친다, False: 펼치지 않는다, dict: 이 역할(`_long_roles`)대로
     펼친다 (큰 파일의 조각은 한 조각에 이름이 하나뿐일 수 있어 판정을 파일 표본으로 미리 한다).
     ``chunk`` — 큰 파일의 한 조각: 글자 컬럼 판정은 합친 뒤 파일 전체로 하도록 컬럼을 남기고 개수만 센다."""
-    rep = IngestReport()
+    rep = _rep or IngestReport()
     rep.delimiter = delimiter or _sniff_delimiter(text)
     rows = _parse_rows(text, rep.delimiter)
     rep.n_lines = len(rows)
@@ -1172,6 +1347,10 @@ def _split_header(rows: list[list[str]], time_column: str | None, rep: IngestRep
                                         f"'{tcol}' 을 썼습니다.")
     rep.time_column = tcol
     tj = names.index(tcol) if tcol else None
+    rep.columns_raw = list(names)
+    if tj is not None:
+        tj2 = _time_of_day_column(names, sample, tj)
+        rep.time_column2 = names[tj2] if tj2 is not None else None
 
     # ---- 설명/단위 행: 헤더 바로 아래, 시각 칸이 시각이 아니고 대부분 문자인 행 -------
     meta: list[list[str]] = []
@@ -1227,8 +1406,9 @@ def _body_to_table(names, header_set, body, tcol, tj, rep: IngestReport, regular
                 return True
         return False
 
+    tj2 = names.index(rep.time_column2) if tcol is not None and rep.time_column2 in names else None
     if tcol is not None:
-        tvals = pd.Series(list(map(itemgetter(tj), body)), dtype=object)
+        tvals = pd.Series(_time_strings(body, tj, tj2), dtype=object)
         codes, uniq = pd.factorize(tvals)
         if len(uniq) < 0.8 * len(tvals):
             # 긴 형식은 같은 시각이 태그 수만큼 반복된다 — 서로 다른 시각만 해석한다
@@ -1243,7 +1423,7 @@ def _body_to_table(names, header_set, body, tcol, tj, rep: IngestReport, regular
             r = body[i]
             if looks_like_header(r):
                 rep.n_repeated_header += 1
-            elif not any(c for j, c in enumerate(r) if j != tj):
+            elif not any(c for j, c in enumerate(r) if j not in (tj, tj2)):
                 rep.n_blank_rows += 1
             else:
                 rep.n_bad_time += 1
@@ -1258,7 +1438,7 @@ def _body_to_table(names, header_set, body, tcol, tj, rep: IngestReport, regular
             rep.n_out_of_order = int(np.sum(t[1:] < t[:-1]))
         if chunk and len(t):
             rep.chunk_stats["edges"] = (t[0], t[-1])
-        data_cols = [c for c in names if c != tcol]
+        data_cols = [c for c in names if c not in (tcol, rep.time_column2)]
     else:
         hdr = [looks_like_header(r) for r in body]
         rep.n_repeated_header = int(sum(hdr))
@@ -1269,10 +1449,14 @@ def _body_to_table(names, header_set, body, tcol, tj, rep: IngestReport, regular
     if not body:
         raise ValueError("시각을 읽을 수 있는 데이터 행이 없습니다")
     spec = None
-    if tcol is not None and rep.header_rows == 1 and long is not False:   # 단위·설명 행이 있으면 넓은 형식
+    if tcol is not None:
         t_ns = times.to_numpy().astype("datetime64[ns]").astype("int64")
-        spec = (_spec_from_roles(names, body, long) if isinstance(long, dict)
-                else _detect_long(names, body, tj, t_ns))
+        rep.time_repeat_frac = 1.0 - len(np.unique(t_ns)) / max(len(t_ns), 1)
+        if isinstance(long, dict):                      # 사람이 지정했거나 큰 파일의 표본에서 정한 역할
+            spec = _spec_from_roles(names, body, long)
+        elif long is None and rep.header_rows == 1:     # 단위·설명 행이 있으면 넓은 형식이다
+            spec = _detect_long(names, body, tj, t_ns, skip=(tj2,) if tj2 is not None else (),
+                                why=rep.long_why)
     if spec is not None:
         frame, times, data_cols = _pivot_long(names, t_ns, spec, rep)
     else:
@@ -1341,12 +1525,26 @@ def _body_to_table(names, header_set, body, tcol, tj, rep: IngestReport, regular
                                     pd.Series(arr[left.to_numpy()]).value_counts().head(12).items()}
         numeric[c] = v
 
+    if not chunk:
+        _set_long_hint(rep, list(numeric))
     df = pd.DataFrame(numeric, index=frame.index)
     if times is None:
         return Table(df=df.reset_index(drop=True), report=rep)
     df.index = pd.DatetimeIndex(times.to_numpy(), name=tcol)
     df = df.sort_index(kind="stable")
     return Table(df=_regularize(_dedupe(df, rep), rep, regularize, tcol), report=rep)
+
+
+def _set_long_hint(rep: IngestReport, numeric_cols: list[str]) -> None:
+    """자동으로 펼치지 않았지만 긴 형식일지 모르는 파일 — 같은 시각이 여러 줄에 나오거나 이름 컬럼답게
+    불리는 글자 컬럼이 있다. 화면이 '파일 형식' 에서 이름·값 컬럼을 고르게 후보를 남긴다."""
+    if rep.long or rep.layout or not rep.time_column or not rep.text_columns:
+        return
+    tagish = [c for c in rep.text_columns if _col_role(c) == "tag"]
+    if rep.time_repeat_frac < 0.3 and not tagish:
+        return
+    rep.long_hint = {"keys": tagish + [c for c in rep.text_columns if c not in tagish],
+                     "values": list(numeric_cols)[:30]}
 
 
 def _dedupe(df: pd.DataFrame, rep: IngestReport) -> pd.DataFrame:
@@ -1380,7 +1578,17 @@ def _regularize(df: pd.DataFrame, rep: IngestReport, regularize: bool, tcol: str
                 if len(dc):
                     per.append(float(np.median(dc)))
             if per:
-                d = np.array(per)
+                per_a = np.array(per)
+                d = per_a
+                if per_a.max() > 3 * per_a.min():
+                    # 이름마다 주기가 크게 다르면(1분 태그와 1시간 태그) 중앙값 격자에서는 느린 이름이 거의
+                    # 비어 '쓸 수 없는 컬럼' 이 된다. 이름 대부분(80%)이 채워지는 격자로 맞추고, 더 촘촘한
+                    # 이름은 격자 칸마다 평균한다 (값을 지어내지 않는다 — 빈칸을 채우는 대신 모은다).
+                    q = float(np.quantile(per_a, 0.8))
+                    st = float(min((v for v in _NICE_INTERVALS if v >= 0.95 * q), default=q))
+                    d = np.array([st])
+                    rep.long["periods"] = [float(per_a.min()), float(per_a.max()), st,
+                                           int((per_a > 1.05 * st).sum())]
         if len(d):
             step = float(np.median(d))
             # 현장 기록 주기는 정해진 값 중 하나다. 시각이 1~2초씩 어긋나면 중앙값이

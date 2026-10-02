@@ -66,6 +66,19 @@ def site_long_csv() -> bytes:
     return ("\r\n".join(out) + "\r\n").encode("cp949")
 
 
+def site_long_split_csv() -> bytes:
+    """긴 형식인데 일자·시간이 두 컬럼이고 부가 컬럼(품질 코드·태그 번호·검색 모드)이 붙은 덤프, CP949."""
+    lines = (ROOT / "examples/nox_stack/data/plant_5min.csv").read_text(encoding="utf-8").splitlines()
+    cols = lines[0].split(",")[1:]
+    out = ["일자,시간,태그명,값,품질코드,태그번호,검색모드"]
+    for ln in lines[1:]:
+        t, *vals = ln.split(",")
+        d, hm = t.split(" ")
+        for k, (col, v) in enumerate(zip(cols, vals)):
+            out.append(f"{d},{hm},{col},{v},192,{1000 + k},Cyclic")
+    return ("\r\n".join(out) + "\r\n").encode("cp949")
+
+
 class Client:
     def __init__(self, base: str):
         self.base = base
@@ -131,6 +144,12 @@ def main() -> int:
                                                       if m["path"].endswith("nox_stack/model.py")),
                                         "csv": upl["path"], "y": Y, "features": X, "units": lunits})
     ok(lcat["suggest"]["best"]["target"] == "STK.C_dry", "긴 형식에서도 자동 연결 (y)")
+    ups = c.call("/api/upload?name=" + urllib.parse.quote("긴형식 일자시간.csv"), raw=site_long_split_csv())
+    ps = c.call("/api/profile", {"csv": ups["path"]})
+    ok([col["name"] for col in ps["columns"]] == [col["name"] for col in prof["columns"]] and ps["rows"] == 8640,
+       f"일자·시간 두 컬럼 + 부가 컬럼 긴 형식도 펼침 ({ps['rows']}행 × {len(ps['columns'])}컬럼)")
+    ok(sum(col["usable"] for col in ps["columns"]) == sum(col["usable"] for col in prof["columns"]),
+       "쓸 수 있는 컬럼 수가 넓은 형식과 같음")
 
     print("[4. 모델·연결 자동 추천]")
     ws = c.call("/api/workspace")

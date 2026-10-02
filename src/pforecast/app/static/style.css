@@ -686,3 +686,16 @@ table.mapping tr.bad td { background: var(--bad-soft); }
 .linkbtn:hover { color: var(--accent); }
 #ez-adv #ez-closures { box-shadow: none; border: 0; padding: 14px 0 0; margin-top: 10px; border-top: 1px dashed var(--line); border-radius: 0; }
 #ez-adv .k { font-size: 12px; font-weight: 700; color: var(--ink-3); margin-bottom: 6px; }
+
+/* 파일 형식 (긴 형식 펼치기) */
+.fmt-row { display: grid; grid-template-columns: 110px minmax(0, 260px) 1fr; gap: 10px; align-items: center;
+  padding: 6px 0; border-top: 1px solid var(--line); }
+.fmt-row:first-of-type { border-top: 0; }
+.fmt-row .k { font-size: 12px; font-weight: 600; color: var(--ink-3); }
+.fmt-row .chips { grid-column: 2 / 4; }
+.fmt-row .chips + .sub { grid-column: 2 / 4; }
+label.chk { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; padding: 3px 8px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--panel); cursor: pointer; }
+summary .sub.good { color: var(--good); }
+summary .sub.warn { color: var(--warn); font-weight: 600; }
+@media (max-width: 700px) { .fmt-row { grid-template-columns: 1fr; } .fmt-row .chips, .fmt-row .chips + .sub { grid-column: auto; } }

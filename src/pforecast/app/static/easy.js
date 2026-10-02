@@ -132,10 +132,15 @@ async function ezSelectCsv(path) {
 function ezRenderDataSummary() {
   const p = EZ.profile, box = $('#ez-data-summary'); box.innerHTML = '';
   const usable = p.columns.filter(c => c.usable).length;
+  // 못 쓰는 컬럼이 있으면 왜인지 같이 (중복 = 다른 컬럼과 상관 0.9999 이상, 결측 = 50% 이상 빔)
+  const why = [['중복', c => (c.status || '').startsWith('중복')], ['상수', c => c.status === '상수'],
+    ['결측 50%↑', c => !c.usable && c.status === '사용' && c.missing_pct >= 50]]
+    .map(([k, f]) => [k, p.columns.filter(f).length]).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(' · ');
   box.append(h('div', { class: 'tiles', style: 'margin-top:14px' },
     tile('행 수', p.rows.toLocaleString('ko-KR'), '', `간격 ${ezInterval(p.interval_s)}`),
     tile('기간', (p.t_start || '').slice(0, 10), '', `~ ${(p.t_end || '').slice(0, 10)}`),
-    tile('컬럼', String(p.columns.length), '개', `쓸 수 있는 것 ${usable}개`),
+    tile('컬럼', String(p.columns.length), '개', `쓸 수 있는 것 ${usable}개` + (why ? ` (못 쓰는 것: ${why})` : ''),
+         usable < p.columns.length ? 'warn' : ''),
     tile('정리한 값', (p.quality.excluded || 0).toLocaleString('ko-KR'), '점',
          '교정 창·고착·스파이크 → 결측', p.quality.excluded ? 'warn' : 'good')));
   if (EZ.preset) {
@@ -144,6 +149,7 @@ function ezRenderDataSummary() {
       `이 파일의 태그가 저장된 설정 **‘${pr.name}’** 과 ${Math.round(pr.coverage * 100)}% 일치합니다. ` +
       '예측할 값·입력·물리모델 연결을 미리 채워 둡니다 (다음 단계에서 바꿀 수 있습니다).') }));
   }
+  box.append(ezFormatCard());
   const ing = p.ingest.lines || [], qual = p.quality.lines || [];
   box.append(h('details', { class: 'card fold' },
     h('summary', {}, h('b', {}, '데이터 정리 내역'), h('span', { class: 'sub' }, ` 파일에서 고친 것 ${ing.length}건 · 값에서 뺀 것 ${qual.length}건 — 조용히 고치지 않습니다`)),
@@ -153,6 +159,78 @@ function ezRenderDataSummary() {
   box.append(h('div', { class: 'actions' },
     h('button', { class: 'btn lg', onclick: () => ezGo('ez-vars') }, '다음: 변수 고르기 →')));
 }
+// ---- 파일 형식 — 긴 형식(한 줄에 시각·이름·값 하나씩)을 자동으로 못 알아봤을 때 사람이 고른다 ----
+// 고른 것은 서버가 CSV 옆 .layout.json 에 저장해 이 파일을 읽는 모든 곳에 같이 적용된다.
+function ezFormatCard() {
+  const ing = EZ.profile.ingest || {}, L = ing.long, hint = ing.long_hint, lay = ing.layout;
+  const skip = new Set([EZ.profile.time_column, ing.time_column2].filter(Boolean));
+  const cols = (ing.columns_raw || []).filter(c => !skip.has(c));
+  let status, cls = '';
+  if (L) {
+    status = `긴 형식을 ${L.manual ? '지정한 대로' : '자동으로'} 펼쳤습니다 — 이름 ‘${L.roles.keys.join(' + ')}’ × 값 ‘${L.roles.values.join(', ')}’ → 컬럼 ${L.n_columns}개`;
+    cls = 'good';
+  } else if (lay && lay.format === 'wide') {
+    status = '넓은 형식으로 지정했습니다 (한 줄 = 한 시각, 컬럼 = 측정 항목)';
+  } else if (hint) {
+    status = '긴 형식일 수 있습니다 — 이름 컬럼과 값 컬럼을 골라 펼치세요';
+    cls = 'warn';
+  } else {
+    status = '넓은 형식 (한 줄 = 한 시각, 컬럼 = 측정 항목)';
+  }
+  // 고를 값: 지금 펼친 역할 → 서버의 후보 → 첫 글자/숫자 컬럼
+  const r = (L && L.roles) || {};
+  const textCols = (ing.text_columns || []).filter(c => cols.includes(c));
+  const key1 = (r.keys || [])[0] || (hint && hint.keys[0]) || textCols[0] || cols[0] || '';
+  const valueLike = c => /value|val$|^값$|측정|reading|pv$|avg|평균|결과/i.test(c);
+  const numCols = cols.filter(c => c !== key1 && !textCols.includes(c));
+  const pre = {
+    key1,
+    key2: (r.keys || [])[1] || '',
+    values: r.values || (hint ? hint.values.filter(c => c !== key1).slice(0, 1)
+      : [numCols.find(valueLike) || numCols[numCols.length - 1]].filter(Boolean)),
+    unit: r.unit || '', desc: r.desc || '', status: r.status || '',
+  };
+  const opt = (sel, none) => [none ? h('option', { value: '' }, none) : null,
+    ...cols.map(c => h('option', { value: c, selected: c === sel }, c))];
+  const s1 = h('select', {}, opt(pre.key1));
+  const s2 = h('select', {}, opt(pre.key2, '— 없음 —'));
+  const su = h('select', {}, opt(pre.unit, '— 없음 —'));
+  const sd = h('select', {}, opt(pre.desc, '— 없음 —'));
+  const sq = h('select', {}, opt(pre.status, '— 없음 —'));
+  const valBox = h('div', { class: 'chips' }, cols.map(c => h('label', { class: 'chk' },
+    h('input', { type: 'checkbox', value: c, checked: pre.values.includes(c) }), ' ' + c)));
+  const send = async layout => {
+    try {
+      await api('/api/table/layout', { csv: EZ.csv, layout });
+      toast(layout ? '파일 형식을 저장했습니다 — 다시 읽습니다' : '자동 판정으로 되돌렸습니다 — 다시 읽습니다');
+      ezSelectCsv(EZ.csv);
+    } catch (e) { toast(e.message, 'bad'); }
+  };
+  const applyLong = () => {
+    const values = [...valBox.querySelectorAll('input:checked')].map(i => i.value);
+    send({ format: 'long', keys: [s1.value, s2.value].filter(Boolean), values,
+           unit: su.value || null, desc: sd.value || null, status: sq.value || null });
+  };
+  const row = (label, el, help) => h('div', { class: 'fmt-row' },
+    h('div', { class: 'k' }, label), el, help ? h('span', { class: 'sub' }, help) : null);
+  return h('details', { class: 'card fold', open: !!hint && !L },
+    h('summary', {}, h('b', {}, '파일 형식'), h('span', { class: 'sub' + (cls ? ' ' + cls : '') }, ' ' + status)),
+    h('div', { style: 'margin-top:12px' },
+      h('p', { class: 'sub' }, '긴 형식 = 한 줄에 시각·이름·값이 하나씩 (Historian·DB 덤프). 이름마다 컬럼으로 펼쳐야 ' +
+        '변수로 고를 수 있습니다. 대부분 자동으로 알아보지만, 못 알아보면 여기서 고르세요. 고른 것은 이 파일에 저장되어 ' +
+        '검증·미래 예측·분석에 똑같이 쓰입니다.'),
+      hint && (ing.long_why || []).length ? h('div', { class: 'note warn' }, `자동으로 펼치지 않은 이유: ${ing.long_why[0]}`) : null,
+      row('이름 컬럼', s1, '태그·항목 이름이 든 컬럼'),
+      row('이름 컬럼 2', s2, '이름이 두 컬럼에 나뉘었으면 (예: 설비 + 항목)'),
+      row('값 컬럼', valBox, '측정값이 든 컬럼 (여럿이면 이름.값컬럼 으로 펼침)'),
+      row('단위 컬럼', su, '선택'), row('설명 컬럼', sd, '선택'),
+      row('품질 컬럼', sq, '선택 — Bad·Comm Fail 등이면 그 값은 결측'),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn', onclick: applyLong }, '긴 형식으로 펼치기'),
+        h('button', { class: 'btn ghost', onclick: () => send({ format: 'wide' }) }, '넓은 형식으로 고정'),
+        lay ? h('button', { class: 'btn ghost', onclick: () => send(null) }, '자동 판정으로 되돌리기') : null)));
+}
+
 const ezInterval = s => (!s ? '—' : s >= 86400 ? `${fmt(s / 86400, 1)}일` : s >= 3600 ? `${fmt(s / 3600, 1)}시간` : s >= 60 ? `${fmt(s / 60, 0)}분` : `${fmt(s, 0)}초`);
 
 async function ezLoadSparks() {

@@ -32,6 +32,19 @@ VPY = VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 STAMP = VENV / "pforecast.installed"
 
 
+def build_version() -> str:
+    """src/pforecast/_build.py 의 커밋 (zip 으로 받았으면 채워져 있다). 어느 판을 돌리는지 창에 보인다."""
+    import re
+    try:
+        src = (ROOT / "src" / "pforecast" / "_build.py").read_text(encoding="utf-8")
+    except OSError:
+        return "?"
+    m = re.search(r'COMMIT = "([^"$]+)"', src), re.search(r'DATE = "([^"$]+)"', src)
+    if m[0]:
+        return f"{m[0].group(1)} ({m[1].group(1) if m[1] else ''})"
+    return "(git 작업 사본)"
+
+
 def say(msg: str = "") -> None:
     print(msg, flush=True)
 
@@ -80,7 +93,7 @@ def main(argv: list[str]) -> int:
     if not work.is_dir():
         return fail(f"작업 폴더가 없습니다: {work}")
     port = os.environ.get("PF_PORT", "8765")
-    say(f"pforecast — 파이썬 {sys.version.split()[0]} ({sys.executable})")
+    say(f"pforecast {build_version()} — 파이썬 {sys.version.split()[0]} ({sys.executable})")
 
     if not venv_ok():
         say("가상환경을 만드는 중 (.venv) ...")

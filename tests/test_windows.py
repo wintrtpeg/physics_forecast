@@ -149,6 +149,32 @@ def test_table_prepare_runs_as_a_job_then_is_ready(server):
     assert r2 == {"ready": True}
 
 
+def test_file_format_can_be_set_from_the_screen(server):
+    """'파일 형식' 카드: 자동이 못 알아본 긴 형식을 골라 펼친다 → 저장(.layout.json) → 다시 읽으면 펼쳐져 있다."""
+    base, ws = server
+    (ws / "uploads").mkdir(exist_ok=True)
+    rows = ["time,ch,reading"] + [f"2025-03-01 00:{5 * i:02d}:00,{k},{100 * k + i}" for i in range(10) for k in (1, 2, 3)]
+    (ws / "uploads/x.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    code, prof = _post(base + "/api/profile", {"csv": "uploads/x.csv"})
+    assert code == 200 and [c["name"] for c in prof["columns"]] == ["ch", "reading"]
+    assert prof["ingest"]["columns_raw"] == ["time", "ch", "reading"] and prof["ingest"]["long"] is None
+    code, r = _post(base + "/api/table/layout",
+                    {"csv": "uploads/x.csv", "layout": {"format": "long", "keys": ["ch"], "values": ["reading"]}})
+    assert code == 200 and (ws / "uploads/x.csv.layout.json").exists()
+    code, prof = _post(base + "/api/profile", {"csv": "uploads/x.csv"})       # 캐시가 아니라 다시 읽는다
+    assert [c["name"] for c in prof["columns"]] == ["1", "2", "3"] and prof["rows"] == 10
+    assert prof["ingest"]["long"]["manual"] and prof["ingest"]["long"]["roles"]["keys"] == ["ch"]
+    code, r = _post(base + "/api/table/layout",
+                    {"csv": "uploads/x.csv", "layout": {"format": "long", "keys": ["없는컬럼"], "values": ["reading"]}})
+    assert code == 400 and "없는컬럼" in r["error"]
+    ds = json.loads(_get(base + "/api/workspace")[2])
+    assert [d["path"] for d in ds["datasets"]].count("uploads/x.csv") == 1 and ds["version"]
+    code, r = _post(base + "/api/table/layout", {"csv": "uploads/x.csv", "layout": None})
+    assert code == 200 and not (ws / "uploads/x.csv.layout.json").exists()
+    code, prof = _post(base + "/api/profile", {"csv": "uploads/x.csv"})
+    assert [c["name"] for c in prof["columns"]] == ["ch", "reading"]
+
+
 def test_launcher_bat_is_plain_ascii_crlf_and_delegates_to_python():
     """cmd.exe 는 chcp 65001 뒤 한글(UTF-8) 배치 파일을 외부 프로그램이 끝난 다음부터 잘못 읽고
     조용히 멈춘다 (윈도우 점검에서 '가상환경을 만드는 중...' 뒤 아무 말 없이 끝났다). 그래서 배치 파일은

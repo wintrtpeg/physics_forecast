@@ -21,6 +21,8 @@ async function homeRender() {
       '모델 만들기 →', () => { go('builder'); if (typeof mbEnter === 'function') mbEnter(); }),
     card('◎', '운전 조건 바꿔 보기', '모델만으로 가동률·설정값을 움직여 결과를 바로 풉니다. 과거 데이터에 없던 조건도 지배방정식으로 답합니다.',
       '모델 구조 · 시나리오 →', () => go('model')));
+  api('/api/workspace').then(ws => { $('#home-version').textContent = `pforecast 버전 ${ws.version || '?'} · 작업 폴더 ${ws.root}`; })
+    .catch(() => {});
   const box = $('#home-projects');
   let items = [];
   try { items = (await api('/api/project/list')).projects; } catch (e) { box.innerHTML = ''; box.append(h('div', { class: 'note bad' }, e.message)); return; }

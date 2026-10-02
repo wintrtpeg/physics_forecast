@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from pforecast.core.units import normalize_unit
-from pforecast.data.ingest import parse_times, read_table, read_text
+from pforecast.data.ingest import parse_times, read_layout, read_table, read_text, write_layout
 
 
 def _messy_csv() -> str:
@@ -325,3 +325,125 @@ def test_wide_file_with_a_text_column_is_not_taken_for_long():
     tab = read_text("\n".join(rows))
     assert not tab.report.long and list(tab.df.columns) == ["a", "b"]
     assert "mode" in tab.report.text_columns
+    assert not tab.report.long_hint                  # 넓은 파일에 '긴 형식일 수 있다' 고 묻지 않는다
+
+
+# ---- 현장 긴 형식 변형 — 예전 판정이 놓쳐 '쓸 수 있는 컬럼 1개' 가 됐던 것들 ---------------------------
+TAGS = ["CH1_KW", "CH1_TCHW", "CT_FAN_HZ", "AHU_SA_T"]
+
+
+def _base_long(n=30):
+    idx = pd.date_range("2025-03-01", periods=n, freq="5min")
+    rows = [(t, tag, round(100.0 * k + i, 3)) for i, t in enumerate(idx) for k, tag in enumerate(TAGS)]
+    return pd.DataFrame(rows, columns=["t", "tag", "v"])
+
+
+def _variant(kind: str) -> str:
+    b = _base_long()
+    ts = b.t.dt.strftime("%Y-%m-%d %H:%M:%S")
+    if kind == "historian_many_columns":        # 부가 컬럼이 많은 Historian 덤프 (품질 코드·태그 번호 …)
+        df = pd.DataFrame({"DateTime": ts, "TagName": b.tag, "Value": b.v, "vValue": b.v.astype(str),
+                           "Quality": 0, "QualityDetail": 192, "OPCQuality": 192,
+                           "wwTagKey": b.tag.map({t: 1000 + i for i, t in enumerate(TAGS)}),
+                           "wwRowCount": 100, "wwResolution": 300000, "wwRetrievalMode": "Cyclic",
+                           "wwTimeZone": "Korea Standard Time", "wwVersion": "Latest", "wwCycleCount": 30})
+    elif kind == "date_and_time_columns":       # 일자·시간이 두 컬럼
+        df = pd.DataFrame({"일자": b.t.dt.strftime("%Y-%m-%d"), "시간": b.t.dt.strftime("%H:%M:%S"),
+                           "태그명": b.tag, "값": b.v})
+    elif kind == "date_and_ampm_time":
+        df = pd.DataFrame({"날짜": b.t.dt.strftime("%Y-%m-%d"),
+                           "시각": b.t.map(lambda t: f"{'오후' if t.hour >= 12 else '오전'} {(t.hour - 1) % 12 + 1}:{t.minute:02d}"),
+                           "Tag": b.tag, "Value": b.v})
+    elif kind == "mostly_on_off":               # 디지털 태그가 대부분 — 값 컬럼 대부분이 글자
+        v = [("ON" if (i // 2) % 2 else "OFF") if tag != TAGS[-1] else str(x)
+             for i, (tag, x) in enumerate(zip(b.tag, b.v))]
+        df = pd.DataFrame({"Time": ts, "Tag": b.tag, "Value": v})
+    elif kind == "value_with_unit":
+        df = pd.DataFrame({"Time": ts, "Tag": b.tag, "Value": b.v.map(lambda x: f"{x} kW")})
+    elif kind == "overlapping_exports":         # 같은 구간을 두 번 받아 이어 붙임 (60%)
+        o = pd.concat([b, b.iloc[: int(len(b) * 0.6)]]).sort_values("t", kind="stable")
+        df = pd.DataFrame({"Time": o.t.dt.strftime("%Y-%m-%d %H:%M:%S"), "TagName": o.tag, "Value": o.v})
+    elif kind == "row_number_first":
+        df = pd.DataFrame({"No": range(1, len(b) + 1), "TagName": b.tag, "DateTime": ts, "Value": b.v})
+    else:
+        raise KeyError(kind)
+    return df.to_csv(index=False, lineterminator="\n")
+
+
+@pytest.mark.parametrize("kind", ["historian_many_columns", "date_and_time_columns", "date_and_ampm_time",
+                                  "mostly_on_off", "value_with_unit", "overlapping_exports", "row_number_first"])
+def test_field_long_variants_are_spread(kind, tmp_path):
+    p = tmp_path / "long.csv"
+    p.write_bytes(_variant(kind).encode("utf-8"))
+    tab = read_table(p)
+    assert list(tab.df.columns) == TAGS, tab.report.lines()
+    assert len(tab.df) == 30 and tab.df.index[0] == pd.Timestamp("2025-03-01 00:00")
+    assert tab.df.notna().all().all()
+    if kind != "mostly_on_off":
+        assert tab.df["AHU_SA_T"].iloc[7] == pytest.approx(307.0)
+    b = read_table(p, chunk_bytes=1500, cache=False)          # 큰 파일 경로도 같아야 한다
+    pd.testing.assert_frame_equal(tab.df, b.df, check_freq=False)
+    assert tab.report.lines() == b.report.lines()
+
+
+def test_date_and_time_columns_are_combined_for_wide_files_too():
+    rows = ["일자,시간,a,b"] + [f"2025-03-01,{h:02d}:{m:02d},{h},{m}" for h in range(3) for m in (0, 30)]
+    tab = read_text("\n".join(rows))
+    assert tab.report.time_column2 == "시간" and list(tab.df.columns) == ["a", "b"]
+    assert tab.df.index[3] == pd.Timestamp("2025-03-01 01:30") and len(tab.df) == 6
+    assert any("두 컬럼을 합쳐" in ln for ln in tab.report.lines())
+
+
+def test_mixed_sampling_rates_use_a_grid_most_names_fill():
+    """1분 태그와 1시간 태그가 섞인 덤프 — 중앙값(1분) 격자면 1시간 태그가 98% 비어 '쓸 수 없는 컬럼' 이 된다.
+    대부분이 채워지는 격자로 맞추고 촘촘한 태그는 칸마다 평균한다 (빈칸을 지어내 채우지 않는다)."""
+    t0 = pd.Timestamp("2025-03-01")
+    rows = [(t0 + pd.Timedelta(minutes=i), tag, float(i)) for tag in ("F1", "F2") for i in range(240)]
+    rows += [(t0 + pd.Timedelta(hours=i), tag, 10.0 * i) for tag in ("S1", "S2", "S3") for i in range(4)]
+    df = pd.DataFrame(rows, columns=["Time", "Tag", "Value"]).sort_values("Time", kind="stable")
+    tab = read_text(df.to_csv(index=False, lineterminator="\n"))
+    assert tab.report.interval_s == 3600 and tab.df.notna().mean().min() > 0.7
+    assert 59 <= tab.df["F1"].iloc[1] <= 61                               # 01:00 앞뒤 30분의 평균
+    assert any("기록 주기가 다릅니다" in ln for ln in tab.report.lines())
+
+
+def test_historian_extra_columns_are_reported_not_spread():
+    tab = read_text(_variant("historian_many_columns"))
+    L = tab.report.long
+    assert L["key"] == "TagName" and L["values"] == ["Value"]        # 태그 번호(wwTagKey)가 아니라 이름
+    assert {"vValue", "wwTagKey", "QualityDetail"} <= set(L["ignored"])
+
+
+def test_layout_file_spreads_what_auto_detection_refuses(tmp_path):
+    """이름이 숫자 번호이고 컬럼 이름도 평범하면 자동으로는 못 알아본다 — '파일 형식' 에서 고르면 펼친다."""
+    b = _base_long()
+    p = tmp_path / "x.csv"
+    p.write_text(pd.DataFrame({"time": b.t, "ch": b.tag.map({t: i + 1 for i, t in enumerate(TAGS)}),
+                               "reading": b.v}).to_csv(index=False, lineterminator="\n"), encoding="utf-8")
+    assert not read_table(p).report.long
+    write_layout(p, {"format": "long", "keys": ["ch"], "values": ["reading"]})
+    assert read_layout(p)["keys"] == ["ch"]
+    tab = read_table(p)
+    assert list(tab.df.columns) == ["1", "2", "3", "4"] and tab.report.long["manual"]
+    assert any("지정한 대로" in ln for ln in tab.report.lines())
+    big = read_table(p, chunk_bytes=900, cache=False)                   # 큰 파일 경로도 지정을 따른다
+    pd.testing.assert_frame_equal(tab.df, big.df, check_freq=False)
+    write_layout(p, None)
+    assert not read_table(p).report.long
+
+
+def test_layout_can_force_wide_and_hint_offers_the_choice(tmp_path):
+    """자동으로 못 펼쳤지만 긴 형식일지 모르는 파일은 이유와 함께 고르라고 알린다. 넓게 못 박으면 묻지 않는다."""
+    idx = pd.date_range("2025-03-01", periods=2, freq="5min")              # 이름마다 두 줄뿐 → 자동은 거절
+    rows = [(t, f"T{k}", float(k)) for t in idx for k in range(30)]
+    p = tmp_path / "x.csv"
+    p.write_text(pd.DataFrame(rows, columns=["Time", "Tag", "Value"]).to_csv(index=False, lineterminator="\n"),
+                 encoding="utf-8")
+    r = read_table(p).report
+    assert not r.long and r.long_hint["keys"] == ["Tag"] and r.long_why
+    assert any("긴 형식일 수 있습니다" in ln for ln in r.lines())
+    write_layout(p, {"format": "wide"})
+    r2 = read_table(p).report
+    assert not r2.long and not r2.long_hint and r2.layout == {"format": "wide"}
+    with pytest.raises(ValueError):
+        write_layout(p, {"format": "long", "keys": ["Tag"], "values": []})

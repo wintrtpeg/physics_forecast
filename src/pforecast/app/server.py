@@ -135,11 +135,22 @@ class Workspace:
         self._tables: dict[str, tuple] = {}       # 경로 -> (mtime, size, Table, QualityReport)
         self._tlock = threading.Lock()
 
+    def sig(self, rel: str) -> tuple:
+        """CSV 가 그대로인지 — 크기·수정 시각, 그리고 사람이 정한 파일 형식(.layout.json)."""
+        from ..data.ingest import layout_path
+        p = self.resolve(rel)
+        st = p.stat()
+        try:
+            lay = layout_path(p).stat().st_mtime_ns
+        except OSError:
+            lay = 0
+        return (st.st_mtime_ns, st.st_size, lay)
+
     def _table_hit(self, rel: str, time_column: str | None):
-        st = self.resolve(rel).stat()
+        sig = self.sig(rel)
         with self._tlock:
             hit = self._tables.get(f"{rel}|{time_column or ''}")
-        return hit if hit and hit[0] == st.st_mtime and hit[1] == st.st_size else None
+        return hit if hit and hit[0] == sig else None
 
     def table_ready(self, rel: str, time_column: str | None = None) -> bool:
         return self._table_hit(rel, time_column) is not None
@@ -157,13 +168,13 @@ class Workspace:
             if hit:
                 return hit[2], hit[3]
             path = self.resolve(rel)
-            st = path.stat()
+            sig = self.sig(rel)
             tab = read_table(path, time_column=time_column, progress=progress)
             if progress:
                 progress("값 이상을 찾는 중 (교정 창·고착·스파이크)")
             q = assess(tab.df)
             with self._tlock:
-                self._tables[f"{rel}|{time_column or ''}"] = (st.st_mtime, st.st_size, tab, q)
+                self._tables[f"{rel}|{time_column or ''}"] = (sig, None, tab, q)
         return tab, q
 
     def _rel(self, p: Path) -> str:
@@ -417,8 +428,9 @@ class Api:
 
     # -- 엔드포인트 --
     def workspace(self, _body) -> dict:
+        from .._build import version
         return {"root": str(self.ws.root), "datasets": self.ws.datasets(),
-                "models": self.ws.model_files()}
+                "models": self.ws.model_files(), "version": version()}
 
     def table_prepare(self, body) -> dict:
         """큰 CSV 는 처음 읽는 데 몇 분 걸린다 — 작업으로 돌리고 화면은 진행률을 본다."""
@@ -437,13 +449,32 @@ class Api:
     def profile(self, body) -> dict:
         """1단계 요약. 같은 파일이면 한 번만 계산한다 (GB 급 표는 수십 초)."""
         key = (body["csv"], body.get("timestamp"))
-        st = self.ws.resolve(body["csv"]).stat()
+        sig = self.ws.sig(body["csv"])
         hit = self._profiles.get(key)
-        if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
-            return hit[2]
+        if hit and hit[0] == sig:
+            return hit[1]
         res = self._profile(body)
-        self._profiles[key] = (st.st_mtime, st.st_size, res)
+        self._profiles[key] = (sig, res)
         return res
+
+    def table_layout(self, body) -> dict:
+        """'파일 형식' — 자동 판정이 놓친 긴 형식을 사람이 지정한다 (또는 넓은 형식으로 못 박는다).
+        CSV 옆 .layout.json 에 저장하므로 이 CSV 를 읽는 모든 곳(검증·예측·분석·CLI)에 같이 적용된다.
+        ``layout: null`` 이면 지우고 자동 판정으로 돌아간다."""
+        from ..data.ingest import write_layout
+        rel = body["csv"]
+        path = self.ws.resolve(rel)
+        layout = body.get("layout")
+        if layout and layout.get("format") == "long":
+            tab, _ = self.ws.table(rel, body.get("timestamp"))
+            cols = set(tab.report.columns_raw)
+            picked = [*(layout.get("keys") or []), *(layout.get("values") or []),
+                      *[layout[r] for r in ("unit", "desc", "status") if layout.get(r)]]
+            missing = [c for c in picked if c not in cols]
+            if missing:
+                raise ValueError(f"파일에 없는 컬럼입니다: {', '.join(missing)}")
+        write_layout(path, layout)
+        return {"ok": True, "layout": layout or None}
 
     def _profile(self, body) -> dict:
         from ..analyze.profile import profile_dataset
@@ -490,7 +521,14 @@ class Api:
                        "header_rows": rep.header_rows,
                        "status_total": rep.status_total(), "gaps": rep.gaps[:5],
                        "dropped_columns": rep.dropped_columns,
-                       "text_columns": list(rep.text_columns)},
+                       "text_columns": list(rep.text_columns),
+                       # 파일 형식 — 화면의 '파일 형식' 카드가 쓴다
+                       "columns_raw": rep.columns_raw,
+                       "time_column2": rep.time_column2,
+                       "long": ({k: rep.long.get(k) for k in ("roles", "n_names", "n_columns", "manual")}
+                                if rep.long else None),
+                       "long_hint": rep.long_hint or None, "long_why": rep.long_why,
+                       "layout": rep.layout or None},
             "quality": {"lines": q.lines(), "excluded": q.excluded(),
                         "n_issues": len(q.issues)},
         }
@@ -928,6 +966,7 @@ _ROUTES: dict[str, str] = {
     "/api/workspace": "workspace",
     "/api/profile": "profile",
     "/api/table/prepare": "table_prepare",
+    "/api/table/layout": "table_layout",
     "/api/preview": "preview",
     "/api/analyze": "analyze",
     "/api/job": "job",
